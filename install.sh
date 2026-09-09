@@ -23,10 +23,20 @@ say "python $PYVER"
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' \
   || die "нужен python 3.9 или новее (сейчас $PYVER)"
 
-if ! python3 -m venv --help >/dev/null 2>&1; then
-  say "ставлю python3-venv"
-  (apt-get update -qq && apt-get install -y -qq python3-venv) || die "поставьте python3-venv вручную"
+# Осторожно: `python3 -m venv --help` отрабатывает успешно и БЕЗ пакета
+# python3-venv — модуль на месте, а ensurepip нет. Проверять надо именно
+# ensurepip, иначе venv создастся наполовину: симлинки bin/python появятся,
+# а pip не будет.
+if ! python3 -c 'import ensurepip' >/dev/null 2>&1; then
+  say "ensurepip недоступен — ставлю python3-venv"
+  apt-get update -qq || true
+  # Ubuntu требует пакет под конкретную версию, Debian — общий.
+  apt-get install -y -qq "python${PYVER}-venv" 2>/dev/null \
+    || apt-get install -y -qq python3-venv 2>/dev/null || true
 fi
+python3 -c 'import ensurepip' >/dev/null 2>&1 || die "нет ensurepip. Поставьте вручную:
+    sudo apt-get install -y python${PYVER}-venv
+и запустите install.sh снова"
 
 # --- пользователь и каталоги ------------------------------------------------
 
@@ -51,10 +61,18 @@ fi
 
 # --- виртуальное окружение --------------------------------------------------
 
-if [[ ! -x "$APP_DIR/venv/bin/python" ]]; then
+# Ориентир — pip, а не bin/python: провалившаяся попытка оставляет симлинки
+# bin/python, и проверка по ним делает поломку липкой, подменяя внятную
+# ошибку про ensurepip невнятной «pip: No such file or directory».
+if [[ ! -x "$APP_DIR/venv/bin/pip" ]]; then
+  if [[ -d "$APP_DIR/venv" ]]; then
+    warn "нахожу недоделанный venv — пересоздаю"
+    rm -rf "$APP_DIR/venv"
+  fi
   say "создаю venv"
-  python3 -m venv "$APP_DIR/venv"
+  python3 -m venv "$APP_DIR/venv" || die "не удалось создать venv в $APP_DIR/venv"
 fi
+[[ -x "$APP_DIR/venv/bin/pip" ]] || die "venv есть, а pip в нём нет — проверьте пакет python${PYVER}-venv"
 say "ставлю зависимости"
 "$APP_DIR/venv/bin/pip" install -q --upgrade pip
 "$APP_DIR/venv/bin/pip" install -q -r "$APP_DIR/requirements.txt"
