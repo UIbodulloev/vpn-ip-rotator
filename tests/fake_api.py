@@ -45,7 +45,7 @@ class FakeCloud:
         server_uuid = str(uuidlib.uuid4())
         storage_uuid = str(uuidlib.uuid4())
         ip = self.new_ip()
-        mac = "e2:a1:13:f8:38:ee"
+        mac = "52:54:00:aa:00:01"
         self.storages[storage_uuid] = {
             "uuid": storage_uuid, "state": "online", "size": 10,
             "tier": "standard", "title": "osdisk", "type": "normal", "zone": zone,
@@ -55,15 +55,15 @@ class FakeCloud:
             "hostname": "amnezia-test", "title": "amnezia-test",
             "ip_addresses": {"ip_address": [
                 {"access": "public", "family": "IPv4", "address": ip},
-                {"access": "public", "family": "IPv6", "address": "2a04:3544::1"},
+                {"access": "public", "family": "IPv6", "address": "2001:db8::1"},
                 {"access": "utility", "family": "IPv4", "address": "10.5.16.10"},
             ]},
             "networking": {"interfaces": {"interface": [
                 {"type": "public", "mac": mac,
                  "ip_addresses": {"ip_address": [{"family": "IPv4", "address": ip}]}},
-                {"type": "public", "mac": "e2:a1:13:f8:64:7a",
-                 "ip_addresses": {"ip_address": [{"family": "IPv6", "address": "2a04:3544::1"}]}},
-                {"type": "utility", "mac": "e2:a1:13:f8:bc:a3",
+                {"type": "public", "mac": "52:54:00:aa:00:03",
+                 "ip_addresses": {"ip_address": [{"family": "IPv6", "address": "2001:db8::1"}]}},
+                {"type": "utility", "mac": "52:54:00:aa:00:02",
                  "ip_addresses": {"ip_address": [{"family": "IPv4", "address": "10.5.16.10"}]}},
             ]}},
             "storage_devices": {"storage_device": [{
@@ -75,7 +75,7 @@ class FakeCloud:
         self.records["rec-a"] = {"id": "rec-a", "type": "A", "name": "vpn.example.com",
                                  "content": ip, "ttl": 60, "proxied": False}
         self.records["rec-aaaa"] = {"id": "rec-aaaa", "type": "AAAA", "name": "vpn.example.com",
-                                    "content": "2a04:3544::1", "ttl": 60, "proxied": False}
+                                    "content": "2001:db8::1", "ttl": 60, "proxied": False}
         return server_uuid, storage_uuid, ip
 
     def server_ip(self, server_uuid: str, family: str = "IPv4") -> str:
