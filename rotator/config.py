@@ -69,7 +69,7 @@ DEFAULTS: dict[str, Any] = {
         "deep_probe_timeout_sec": 25,
     },
     "rotation": {
-        "mode": "auto",              # auto | replace-ip | recreate | floating
+        "mode": "auto",              # auto | clone | move | floating
         "cooldown_hours": 6,
         "max_per_day": 2,
         "escalate_after_hours": 6,   # новый IP умер быстрее — значит подсеть/протокол

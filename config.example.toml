@@ -38,7 +38,7 @@ awg_probe_cmd = ""
 deep_probe_timeout_sec = 25
 
 [rotation]
-mode = "auto"                  # auto | replace-ip | recreate | floating
+mode = "auto"                  # auto | clone (копия здесь) | move (переезд) | floating
 cooldown_hours = 6             # минимум между ротациями
 max_per_day = 2                # дальше — только руками через /rotate
 escalate_after_hours = 6       # новый адрес умер быстрее — значит подсеть или протокол

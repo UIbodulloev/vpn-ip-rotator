@@ -101,7 +101,9 @@ def always_closed(host, port, timeout):
     return False
 
 
-class ReplaceIpTest(unittest.TestCase):
+class RemovedModeTest(unittest.TestCase):
+    """replace-ip убран: UpCloud не отдаёт свежий адрес на существующий интерфейс."""
+
     def setUp(self):
         self.h = Harness()
         self._orig = modes.tcp_open
@@ -110,47 +112,27 @@ class ReplaceIpTest(unittest.TestCase):
     def tearDown(self):
         modes.tcp_open = self._orig
 
-    def test_адрес_меняется_и_старый_освобождается(self):
-        old = self.h.ip
-        result = self.h.engine.rotate("replace-ip", force=True)
-
-        self.assertNotEqual(result["new_ip"], old)
-        self.assertEqual(result["old_ip"], old)
-        # Старый адрес больше не принадлежит никому.
-        self.assertNotIn(old, self.h.cloud.ips)
-        # Новый висит на том же сервере.
-        self.assertEqual(self.h.cloud.ips[result["new_ip"]], self.h.server_uuid)
-        # Сервер снова запущен.
-        self.assertEqual(self.h.cloud.servers[self.h.server_uuid]["state"], "started")
-        # DNS переписан.
-        self.assertEqual(self.h.dns(), result["new_ip"])
-        self.assertIsNone(self.h.state["pending"])
-
-    def test_новый_адрес_заказывается_только_на_остановленном_сервере(self):
-        """Фейк повторяет ограничение UpCloud, так что порядок шагов проверяется по-настоящему."""
-        self.h.engine.rotate("replace-ip", force=True)
-        order = [path for method, path in self.h.cloud.calls if method == "POST"]
-        stop_at = next(i for i, p in enumerate(order) if p.endswith("/stop"))
-        assign_at = next(i for i, p in enumerate(order) if p == "/1.3/ip_address")
-        start_at = next(i for i, p in enumerate(order) if p.endswith("/start"))
-        self.assertLess(stop_at, assign_at, "адрес заказан до остановки")
-        self.assertLess(assign_at, start_at, "сервер запущен до выдачи адреса")
-
-    def test_старый_адрес_освобождается_после_выдачи_нового(self):
-        self.h.engine.rotate("replace-ip", force=True)
-        sequence = [f"{m} {p}" for m, p in self.h.cloud.calls if "ip_address" in p]
-        self.assertEqual(sequence[0], "POST /1.3/ip_address")
-        self.assertTrue(sequence[1].startswith("DELETE"), "старый адрес освобождён раньше выдачи нового")
-
-    def test_если_старый_адрес_не_освобождается_dns_не_трогаем(self):
-        old = self.h.ip
-        self.h.cloud.fail_on[f"DELETE /1.3/ip_address/{old}"] = 99
+    def test_старый_режим_отвергается_с_объяснением(self):
         with self.assertRaises(modes.RotationError) as caught:
             self.h.engine.rotate("replace-ip", force=True)
-        self.assertIn("не удалось освободить", str(caught.exception))
-        # Главное: сервер поднят обратно, а DNS остался на старом адресе.
-        self.assertEqual(self.h.cloud.servers[self.h.server_uuid]["state"], "started")
-        self.assertEqual(self.h.dns(), old)
+        message = str(caught.exception)
+        self.assertIn("убран", message)
+        self.assertIn("копия сервера", message, "не предложена замена")
+
+    def test_настоящий_upcloud_отвергает_mac_для_обычного_адреса(self):
+        """Фейк повторяет боевой отказ — иначе такая ошибка снова проскочит в тестах."""
+        from rotator.upcloud import UpCloudError
+        with self.assertRaises(UpCloudError) as caught:
+            self.h.engine.uc.assign_ip(server_uuid=self.h.server_uuid, mac="52:54:00:aa:00:01")
+        self.assertIn("FLOATING_IP_NOT_AVAILABLE", str(caught.exception))
+
+    def test_сбой_не_оставляет_сервер_выключенным(self):
+        """Главное последствие того бага: сервер лежал, пока человек не заметил."""
+        self.h.cloud.fail_on["POST /1.3/storage/%s/templatize" % self.h.storage_uuid] = 99
+        with self.assertRaises(Exception):
+            self.h.engine.rotate(modes.CLONE, force=True)
+        self.assertEqual(self.h.cloud.servers[self.h.server_uuid]["state"], "started",
+                         "сервер остался остановленным после сбоя")
 
 
 class RecreateTest(unittest.TestCase):
@@ -164,7 +146,7 @@ class RecreateTest(unittest.TestCase):
 
     def test_пересоздание_в_той_же_зоне(self):
         old_uuid, old_ip = self.h.server_uuid, self.h.ip
-        result = self.h.engine.rotate("recreate", force=True)
+        result = self.h.engine.rotate(modes.CLONE, force=True)
 
         self.assertNotEqual(result["new_ip"], old_ip)
         self.assertNotIn(old_uuid, self.h.cloud.servers, "старый сервер не удалён")
@@ -177,7 +159,7 @@ class RecreateTest(unittest.TestCase):
         self.assertIn(self.h.state["templates"][0]["uuid"], self.h.cloud.storages)
 
     def test_переезд_в_другую_зону(self):
-        result = self.h.engine.rotate("recreate", zone="fi-hel1", force=True)
+        result = self.h.engine.rotate(modes.MOVE, zone="fi-hel1", force=True)
         new_uuid = self.h.secrets.get("SERVER_UUID")
         self.assertEqual(self.h.cloud.servers[new_uuid]["zone"], "fi-hel1")
         self.assertEqual(result["zone"], "fi-hel1")
@@ -189,7 +171,7 @@ class RecreateTest(unittest.TestCase):
         old_uuid, old_ip = self.h.server_uuid, self.h.ip
         self.h.cloud.fail_on["POST /1.3/server"] = 99
         with self.assertRaises(Exception):
-            self.h.engine.rotate("recreate", force=True)
+            self.h.engine.rotate(modes.CLONE, force=True)
         # Ничего не потеряно: сервер жив, работает, DNS не менялся.
         self.assertIn(old_uuid, self.h.cloud.servers)
         self.assertEqual(self.h.cloud.servers[old_uuid]["state"], "started")
@@ -199,7 +181,7 @@ class RecreateTest(unittest.TestCase):
         """Обрыв после снятия шаблона: перезапуск должен закончить дело, а не начать заново."""
         self.h.cloud.fail_on["POST /1.3/server"] = 1
         with self.assertRaises(Exception):
-            self.h.engine.rotate("recreate", force=True)
+            self.h.engine.rotate(modes.CLONE, force=True)
         pending = self.h.state["pending"]
         self.assertIsNotNone(pending, "незавершённая ротация не сохранена")
         self.assertTrue(pending["data"].get("template_uuid"), "шаблон не запомнен")
@@ -221,7 +203,7 @@ class DryRunTest(unittest.TestCase):
 
     def test_ничего_не_трогает_но_включает_предохранители(self):
         old_ip = self.h.ip
-        result = self.h.engine.rotate("replace-ip", force=True)
+        result = self.h.engine.rotate(modes.CLONE, force=True)
 
         self.assertTrue(result["dry_run"])
         # Сервер и адрес не тронуты.
@@ -233,7 +215,7 @@ class DryRunTest(unittest.TestCase):
         self.assertEqual(self.h.state["fail_streak"], 0, "серия неудач не сброшена")
 
     def test_попадает_в_историю_с_пометкой(self):
-        self.h.engine.rotate("replace-ip", force=True)
+        self.h.engine.rotate(modes.CLONE, force=True)
         self.assertEqual(self.h.state["history"][0]["to"], "(холостой прогон)")
 
 
@@ -289,10 +271,10 @@ class GuardTest(unittest.TestCase):
                           .replace("max_per_day = 99", "max_per_day = 1"))
         modes.tcp_open = always_open
         try:
-            h.engine.rotate("replace-ip", force=True)
+            h.engine.rotate(modes.CLONE, force=True)
             self.assertIn("cooldown", h.engine.guard() or "")
             with self.assertRaises(modes.RotationError):
-                h.engine.rotate("replace-ip")
+                h.engine.rotate(modes.CLONE)
             # force снимает мягкий предохранитель.
             self.assertIsNone(h.engine.guard(force=True))
         finally:
@@ -313,17 +295,28 @@ class EscalationTest(unittest.TestCase):
 
     def test_первая_блокировка_меняет_адрес(self):
         mode, zone = self.h.engine.choose()
-        self.assertEqual(mode, modes.REPLACE_IP)
+        self.assertEqual(mode, modes.CLONE)
         self.assertEqual(zone, "")
 
     def test_быстрый_повтор_переезжает_в_другую_зону(self):
-        self.h.state.record_rotation(modes.REPLACE_IP, "1.1.1.1", "2.2.2.2", "nl-ams1", "auto")
+        self.h.state.record_rotation(modes.CLONE, "1.1.1.1", "2.2.2.2", "nl-ams1", "auto")
         mode, zone = self.h.engine.choose()
-        self.assertEqual(mode, modes.RECREATE)
+        self.assertEqual(mode, modes.MOVE)
         self.assertEqual(zone, "fi-hel1")
 
+    def test_сохранённый_устаревший_режим_не_ломает_автоматику(self):
+        self.h.state["mode"] = "replace-ip"
+        mode, _ = self.h.engine.choose()
+        self.assertIn(mode, modes.ALL_MODES, "устаревший режим вернулся из choose()")
+
+    def test_переезду_подставляется_локация(self):
+        self.h.state["mode"] = modes.MOVE
+        mode, zone = self.h.engine.choose()
+        self.assertEqual(mode, modes.MOVE)
+        self.assertTrue(zone, "переезд без локации не стартует")
+
     def test_после_переезда_эскалировать_некуда(self):
-        self.h.state.record_rotation(modes.RECREATE, "1.1.1.1", "2.2.2.2", "fi-hel1", "auto")
+        self.h.state.record_rotation(modes.MOVE, "1.1.1.1", "2.2.2.2", "fi-hel1", "auto")
         mode, _ = self.h.engine.choose()
         self.assertEqual(mode, "", "должен требовать человека, а не жечь адреса дальше")
 

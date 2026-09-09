@@ -108,24 +108,29 @@ class Engine:
     def choose(self) -> tuple[str, str]:
         """(режим, зона). Пустой режим — эскалировать некуда, нужен человек."""
         configured = self.state["mode"] or self.cfg.get("rotation.mode", "auto")
+        if configured != "auto" and configured not in modes.ALL_MODES:
+            # Например, сохранённый replace-ip из старой версии.
+            logger.warning("режим %r больше не поддерживается — работаю как auto", configured)
+            configured = "auto"
         if configured != "auto":
-            return configured, ""
+            # Переезду нужна целевая локация, иначе он не стартует.
+            return configured, self.next_zone() if configured == modes.MOVE else ""
 
         history = self.state["history"]
         escalate_after = float(self.cfg.get("rotation.escalate_after_hours", 6))
         since = self.state.hours_since_last_rotation()
 
         if not history or since >= escalate_after:
-            # Обычный случай: просто меняем адрес.
-            return modes.REPLACE_IP, ""
+            # Обычный случай: копия сервера в той же локации, адрес бесплатный.
+            return modes.CLONE, ""
 
         last = history[0]
-        if last.get("mode") == modes.RECREATE:
+        if last.get("mode") == modes.MOVE:
             # Уже переезжали — и снова блок. Дальше гонять адреса бессмысленно.
             return "", ""
 
-        # Адрес умер слишком быстро: дело в подсети или протоколе, меняем локацию.
-        return modes.RECREATE, self.next_zone()
+        # Адрес умер слишком быстро: дело в подсети, а не в адресе — меняем локацию.
+        return modes.MOVE, self.next_zone()
 
     def next_zone(self) -> str:
         rotation = list(self.cfg.get("rotation.zone_rotation", []) or [])
@@ -176,6 +181,18 @@ class Engine:
         mode = pending.get("mode", "")
         step = pending.get("step", "?")
         data = pending.get("data", {})
+
+        if mode not in modes.ALL_MODES:
+            # Например, оставшаяся от убранного replace-ip. Доигрывать нечего,
+            # но сервер после неё мог остаться выключенным.
+            self.state.clear_pending()
+            self.notify(
+                f"⚠️ найдена незавершённая ротация в режиме {mode}, которого больше нет "
+                f"(шаг «{step}»). Запись убрана. Проверяю, работает ли сервер…"
+            )
+            modes._ensure_running(self.ctx(progress), self.secrets.get("SERVER_UUID"))
+            return None
+
         self.notify(f"⚠️ найдена незавершённая ротация {mode} на шаге «{step}» — доигрываю")
         with self.lock:
             self.busy = True

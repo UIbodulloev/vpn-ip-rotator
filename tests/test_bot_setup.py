@@ -301,12 +301,13 @@ class SetupWizardTest(unittest.TestCase):
             self.h.secrets.set(key, value)
         before = dict(self.h.cloud.servers[self.h.server_uuid])
 
-        for mode in ("replace-ip", "recreate", "floating"):
+        from rotator.modes import MODE_TITLES
+        for mode, human in MODE_TITLES.items():
             self.h.tg.timeline.clear()
             self.h.tg.user_says(f"/plan {mode}")
             self.h.pump()
             card = self.h.tg.all_visible()
-            self.assertIn(mode, card, f"режим {mode} не назван")
+            self.assertIn(human, card, f"режим {mode} не назван по-человечески")
             self.assertIn("Что произойдёт", card, f"нет шагов для {mode}")
             self.assertIn("Цена вопроса", card, f"нет цены для {mode}")
 
@@ -317,7 +318,7 @@ class SetupWizardTest(unittest.TestCase):
         self.h.tg.user_says("/plan")
         self.h.pump()
         buttons = [d for _, d in self.h.tg.buttons()]
-        for mode in ("plan:replace-ip", "plan:recreate", "plan:floating"):
+        for mode in ("plan:clone", "plan:move", "plan:floating"):
             self.assertIn(mode, buttons)
 
     def test_сообщения_размечены_html_и_не_ломаются(self):
@@ -327,6 +328,61 @@ class SetupWizardTest(unittest.TestCase):
         self.h.tg.user_says("/status")
         self.h.pump()
         self.assertTrue(self.h.tg.timeline, "бот промолчал")
+
+    def test_единое_меню_ведёт_во_все_разделы(self):
+        self.h.secrets.set("SERVER_UUID", self.h.server_uuid)
+        self.h.tg.user_says("/menu")
+        self.h.pump()
+        buttons = [d for _, d in self.h.tg.buttons()]
+        for target in ("cmd:status", "cmd:rotate", "srv:menu", "wiz:board", "guide:menu"):
+            self.assertIn(target, buttons, f"из меню не попасть в {target}")
+
+    def test_меню_сервера_показывает_состояние_и_действия(self):
+        self.h.secrets.set("UPCLOUD_TOKEN", GOOD_UC)
+        self.h.secrets.set("SERVER_UUID", self.h.server_uuid)
+        self.h.tg.user_says("/server")
+        self.h.pump()
+        card = self.h.tg.all_visible()
+        self.assertIn("Управление сервером", card)
+        self.assertIn("amnezia-test", card)
+        buttons = [d for _, d in self.h.tg.buttons()]
+        for target in ("srv:ask:stop", "srv:ask:reboot", "srv:ask:template",
+                       "srv:new", "srv:docker", "srv:ask:delete"):
+            self.assertIn(target, buttons, f"нет действия {target}")
+
+    def test_опасные_действия_требуют_подтверждения(self):
+        self.h.secrets.set("SERVER_UUID", self.h.server_uuid)
+        before = dict(self.h.cloud.servers[self.h.server_uuid])
+        for action in ("stop", "reboot", "delete", "template"):
+            self.h.tg.timeline.clear()
+            self.h.tg.user_taps(f"srv:ask:{action}")
+            self.h.pump()
+            card = self.h.tg.all_visible()
+            self.assertIn(f"srv:go:{action}", [d for _, d in self.h.tg.buttons()],
+                          f"{action}: нет кнопки подтверждения")
+            self.assertTrue(len(card) > 60, f"{action}: последствия не объяснены")
+        self.assertEqual(self.h.cloud.servers[self.h.server_uuid], before,
+                         "экран подтверждения что-то изменил")
+
+    def test_удаление_предупреждает_если_нет_шаблона(self):
+        self.h.secrets.set("SERVER_UUID", self.h.server_uuid)
+        self.h.tg.user_taps("srv:ask:delete")
+        self.h.pump()
+        self.assertIn("Шаблонов нет", self.h.tg.all_visible())
+
+    def test_контейнеры_без_ssh_объясняют_чего_не_хватает(self):
+        self.h.secrets.set("SERVER_UUID", self.h.server_uuid)
+        self.h.tg.user_taps("srv:docker")
+        self.h.pump()
+        self.assertIn("SSH-ключ не задан", self.h.tg.all_visible())
+        self.assertIn("set:SSH_KEY_PATH", [d for _, d in self.h.tg.buttons()])
+
+    def test_поднять_из_шаблона_без_шаблонов(self):
+        self.h.secrets.set("SERVER_UUID", self.h.server_uuid)
+        self.h.tg.user_taps("srv:new")
+        self.h.pump()
+        self.assertIn("Шаблонов нет", self.h.tg.all_visible())
+        self.assertIn("srv:ask:template", [d for _, d in self.h.tg.buttons()])
 
     def test_кнопка_инструкции_есть_в_главном_меню(self):
         self.h.tg.user_says("/help")

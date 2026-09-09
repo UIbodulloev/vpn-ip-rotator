@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import guide, log, modes, probes, ui
+from . import guide, log, modes, probes, remote, ui
 from .config import Secrets, domain_of, masked
 from .engine import Engine
 from .relay import Relay
@@ -49,13 +49,15 @@ OPTIONAL_KEYS = [
 # Единственный источник правды по командам: из него строится и /help, и меню
 # Telegram (setMyCommands), чтобы они не разъезжались.
 COMMANDS = [
+    ("menu", "единое меню: всё управление в одном месте"),
+    ("server", "управление сервером: стоп, старт, шаблон, контейнеры"),
     ("status", "адрес, состояние сервера, последние пробы"),
     ("probe", "проверить доступность VPN прямо сейчас"),
     ("ip", "что у сервера и что стоит в DNS"),
     ("simulate", "холостой прогон: что сделала бы автоматика"),
     ("plan", "что именно сделает каждый режим на вашем сервере"),
     ("rotate", "сменить адрес"),
-    ("mode", "режим автоматики: auto / replace-ip / recreate / floating"),
+    ("mode", "режим автоматики: auto / clone / move / floating"),
     ("pause", "выключить автоматику"),
     ("resume", "включить автоматику"),
     ("log", "последние строки журнала"),
@@ -79,6 +81,7 @@ def _help_text() -> str:
 
 
 HELP_GROUPS = [
+    ('Главное', ['menu', 'server']),
     ('Наблюдение', ['status', 'probe', 'ip', 'log']),
     ('Проверка вхолостую', ['simulate', 'plan']),
     ('Управление', ['rotate', 'mode', 'pause', 'resume', 'rollback']),
@@ -410,8 +413,12 @@ class Bot:
                 ui.joined(ui.title("Команды", "🤖"), ui.esc(HELP.split("\n", 2)[-1].strip())),
                 MAIN_KEYBOARD,
             )
+        elif command == "/menu":
+            self.main_menu()
+        elif command == "/server":
+            self.server_menu()
         elif command == "/status":
-            self.send(self.status_text())
+            self.send(self.status_text(), MAIN_KEYBOARD)
         elif command == "/probe":
             self.cmd_probe()
         elif command == "/simulate":
@@ -591,20 +598,8 @@ class Bot:
             ("домен", domain),
         ])
 
-        if argument == modes.REPLACE_IP:
-            plan = ui.steps([
-                ("Остановить сервер", "мягко, с ожиданием до "
-                 f"{self.cfg.get('rotation.wait_stop_sec')} с"),
-                ("Заказать новый IPv4", f"на интерфейс {info['mac'] or '—'}"),
-                (f"Освободить {info['ipv4']}", "строго после выдачи нового"),
-                ("Запустить сервер", "адрес приезжает по DHCP, netplan не трогаем"),
-                (f"Переписать A-запись {domain}", f"TTL {self.cfg.get('rotation.dns_ttl')} с"),
-                ("Дождаться порта 443", "подтверждение, что VPN поднялся"),
-            ])
-            cost = ["даунтайм ~2–3 минуты", "денег не стоит", "конфиги клиентов не меняются"]
-
-        elif argument == modes.RECREATE:
-            target = self.engine.next_zone() or info["zone"]
+        if argument == modes.CLONE or argument == modes.MOVE:
+            target = (self.engine.next_zone() or info["zone"]) if argument == modes.MOVE else info["zone"]
             same = target == info["zone"]
             plan = ui.steps([
                 ("Остановить сервер", "шаблон снимается только с остановленного"),
@@ -612,13 +607,13 @@ class Bot:
                  "внутри всё: ключи, клиенты, swap, authorized_keys"),
             ] + ([] if same else [(f"Скопировать диск в {target}", "самый долгий шаг, до получаса")]) + [
                 (f"Создать сервер {info['plan']} в {target}", "из шаблона, адрес выдаётся бесплатно"),
-                (f"Переписать A и AAAA {domain}", "старые конфиги остаются рабочими"),
-                (f"Удалить старый сервер", f"адрес {info['ipv4']} освобождается автоматически"),
+                (f"Переписать A и AAAA {domain}", "старые конфиги клиентов остаются рабочими"),
+                ("Удалить старый сервер", f"адрес {info['ipv4']} освобождается автоматически"),
                 ("Прибрать шаблоны", f"остаётся {self.cfg.get('rotation.keep_templates')} как точка отката"),
             ])
             cost = [
-                f"даунтайм ~5–10 минут" + ("" if same else " плюс копирование диска"),
-                "новый адрес бесплатный, остаток за старый сервер возвращается",
+                "даунтайм ~5–10 минут" + ("" if same else " плюс копирование диска"),
+                "адрес бесплатный, остаток за старый сервер возвращается на счёт",
                 f"шаблон {info['storage_size']} ГБ тарифицируется как доп. хранилище",
                 "конфиги клиентов не меняются: ключи внутри шаблона",
             ]
@@ -634,12 +629,12 @@ class Bot:
             cost = [
                 "даунтайма нет",
                 "плавающий адрес тарифицируется помесячно",
-                "нужен SSH-ключ; если заблокирован и 22-й порт, режим не сработает",
+                "нужен SSH-ключ; если закрыт и 22-й порт, режим не сработает",
                 "конфиги клиентов не меняются",
             ]
 
         self.edit(message_id, ui.joined(
-            ui.title(f"Режим {argument}", "📋"),
+            ui.title(modes.MODE_TITLES.get(argument, argument), "📋"),
             facts,
             ui.title("Что произойдёт"),
             plan,
@@ -767,6 +762,270 @@ class Bot:
         ]
         self.send("Планы UpCloud:\n\n" + "\n".join(lines))
 
+    # --- единое меню ---------------------------------------------------------
+
+    def main_menu(self) -> None:
+        state = self.engine.state
+        verdict = state["last_verdict"]
+        head = ui.joined(
+            ui.title("vpn-ip-rotator", "🤖"),
+            ui.table([
+                ("сервер", state["ipv4"] or "не выбран"),
+                ("локация", state["zone"] or "—"),
+                ("домен", domain_of(self.cfg, self.secrets) or "—"),
+                ("состояние", probes.VERDICT_TEXT.get(verdict, "проверок ещё не было")),
+            ]),
+            ui.note("dry_run включён — ротации только имитируются" if self.cfg.get("dry_run")
+                    else "боевой режим"),
+        )
+        self.send(head, [
+            [{"text": "📊 Состояние", "callback_data": "cmd:status"},
+             {"text": "🔍 Проверить", "callback_data": "cmd:probe"}],
+            [{"text": "🔄 Сменить адрес", "callback_data": "cmd:rotate"}],
+            [{"text": "🖥 Управление сервером", "callback_data": "srv:menu"}],
+            [{"text": "🧪 Вхолостую", "callback_data": "cmd:simulate"},
+             {"text": "📋 Что произойдёт", "callback_data": "cmd:plan"}],
+            [{"text": "⚙️ Настройка", "callback_data": "wiz:board"},
+             {"text": "📖 Инструкция", "callback_data": "guide:menu"}],
+        ])
+
+    # --- ручное управление сервером ------------------------------------------
+
+    def server_menu(self) -> None:
+        try:
+            info = self.engine.refresh()
+        except Exception as exc:                               # noqa: BLE001
+            return self.send(ui.joined(
+                ui.title("Сервер не читается", ui.NO), ui.block([str(exc)])),
+                [[{"text": "⚙️ Настройка", "callback_data": "wiz:board"}]])
+
+        running = info["state"] == "started"
+        templates = self.engine.state["templates"]
+        head = ui.joined(
+            ui.title("Управление сервером", "🖥"),
+            ui.table([
+                ("имя", info["hostname"]),
+                ("состояние", f"{'🟢' if running else '🔴'} {info['state']}"),
+                ("адрес", info["ipv4"]),
+                ("локация", f"{info['zone']} · {info['plan']}"),
+                ("диск", f"{info['storage_size']} ГБ, {info['storage_tier'] or 'standard'}"),
+                ("шаблонов", len(templates)),
+            ]),
+            ui.note("Действия ниже выполняются вручную и не трогают DNS, "
+                    "если не сказано иное."),
+        )
+        power = ([{"text": "⏸ Остановить", "callback_data": "srv:ask:stop"}]
+                 if running else [{"text": "▶️ Запустить", "callback_data": "srv:go:start"}])
+        self.send(head, [
+            power + [{"text": "🔁 Перезагрузить", "callback_data": "srv:ask:reboot"}],
+            [{"text": "📸 Снять шаблон (дамп)", "callback_data": "srv:ask:template"}],
+            [{"text": "🆕 Поднять сервер из шаблона", "callback_data": "srv:new"}],
+            [{"text": "🐳 Контейнеры", "callback_data": "srv:docker"},
+             {"text": "🔍 Протоколы", "callback_data": "srv:go:protocols"}],
+            [{"text": "🗑 Удалить сервер", "callback_data": "srv:ask:delete"}],
+            [{"text": "◀️ Меню", "callback_data": "cmd:menu"}],
+        ])
+
+    SERVER_ACTIONS = {
+        "stop": ("Остановить сервер",
+                 "VPN перестанет работать до запуска. Адрес и диск сохранятся. "
+                 "DNS не меняется.", "⏸ Да, остановить"),
+        "reboot": ("Перезагрузить сервер",
+                   "Мягкая остановка и запуск. VPN недоступен около минуты. "
+                   "Адрес не меняется.", "🔁 Да, перезагрузить"),
+        "template": ("Снять шаблон диска",
+                     "Сервер будет остановлен на время снятия, потом запущен обратно. "
+                     "Шаблон — это дамп: ключи, клиенты, настройки. "
+                     "Он тарифицируется как дополнительное хранилище.", "📸 Да, снять"),
+        "delete": ("Удалить сервер",
+                   "СЕРВЕР И ЕГО ДИСК БУДУТ УДАЛЕНЫ БЕЗВОЗВРАТНО, адрес освободится. "
+                   "Если шаблона нет — восстановить будет нечем. "
+                   "Обычно вместо этого нужен «Сменить адрес».", "🗑 Да, удалить навсегда"),
+    }
+
+    def server_confirm(self, action: str) -> None:
+        heading, what, button = self.SERVER_ACTIONS[action]
+        state = self.engine.state
+        extra = ""
+        if action == "delete" and not state["templates"]:
+            extra = f"\n\n{ui.WARN} Шаблонов нет — восстановить сервер будет не из чего."
+        self.send(
+            ui.joined(ui.title(heading, ui.WARN), ui.esc(what) + extra,
+                      ui.table([("сервер", state["ipv4"]), ("локация", state["zone"])])),
+            [[{"text": button, "callback_data": f"srv:go:{action}"}],
+             [{"text": "◀️ Отмена", "callback_data": "srv:menu"}]],
+        )
+
+    def server_action(self, action: str, argument: str = "") -> None:
+        header = ui.title(f"Сервер: {action}", "🖥")
+        message_id = self.send(ui.joined(header, ui.note("выполняю…")))
+        lines: list[str] = []
+
+        def say(text: str) -> None:
+            lines.append(text)
+            self.edit(message_id, ui.joined(header, ui.block(lines[-12:])))
+
+        def worker() -> None:
+            try:
+                self._server_action_body(action, argument, say)
+            except Exception as exc:                           # noqa: BLE001
+                logger.exception("действие %s не удалось", action)
+                say(f"{ui.NO} {exc}")
+            self.send("Что дальше?", [[{"text": "🖥 К управлению", "callback_data": "srv:menu"}]])
+
+        threading.Thread(target=worker, name=f"srv-{action}", daemon=True).start()
+
+    def _server_action_body(self, action: str, argument: str, say) -> None:
+        uc = self.engine.uc
+        uuid = self.secrets.get("SERVER_UUID")
+        ctx = self.engine.ctx(say)
+
+        if action == "start":
+            say("запускаю…")
+            modes._start_and_wait(ctx, uuid)
+            info = self.engine.refresh()
+            return say(f"{ui.YES} работает на {info['ipv4']}")
+
+        if action == "stop":
+            modes._stop_and_wait(ctx, uuid)
+            return say(f"{ui.YES} остановлен. Запустить: 🖥 → ▶️")
+
+        if action == "reboot":
+            modes._stop_and_wait(ctx, uuid)
+            modes._start_and_wait(ctx, uuid)
+            info = self.engine.refresh()
+            return say(f"{ui.YES} перезагружен, адрес {info['ipv4']}")
+
+        if action == "template":
+            info = self.engine.refresh()
+            was_running = info["state"] == "started"
+            if was_running:
+                modes._stop_and_wait(ctx, uuid)
+            say(f"снимаю шаблон диска {info['storage_size']} ГБ…")
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            template = uc.templatize(info["storage_uuid"], f"manual-{info['hostname']}-{stamp}")
+            uc.wait_storage_online(template["uuid"], int(self.cfg.get("rotation.wait_storage_sec", 3600)),
+                                   on_tick=lambda st, left: say(f"готовится… ({st})"))
+            self.engine.state.add_template(template["uuid"], info["zone"])
+            say(f"{ui.YES} шаблон {template['uuid'][:8]}… готов")
+            if was_running:
+                modes._start_and_wait(ctx, uuid)
+                say("сервер запущен обратно")
+            return say(ui.strip_tags("Он тарифицируется как доп. хранилище. "
+                                     "Удалить лишние можно после следующей ротации."))
+
+        if action == "delete":
+            info = self.engine.refresh()
+            if info["state"] != "stopped":
+                modes._stop_and_wait(ctx, uuid)
+            uc.delete_server(uuid, storages=True, backups="delete")
+            self.engine.state.update(server_uuid="", ipv4="", ipv6="")
+            self.secrets.unset("SERVER_UUID")
+            return say(f"{ui.YES} сервер удалён, адрес {info['ipv4']} освобождён. "
+                       "Поднимите новый: 🖥 → 🆕")
+
+        if action in ("containers", "protocols", "docker-up", "docker-restart"):
+            return self._remote_action(action, say)
+
+        if action == "create":
+            return self._create_from_template(argument, say)
+
+        say(f"{ui.NO} неизвестное действие {action}")
+
+    def _remote_action(self, action: str, say) -> None:
+        key = self.secrets.get("SSH_KEY_PATH")
+        if not key:
+            return say(ui.strip_tags(
+                "SSH-ключ не задан — без него контейнеры не посмотреть. "
+                "/setup → Необязательное → SSH-ключ, приватный"))
+        host = self.engine.state["ipv4"]
+        port = int(self.cfg.get("vpn.control_port", 22)) or 22
+        command = {
+            "containers": remote.CONTAINERS,
+            "docker-up": remote.CONTAINERS_UP,
+            "docker-restart": remote.CONTAINERS_RESTART,
+            "protocols": remote.LISTENERS + " ; " + remote.DISK,
+        }[action]
+        result = remote.run(host, command, key_path=key, port=port)
+        say(result.text())
+        if action == "protocols":
+            probe = self.engine.probe()
+            say(f"снаружи: {ui.strip_tags(probe.short())}")
+
+    def _create_from_template(self, template_uuid: str, say) -> None:
+        templates = self.engine.state["templates"]
+        entry = next((x for x in templates if x["uuid"] == template_uuid), None)
+        if not entry:
+            return say(f"{ui.NO} шаблон не найден — снимите новый")
+        state = self.engine.state
+        spec = {
+            "zone": entry["zone"],
+            "title": state["hostname"] or "amnezia",
+            "hostname": state["hostname"] or "amnezia",
+            "plan": state["plan"] or "1xCPU-1GB",
+            "storage_devices": {"storage_device": [{
+                "action": "clone", "storage": entry["uuid"],
+                "title": (state["hostname"] or "amnezia") + "-osdisk",
+                "size": 10, "tier": "standard",
+            }]},
+            "networking": {"interfaces": {"interface": [
+                {"type": "public", "ip_addresses": {"ip_address": [{"family": "IPv4"}]}},
+                {"type": "utility", "ip_addresses": {"ip_address": [{"family": "IPv4"}]}},
+                {"type": "public", "ip_addresses": {"ip_address": [{"family": "IPv6"}]}},
+            ]}},
+        }
+        pubkey = self.secrets.get("SSH_PUBKEY")
+        if pubkey:
+            spec["login_user"] = {"username": "root", "ssh_keys": {"ssh_key": [pubkey]}}
+        say(f"создаю сервер в {entry['zone']} из шаблона {entry['uuid'][:8]}…")
+        created = self.engine.uc.create_server(spec)
+        new_uuid = created.get("uuid", "")
+        server = self.engine.uc.wait_server_state(
+            new_uuid, "started", int(self.cfg.get("rotation.wait_start_sec", 300)),
+            on_tick=lambda st, left: say(f"поднимается… ({st})"))
+        info = modes.upcloud.summarize(server)
+        self.secrets.set("SERVER_UUID", new_uuid)
+        self.engine.refresh()
+        say(f"{ui.YES} готов: {info['ipv4']} в {info['zone']}")
+        say(ui.strip_tags("DNS НЕ обновлён — сделайте это сами или запустите смену адреса. "
+                          "Старый сервер, если он ещё есть, тоже надо удалить вручную."))
+
+    def docker_menu(self) -> None:
+        has_key = bool(self.secrets.get("SSH_KEY_PATH"))
+        body = ui.joined(
+            ui.title("Контейнеры Amnezia", "🐳"),
+            ui.esc("Действия выполняются на VPN-сервере по SSH. Ротации это не требуется — "
+                   "там всё идёт через API, и ключей на сервере не хранится."),
+            "" if has_key else ui.note("SSH-ключ не задан: /setup → Необязательное → SSH-ключ, приватный"),
+        )
+        rows = [
+            [{"text": "📋 Показать состояние", "callback_data": "srv:go:containers"}],
+            [{"text": "▶️ Поднять остановленные", "callback_data": "srv:go:docker-up"}],
+            [{"text": "🔁 Перезапустить все", "callback_data": "srv:go:docker-restart"}],
+            [{"text": "◀️ Назад", "callback_data": "srv:menu"}],
+        ] if has_key else [
+            [{"text": "⚙️ Задать SSH-ключ", "callback_data": "set:SSH_KEY_PATH"}],
+            [{"text": "◀️ Назад", "callback_data": "srv:menu"}],
+        ]
+        self.send(body, rows)
+
+    def server_new(self) -> None:
+        templates = self.engine.state["templates"]
+        if not templates:
+            return self.send(
+                ui.joined(ui.title("Шаблонов нет", ui.WARN),
+                          ui.esc("Сначала снимите дамп текущего сервера — из него и поднимется новый.")),
+                [[{"text": "📸 Снять шаблон", "callback_data": "srv:ask:template"}],
+                 [{"text": "◀️ Назад", "callback_data": "srv:menu"}]])
+        rows = [[{"text": f"{time.strftime('%d.%m %H:%M', time.localtime(x['created']))} · {x['zone']}",
+                  "callback_data": f"srv:create:{x['uuid']}"}] for x in templates[:8]]
+        rows.append([{"text": "◀️ Назад", "callback_data": "srv:menu"}])
+        self.send(ui.joined(
+            ui.title("Поднять сервер из шаблона", "🆕"),
+            ui.esc("Новый сервер поднимется в той же локации, что и шаблон. "
+                   "DNS не обновляется, старый сервер не удаляется — это ручной режим."),
+        ), rows)
+
     # --- ротация ------------------------------------------------------------
 
     def cmd_rotate(self, argument: str) -> None:
@@ -783,11 +1042,12 @@ class Bot:
             return self.ask_confirm(argument, "")
 
         keyboard = [
-            [{"text": "replace-ip · ~3 мин · бесплатно", "callback_data": "rot:replace-ip"}],
-            [{"text": "recreate · ~10 мин · смена зоны", "callback_data": "rot:recreate"}],
-            [{"text": "floating · без даунтайма · ~$3.5/мес", "callback_data": "rot:floating"}],
-            [{"text": "❓ чем они отличаются", "callback_data": "guide:modes"}],
-            [{"text": "отмена", "callback_data": "cancel"}],
+            [{"text": "1️⃣ Копия здесь · ~10 мин · бесплатно", "callback_data": "rot:clone"}],
+            [{"text": "2️⃣ Переезд в другую страну · бесплатно", "callback_data": "rot:move"}],
+            [{"text": "3️⃣ Плавающий адрес · без даунтайма · платно", "callback_data": "rot:floating"}],
+            [{"text": "📋 Что именно произойдёт", "callback_data": "cmd:plan"}],
+            [{"text": "❓ Чем они отличаются", "callback_data": "guide:modes"}],
+            [{"text": "◀️ Отмена", "callback_data": "cancel"}],
         ]
         mode, zone = self.engine.choose()
         auto = f"Автоматика выбрала бы: {mode or 'ничего — эскалировать некуда'}" + (f" → {zone}" if zone else "")
@@ -804,7 +1064,7 @@ class Bot:
         keyboard = [
             [{
                 "text": ("• " if z["id"] == current else "") + f"{z['id']} — {z.get('description', '')}",
-                "callback_data": f"rot:recreate:{z['id']}",
+                "callback_data": f"rot:move:{z['id']}",
             }]
             for z in ordered[:12]
         ]
@@ -814,12 +1074,14 @@ class Bot:
     def ask_confirm(self, mode: str, zone: str) -> None:
         state = self.engine.state
         details = {
-            "replace-ip": "Сервер остановится и запустится. Даунтайм ~2-3 минуты, адрес сменится, денег не стоит.",
-            "recreate": "Снимется шаблон диска, поднимется новый сервер, старый будет удалён. "
-                        "Даунтайм ~5-10 минут в своей зоне и заметно дольше при переезде. Адрес бесплатный.",
-            "floating": "Плавающий адрес поднимется на живом сервере через SSH. Даунтайма нет, "
-                        "адрес тарифицируется помесячно.",
-        }[mode]
+            modes.CLONE: "Снимется шаблон диска, поднимется новый сервер в той же локации, "
+                         "старый будет удалён. Даунтайм ~5–10 минут. Адрес бесплатный, "
+                         "конфиги клиентов не меняются.",
+            modes.MOVE: "То же самое, но новый сервер поднимется в другой локации. Копирование "
+                        "диска между зонами долгое — до получаса. Адрес бесплатный.",
+            modes.FLOATING: "Плавающий адрес поднимется на живом сервере через SSH. Даунтайма нет, "
+                            "адрес тарифицируется помесячно.",
+        }.get(mode, "")
         target = f"\nЗона: {zone}" if zone else ""
         keyboard = [
             [{"text": "да, запускаю", "callback_data": f"go:{mode}:{zone}"}],
@@ -865,7 +1127,7 @@ class Bot:
             "Клиенты, добавленные после снятия шаблона, пропадут.\n\n"
             "Это тот же recreate — подтвердите зону:",
             [
-                [{"text": f"откатить в {newest['zone']}", "callback_data": f"rot:recreate:{newest['zone']}"}],
+                [{"text": f"откатить в {newest['zone']}", "callback_data": f"rot:move:{newest['zone']}"}],
                 [{"text": "отмена", "callback_data": "cancel"}],
             ],
         )
@@ -1002,7 +1264,7 @@ class Bot:
         self.send(ui.joined(
             ui.title("Необязательные ключи", "⚙️"),
             ui.note("Каждый включает отдельную возможность. Без них работают "
-                    "replace-ip и recreate."),
+                    "копия здесь и переезд."),
             ui.block(rows),
         ), keyboard)
 
@@ -1239,7 +1501,7 @@ class Bot:
                          ("адрес", info["ipv4"]),
                          ("зона", f"{info['zone']} · {info['plan']}")]
                 if not info["mac"]:
-                    problems.append("MAC интерфейса не определился — replace-ip не сработает")
+                    problems.append("MAC публичного интерфейса не определился — floating не сработает")
                 if not info["storage_uuid"]:
                     problems.append("системный диск не определился — recreate не сработает")
             except Exception as exc:                           # noqa: BLE001
@@ -1284,9 +1546,9 @@ class Bot:
         admin = bool(self.secrets.get("UPCLOUD_ADMIN_TOKEN"))
         sub = bool(self.secrets.get("UPCLOUD_SUBACCOUNT"))
         sections.append(ui.joined(ui.title("Доступные режимы"), ui.table([
-            ("replace-ip", ui.YES),
-            ("recreate", ui.YES if (admin or not sub) else f"{ui.WARN} после переезда нужны права вручную"),
-            ("floating", ui.YES if ssh else f"{ui.SKIP} нет SSH-ключа"),
+            ("копия здесь", ui.YES if (admin or not sub) else f"{ui.WARN} после неё нужны права вручную"),
+            ("переезд", ui.YES if (admin or not sub) else f"{ui.WARN} после неё нужны права вручную"),
+            ("плавающий адрес", ui.YES if ssh else f"{ui.SKIP} нет SSH-ключа"),
         ])))
         if sub and not admin:
             problems.append("субаккаунт без админ-токена: после recreate ротация упрётся в 403")
@@ -1331,6 +1593,18 @@ class Bot:
             return self.optional_menu()
         if data == "wiz:check":
             return self.cmd_check()
+        if data == "srv:menu":
+            return self.server_menu()
+        if data == "srv:docker":
+            return self.docker_menu()
+        if data == "srv:new":
+            return self.server_new()
+        if data.startswith("srv:ask:"):
+            return self.server_confirm(data.split(":", 2)[2])
+        if data.startswith("srv:go:"):
+            return self.server_action(data.split(":", 2)[2])
+        if data.startswith("srv:create:"):
+            return self.server_action("create", data.split(":", 2)[2])
         if data.startswith("plan:"):
             return self.cmd_plan(data.split(":", 1)[1])
         if data.startswith("cmd:"):
@@ -1345,7 +1619,7 @@ class Bot:
             choice = data.split(":", 1)[1]
             self.engine.state["mode"] = "" if choice == "auto" else choice
             return self.send(f"Режим автоматики: {choice}")
-        if data == "rot:recreate":
+        if data == "rot:move":
             return self.ask_zone()
         if data.startswith("rot:"):
             parts = data.split(":")

@@ -194,8 +194,14 @@ class FakeCloud:
                             server_uuid = uid
             if not server_uuid:
                 return FakeResponse(400, {"error": {"error_message": "нет сервера"}})
-            if spec.get("mac") and self.servers[server_uuid]["state"] != "stopped" and not spec.get("floating"):
-                # Ровно то ограничение, что описано в документации UpCloud.
+            # Настоящий UpCloud отвергает MAC для обычного адреса — именно на этом
+            # сломалась боевая ротация, пока фейк был мягче оригинала.
+            if spec.get("mac") and not spec.get("floating"):
+                return FakeResponse(409, {"error": {
+                    "error_code": "FLOATING_IP_NOT_AVAILABLE",
+                    "error_message": "Only floating IP addresses can be assigned to MAC addresses.",
+                }})
+            if spec.get("floating") and self.servers[server_uuid]["state"] not in ("started", "stopped"):
                 return FakeResponse(409, {"error": {"error_code": "SERVER_STATE_ILLEGAL"}})
             self._attach_ip(server_uuid, address, spec.get("mac", ""))
             return FakeResponse(201, {"ip_address": {"address": address, "family": "IPv4"}})

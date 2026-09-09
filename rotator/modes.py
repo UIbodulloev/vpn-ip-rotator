@@ -21,10 +21,23 @@ from .upcloud import UpCloud, UpCloudError
 
 logger = log.get("modes")
 
-REPLACE_IP = "replace-ip"
-RECREATE = "recreate"
-FLOATING = "floating"
-ALL_MODES = (REPLACE_IP, RECREATE, FLOATING)
+# Режим replace-ip убран намеренно. UpCloud не позволяет запросить свежий адрес
+# на существующий публичный интерфейс («Specifying an address in public
+# interfaces requires special privileges»), а выданный без MAC адрес приезжает на
+# НОВЫЙ интерфейс, который netplan на сервере не настроен поднимать. После
+# освобождения старого адреса сервер остался бы вообще без публичного IPv4 —
+# без VPN и без SSH. Клонирование сервера решает ту же задачу и бесплатно.
+CLONE = "clone"          # копия в той же зоне
+MOVE = "move"            # копия в другой зоне
+FLOATING = "floating"    # плавающий адрес на живом сервере
+RECREATE = CLONE         # прежнее имя: recreate == клонирование
+ALL_MODES = (CLONE, MOVE, FLOATING)
+
+MODE_TITLES = {
+    CLONE: "копия сервера в той же локации",
+    MOVE: "переезд в другую локацию",
+    FLOATING: "плавающий адрес",
+}
 
 NETPLAN_FILE = "/etc/netplan/99-floating.yaml"
 
@@ -142,74 +155,6 @@ def _finish(ctx: Ctx, mode: str, old_ip: str, new_ip: str, zone: str, reason: st
     return {"mode": mode, "old_ip": old_ip, "new_ip": new_ip, "zone": zone, "service_up": alive}
 
 
-# --- режим 1: replace-ip ----------------------------------------------------
-
-
-def replace_ip(ctx: Ctx, reason: str = "manual", resume: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Стоп → новый IPv4 на MAC eth0 → освободить старый → старт. ~2-3 минуты, бесплатно."""
-    data: dict[str, Any] = dict(resume or {})
-    uuid = ctx.secrets.get("SERVER_UUID")
-
-    if not data.get("old_ip"):
-        info = collect(ctx)
-        if not info["mac"]:
-            raise RotationError("не удалось определить MAC публичного интерфейса")
-        data.update(old_ip=info["ipv4"], mac=info["mac"], zone=info["zone"])
-        ctx.state.set_pending(REPLACE_IP, "collected", **data)
-
-    ctx.say(f"режим replace-ip, текущий адрес {data['old_ip']}")
-
-    if not data.get("stopped"):
-        ctx.state.set_pending(REPLACE_IP, "stopping", **data)
-        _stop_and_wait(ctx, uuid)
-        data["stopped"] = True
-        ctx.state.set_pending(REPLACE_IP, "stopped", **data)
-
-    if not data.get("new_ip"):
-        ctx.state.set_pending(REPLACE_IP, "assigning", **data)
-        ctx.say("заказываю новый IPv4 на существующий интерфейс…")
-        # MAC указывается намеренно: адрес садится на eth0, а не создаёт новый
-        # интерфейс — иначе на сервере пришлось бы править netplan.
-        assigned = ctx.uc.assign_ip(server_uuid=uuid, mac=data["mac"], family="IPv4")
-        data["new_ip"] = assigned.get("address", "")
-        if not data["new_ip"]:
-            raise RotationError(f"UpCloud не вернул адрес: {assigned}")
-        ctx.state.set_pending(REPLACE_IP, "assigned", **data)
-        ctx.say(f"выдан {data['new_ip']}")
-
-    if not data.get("released"):
-        # Строго после выдачи нового: интерфейс не должен остаться без адресов.
-        ctx.state.set_pending(REPLACE_IP, "releasing", **data)
-        for attempt in range(3):
-            try:
-                ctx.uc.release_ip(data["old_ip"])
-                data["released"] = True
-                break
-            except UpCloudError as exc:
-                logger.warning("попытка %s освободить %s: %s", attempt + 1, data["old_ip"], exc)
-                time.sleep(5)
-        ctx.state.set_pending(REPLACE_IP, "released", **data)
-
-    if not data.get("released"):
-        # Старый адрес остался — DHCP может выдать при старте именно его.
-        # Поднимаем сервер, но DNS не трогаем и зовём человека.
-        _start_and_wait(ctx, uuid)
-        ctx.state.clear_pending()
-        raise RotationError(
-            f"не удалось освободить {data['old_ip']}. Сервер запущен со старым адресом, "
-            "DNS не менялся — разберитесь в панели UpCloud вручную"
-        )
-
-    ctx.say(f"старый {data['old_ip']} освобождён")
-    server = _start_and_wait(ctx, uuid)
-    info = upcloud.summarize(server)
-    actual_ip = info["ipv4"] or data["new_ip"]
-    ctx.state.update(ipv4=actual_ip, ipv6=info["ipv6"], eth0_mac=info["mac"])
-
-    dns = update_dns(ctx, actual_ip, info["ipv6"])
-    return _finish(ctx, REPLACE_IP, data["old_ip"], actual_ip, info["zone"], reason, dns)
-
-
 # --- режим 2: recreate ------------------------------------------------------
 
 
@@ -243,7 +188,7 @@ def recreate(
             storage_tier=info["storage_tier"] or "standard",
         )
         old_uuid = data["old_uuid"]
-        ctx.state.set_pending(RECREATE, "collected", **data)
+        ctx.state.set_pending(CLONE, "collected", **data)
 
     target_zone = zone or data.get("target_zone") or data["src_zone"]
     data["target_zone"] = target_zone
@@ -255,20 +200,20 @@ def recreate(
 
     try:
         if not data.get("stopped"):
-            ctx.state.set_pending(RECREATE, "stopping", **data)
+            ctx.state.set_pending(CLONE, "stopping", **data)
             _stop_and_wait(ctx, old_uuid)
             data["stopped"] = True
-            ctx.state.set_pending(RECREATE, "stopped", **data)
+            ctx.state.set_pending(CLONE, "stopped", **data)
 
         if not data.get("template_uuid"):
-            ctx.state.set_pending(RECREATE, "templatizing", **data)
+            ctx.state.set_pending(CLONE, "templatizing", **data)
             ctx.say("снимаю шаблон системного диска (ключи, клиенты, swap — всё внутри)…")
             stamp = time.strftime("%Y%m%d-%H%M%S")
             template = ctx.uc.templatize(data["storage_uuid"], f"rotator-{data['hostname']}-{stamp}")
             data["template_uuid"] = template.get("uuid", "")
             if not data["template_uuid"]:
                 raise RotationError(f"templatize не вернул uuid: {template}")
-            ctx.state.set_pending(RECREATE, "templatizing", **data)
+            ctx.state.set_pending(CLONE, "templatizing", **data)
             ctx.uc.wait_storage_online(
                 data["template_uuid"],
                 int(ctx.cfg.get("rotation.wait_storage_sec", 3600)),
@@ -279,13 +224,13 @@ def recreate(
 
         # Кросс-зонный переезд: клонируем шаблон в целевую зону и делаем шаблон уже там.
         if not same_zone and not data.get("zone_template_uuid"):
-            ctx.state.set_pending(RECREATE, "cloning", **data)
+            ctx.state.set_pending(CLONE, "cloning", **data)
             ctx.say(f"копирую диск в {target_zone} — самый долгий шаг…")
             clone = ctx.uc.clone_storage(
                 data["template_uuid"], target_zone, f"rotator-clone-{target_zone}-{int(time.time())}"
             )
             data["clone_uuid"] = clone.get("uuid", "")
-            ctx.state.set_pending(RECREATE, "cloning", **data)
+            ctx.state.set_pending(CLONE, "cloning", **data)
             ctx.uc.wait_storage_online(
                 data["clone_uuid"],
                 int(ctx.cfg.get("rotation.wait_storage_sec", 3600)),
@@ -293,7 +238,7 @@ def recreate(
             )
             zone_template = ctx.uc.templatize(data["clone_uuid"], f"rotator-{target_zone}-{int(time.time())}")
             data["zone_template_uuid"] = zone_template.get("uuid", "")
-            ctx.state.set_pending(RECREATE, "cloning", **data)
+            ctx.state.set_pending(CLONE, "cloning", **data)
             ctx.uc.wait_storage_online(
                 data["zone_template_uuid"], int(ctx.cfg.get("rotation.wait_storage_sec", 3600))
             )
@@ -303,13 +248,13 @@ def recreate(
         source_template = data.get("zone_template_uuid") or data["template_uuid"]
 
         if not data.get("new_uuid"):
-            ctx.state.set_pending(RECREATE, "creating", **data)
+            ctx.state.set_pending(CLONE, "creating", **data)
             ctx.say("создаю новый сервер из шаблона…")
             created = ctx.uc.create_server(_server_spec(ctx, data, source_template, target_zone))
             data["new_uuid"] = created.get("uuid", "")
             if not data["new_uuid"]:
                 raise RotationError(f"create_server не вернул uuid: {created}")
-            ctx.state.set_pending(RECREATE, "created", **data)
+            ctx.state.set_pending(CLONE, "created", **data)
 
         server = ctx.uc.wait_server_state(
             data["new_uuid"],
@@ -320,7 +265,7 @@ def recreate(
         info = upcloud.summarize(server)
         data["new_ip"] = info["ipv4"]
         data["new_ipv6"] = info["ipv6"]
-        ctx.state.set_pending(RECREATE, "started", **data)
+        ctx.state.set_pending(CLONE, "started", **data)
         ctx.say(f"новый сервер {info['uuid'][:8]}… поднялся на {info['ipv4']}")
 
         _grant_permission(ctx, data["new_uuid"])
@@ -350,7 +295,7 @@ def recreate(
     dns = update_dns(ctx, data["new_ip"], data.get("new_ipv6", ""))
 
     # Точка невозврата пройдена — старый сервер больше не нужен.
-    ctx.state.set_pending(RECREATE, "deleting-old", **data)
+    ctx.state.set_pending(CLONE, "deleting-old", **data)
     try:
         ctx.uc.delete_server(old_uuid, storages=True, backups="delete")
         ctx.say(f"старый сервер удалён, адрес {data['old_ip']} освобождён")
@@ -358,7 +303,8 @@ def recreate(
         ctx.say(f"старый сервер удалить не удалось ({exc}) — удалите вручную, он тарифицируется")
 
     _prune_templates(ctx, keep=int(ctx.cfg.get("rotation.keep_templates", 1)), extra=[data.get("clone_uuid", "")])
-    return _finish(ctx, RECREATE, data["old_ip"], data["new_ip"], target_zone, reason, dns)
+    mode_name = CLONE if same_zone else MOVE
+    return _finish(ctx, mode_name, data["old_ip"], data["new_ip"], target_zone, reason, dns)
 
 
 def _server_spec(ctx: Ctx, data: dict[str, Any], template_uuid: str, zone: str) -> dict[str, Any]:
@@ -541,29 +487,52 @@ def _apply_netplan(ctx: Ctx, host: str, key_path: str, ip: str) -> None:
 
 # --- диспетчер --------------------------------------------------------------
 
-RUNNERS: dict[str, Callable[..., dict[str, Any]]] = {
-    REPLACE_IP: replace_ip,
-    RECREATE: recreate,
-    FLOATING: floating,
-}
+
+def _ensure_running(ctx: Ctx, uuid: str) -> None:
+    """Страховка: что бы ни случилось, сервер не должен остаться выключенным."""
+    if not uuid:
+        return
+    try:
+        state = ctx.uc.server(uuid).get("state", "")
+    except Exception:                                        # noqa: BLE001
+        return
+    if state == "stopped":
+        ctx.say("сервер остался остановленным — запускаю обратно")
+        try:
+            _start_and_wait(ctx, uuid)
+        except Exception as exc:                             # noqa: BLE001
+            ctx.say(f"{'⚠️'} запустить не удалось: {exc}. Нужны руки в панели UpCloud")
 
 
 def run(ctx: Ctx, mode: str, *, zone: str = "", reason: str = "manual", resume: dict[str, Any] | None = None):
-    if mode not in RUNNERS:
+    if mode == "replace-ip":
+        raise RotationError(
+            "режим replace-ip убран: UpCloud не отдаёт свежий адрес на существующий "
+            "интерфейс, и сервер мог остаться без публичного IPv4. "
+            f"Используйте «{MODE_TITLES[CLONE]}» или «{MODE_TITLES[MOVE]}» — они бесплатны."
+        )
+    if mode not in ALL_MODES:
         raise RotationError(f"неизвестный режим {mode!r}, доступны: {', '.join(ALL_MODES)}")
+
     if ctx.cfg.get("dry_run"):
-        # Репетиция должна вести себя как настоящая ротация во всём, кроме
-        # действий: иначе cooldown и дневной лимит не применяются, серия неудач
-        # не сбрасывается, и автоматика присылает «запускаю ротацию» каждую минуту.
         current = ctx.state["ipv4"]
         ctx.say(
-            f"dry_run: ротация {mode}"
+            f"dry_run: {MODE_TITLES[mode]}"
             + (f" → {zone}" if zone else "")
             + f" НЕ выполняется. В боевом режиме адрес {current or '—'} сменился бы сейчас."
         )
         ctx.state.record_rotation(mode, current, "(холостой прогон)", zone or ctx.state["zone"], reason)
         ctx.state.update(fail_streak=0)
         return {"mode": mode, "dry_run": True, "old_ip": current, "new_ip": "(холостой прогон)"}
-    if mode == RECREATE:
-        return recreate(ctx, zone=zone, reason=reason, resume=resume)
-    return RUNNERS[mode](ctx, reason=reason, resume=resume)
+
+    uuid = ctx.secrets.get("SERVER_UUID")
+    try:
+        if mode == FLOATING:
+            return floating(ctx, reason=reason, resume=resume)
+        if mode == MOVE and not zone:
+            raise RotationError("для переезда нужно выбрать локацию")
+        return recreate(ctx, zone=zone if mode == MOVE else "", reason=reason, resume=resume)
+    except Exception:
+        # Сервер могли остановить на первом шаге — оставлять его лежать нельзя.
+        _ensure_running(ctx, ctx.secrets.get("SERVER_UUID") or uuid)
+        raise
