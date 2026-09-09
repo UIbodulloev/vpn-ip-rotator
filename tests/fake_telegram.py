@@ -17,6 +17,7 @@ class FakeTelegram:
         self.deleted: list[tuple] = []     # deleteMessage
         self.answered: list[str] = []      # answerCallbackQuery
         self.calls: list[str] = []
+        self.timeline: list[str] = []      # всё, что увидел пользователь, по порядку
         self._update_id = 100
         self._message_id = 1000
 
@@ -56,6 +57,13 @@ class FakeTelegram:
     def last_text(self) -> str:
         return self.sent[-1]["text"] if self.sent else ""
 
+    def last_visible(self) -> str:
+        """Последнее, что реально увидел пользователь — с учётом правок сообщений."""
+        return self.timeline[-1] if self.timeline else ""
+
+    def all_visible(self) -> str:
+        return "\n".join(self.timeline)
+
     def keyboards(self) -> list[list]:
         return [m["markup"]["inline_keyboard"] for m in self.sent if m.get("markup")]
 
@@ -88,10 +96,12 @@ class FakeTelegram:
                 "markup": payload.get("reply_markup"),
                 "message_id": self._message_id,
             })
+            self.timeline.append(payload.get("text", ""))
             return FakeResponse(200, {"ok": True, "result": {"message_id": self._message_id}})
 
         if api_method == "editMessageText":
             self.edited.append({"message_id": payload.get("message_id"), "text": payload.get("text", "")})
+            self.timeline.append(payload.get("text", ""))
             return FakeResponse(200, {"ok": True, "result": {"message_id": payload.get("message_id")}})
 
         if api_method == "deleteMessage":

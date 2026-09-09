@@ -186,7 +186,7 @@ class SetupWizardTest(unittest.TestCase):
 
         for key, _ in __import__("rotator.bot", fromlist=["REQUIRED_STEPS"]).REQUIRED_STEPS:
             self.assertTrue(self.h.secrets.get(key), f"{key} не заполнен")
-        self.assertIn("🎉", "\n".join(self.h.tg.texts()), "мастер не сообщил о завершении")
+        self.assertIn("🎉", self.h.tg.all_visible(), "мастер не сообщил о завершении")
 
     def test_токен_подхватывается_без_перезапуска(self):
         """Клиенты обязаны читать токен заново — иначе /setup не даёт эффекта."""
@@ -217,7 +217,7 @@ class SetupWizardTest(unittest.TestCase):
         self.h.tg.user_says(GOOD_UC)
         self.h.pump()
         self.assertTrue(self.h.tg.deleted, "сообщение с токеном не удалено")
-        self.assertNotIn(GOOD_UC, "\n".join(self.h.tg.texts()), "секрет утёк в ответ")
+        self.assertNotIn(GOOD_UC, self.h.tg.all_visible(), "секрет утёк в ответ")
 
     def test_справка_открывается_и_влезает_в_лимит(self):
         from rotator import guide
@@ -231,7 +231,7 @@ class SetupWizardTest(unittest.TestCase):
     def test_ротация_до_настройки_отправляет_в_мастер(self):
         self.h.tg.user_says("/rotate")
         self.h.pump()
-        self.assertIn("Сначала настройка", self.h.tg.last_text())
+        self.assertIn("Сначала настройка", self.h.tg.last_visible())
         self.assertIn("wiz:board", [d for _, d in self.h.tg.buttons()])
 
     def test_короткий_мусор_вместо_токена_отвергается(self):
@@ -245,12 +245,26 @@ class SetupWizardTest(unittest.TestCase):
         self.h.pump()
 
         self.assertEqual(self.h.secrets.get("UPCLOUD_TOKEN"), "", "мусор попал в секреты")
-        answer = self.h.tg.last_text()
+        answer = self.h.tg.last_visible()
         self.assertIn("Не принял", answer, "бот промолчал вместо объяснения")
         self.assertIn("5 симв", answer, "не показал, что именно получил")
         self.assertIn("ucat_", answer, "не объяснил, как выглядит правильный токен")
         self.assertEqual(self.h.bot.awaiting, "UPCLOUD_TOKEN",
                          "после отказа надо остаться на том же шаге, а не терять его")
+
+    def test_расписка_приходит_раньше_любых_проверок(self):
+        """Молчания быть не должно: что бы ни случилось дальше, «принял» уже ушло."""
+        self.h.tg.user_says("/setup")
+        self.h.pump()
+        self.h.tg.user_taps("wiz:next")
+        self.h.pump()
+        self.h.tg.sent.clear()
+        self.h.tg.timeline.clear()
+
+        self.h.tg.user_says("что угодно")
+        self.h.pump()
+        self.assertTrue(self.h.tg.timeline, "бот не ответил вообще ничего")
+        self.assertIn("Принял", self.h.tg.timeline[0], "расписка не пришла первой")
 
     def test_после_отказа_можно_просто_прислать_заново(self):
         self.h.tg.user_says("/setup")

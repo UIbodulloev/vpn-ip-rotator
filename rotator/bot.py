@@ -217,7 +217,18 @@ class Bot:
             logger.warning("Telegram %s вернул не-JSON (HTTP %s)", method, response.status_code)
             return None
         if not body.get("ok"):
-            logger.warning("Telegram %s: %s", method, body.get("description"))
+            description = str(body.get("description") or "")
+            if "Conflict" in description or "terminated by other" in description:
+                # Классическая причина «половина сообщений пропадает»: два
+                # процесса с одним токеном тянут getUpdates, и Telegram отдаёт
+                # каждое обновление только одному из них.
+                logger.error(
+                    "КОНФЛИКТ: этот токен опрашивает кто-то ещё (%s). "
+                    "Проверьте: pgrep -af 'rotator run'. Лишний процесс надо убить, "
+                    "иначе сообщения будут теряться через одно.", description
+                )
+            else:
+                logger.warning("Telegram %s: %s", method, description)
             return None
         return body.get("result")
 
@@ -253,9 +264,14 @@ class Bot:
 
     def run(self, stop_event: threading.Event) -> None:
         poll = int(self.cfg.get("telegram.poll_timeout_sec", 25))
+        import os
+
+        from . import __version__
+
         me = self.api("getMe")
         if me:
-            logger.info("бот @%s на связи", me.get("username", "?"))
+            logger.info("бот @%s на связи · версия %s · PID %s · long-poll %s с",
+                        me.get("username", "?"), __version__, os.getpid(), poll)
         else:
             logger.error("Telegram недоступен — проверьте релей и токен бота")
 
@@ -352,6 +368,8 @@ class Bot:
             self.setup_board()
         elif command == "/check":
             self.cmd_check()
+        elif command == "/diag":
+            self.cmd_diag()
         elif command == "/rollback":
             self.cmd_rollback()
         elif command in ("/cancel", "/skip", "/auto"):
@@ -704,12 +722,17 @@ class Bot:
         key = self.awaiting
         value = text.strip()
 
+        # Расписка уходит ДО любых проверок и обращений к API: что бы дальше ни
+        # случилось, пользователь видит, что сообщение дошло.
+        receipt = self.send(f"Принял {len(value)} символов для {key}. Проверяю…")
+
         problem = VALIDATORS.get(key, lambda _v: "")(value)
         if problem:
             # awaiting НЕ сбрасываем: можно просто прислать значение заново.
             if "TOKEN" in key:
                 self.delete(message["chat"]["id"], message["message_id"])
-            return self.send(
+            return self.edit(
+                receipt,
                 f"❌ Не принял: {preview(value)}\n\n{problem}\n\n"
                 "Пришлите значение ещё раз, или /skip · /cancel.",
                 [[{"text": "❓ Где взять токены", "callback_data": "guide:where"}]],
@@ -720,7 +743,7 @@ class Bot:
             self.delete(message["chat"]["id"], message["message_id"])
         self.secrets.set(key, value)
         shown = masked(value) if "TOKEN" in key else value
-        self.send(f"✅ {key.replace('_', ' ').lower()}: {shown}")
+        self.edit(receipt, f"✅ {key.replace('_', ' ').lower()}: {shown}")
         self.after_field_set(key)
 
     def cmd_wizard_control(self, command: str) -> None:
@@ -775,6 +798,40 @@ class Bot:
         self.secrets.set(key, record["id"])
         self.send(f"✅ {rtype} {record['name']} → {record['content']} (TTL {record.get('ttl')})")
         self.after_field_set(key)
+
+    def cmd_diag(self) -> None:
+        """Что бот о себе знает — первое, что стоит спросить, когда он «молчит»."""
+        import os
+        import platform
+
+        from . import __version__
+
+        state = self.engine.state
+        filled = [k for k in ("UPCLOUD_TOKEN", "SERVER_UUID", "CF_TOKEN", "CF_ZONE_ID",
+                              "CF_A_RECORD_ID", "CF_AAAA_RECORD_ID", "UPCLOUD_ADMIN_TOKEN",
+                              "SSH_KEY_PATH") if self.secrets.get(k)]
+        lines = [
+            f"Версия:   {__version__}",
+            f"PID:      {os.getpid()} на {platform.node()}",
+            f"Потоков:  {threading.active_count()}",
+            "",
+            f"Жду поле: {self.awaiting or '— (текст пойдёт как команда)'}",
+            f"Offset:   {self.offset}",
+            f"Заполнено: {', '.join(filled) or 'ничего'}",
+            f"Файл секретов: {self.secrets.path}",
+            f"Файл состояния: {state.path}",
+            "",
+            "Каналы:",
+        ]
+        for url, status in self.relay.health().items():
+            lines.append(f"  {'✅' if status == 'ok' else '❌'} {url} — {status}")
+        lines += ["", "Журнал (последние строки):"] + [f"  {line}" for line in log.tail(8)]
+        lines += [
+            "",
+            "Если сообщения теряются через одно — проверьте на сервере, "
+            "что процесс один: pgrep -af 'rotator run'",
+        ]
+        self.send("\n".join(lines))
 
     # --- проверка доступов --------------------------------------------------
 
