@@ -1,0 +1,58 @@
+# vpn-ip-rotator — /etc/vpn-rotator/config.toml
+# Здесь только настройки. Ключи и доступы живут в secrets.env (0600),
+# заливаются через /setup в Telegram или через `rotator setup --local`.
+
+log_level = "INFO"
+
+# Ротации только имитируются: пробы идут, уведомления приходят, ничего не меняется.
+# Первые сутки держите true.
+dry_run = true
+
+# Агент стоит вне России и релей ему не нужен.
+prefer_direct = false
+# Пробовать API напрямую, если релей не ответил. Из РФ бесполезно — только таймауты.
+allow_direct_fallback = false
+
+[vpn]
+domain = "vpn.example.com"     # домен, чью A/AAAA запись переписываем
+probe_port = 443               # рабочий порт (VLESS Reality)
+control_port = 22              # контрольный порт: отличает блок адреса от блока порта
+udp_port = 35206               # порт AmneziaWG, справочно
+update_aaaa = true             # обновлять и AAAA — IPv6 у UpCloud бесплатен
+
+[detector]
+enabled = true
+interval_sec = 60
+fail_threshold = 5             # 5 неудач подряд, а не одна: защита от ложных срабатываний
+tcp_timeout_sec = 5.0
+
+# Проверка собственного канала. Если недоступны и они — молчим, а не ротируем.
+sanity_targets = ["77.88.55.242:443", "5.255.255.242:443"]
+
+# Уровень 2: настоящая сессия вместо голого TCP. Единственный способ поймать
+# фингерпринт-блок, когда порт открывается, а соединение рвётся.
+# Команда должна вернуть 0 при успехе. Примеры — в README.
+deep_probe = false
+reality_probe_cmd = ""
+awg_probe_cmd = ""
+deep_probe_timeout_sec = 25
+
+[rotation]
+mode = "auto"                  # auto | replace-ip | recreate | floating
+cooldown_hours = 6             # минимум между ротациями
+max_per_day = 2                # дальше — только руками через /rotate
+escalate_after_hours = 6       # новый адрес умер быстрее — значит подсеть или протокол
+keep_templates = 1             # сколько шаблонов держать как точку отката
+dns_ttl = 60
+
+# Куда переезжать при эскалации. Хельсинки ближе всех к РФ по задержке.
+zone_rotation = ["fi-hel1", "de-fra1", "nl-ams1", "uk-lon1"]
+
+wait_stop_sec = 240
+wait_start_sec = 300
+wait_storage_sec = 3600        # кросс-зонный клон диска бывает долгим
+wait_service_sec = 240
+
+[telegram]
+poll_timeout_sec = 50
+delete_secret_messages = true  # удалять сообщение с ключом сразу после чтения

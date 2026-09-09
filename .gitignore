@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+secrets.env
+config.toml
+state.json
+*.tmp
+*.corrupt
+.wrangler/
+node_modules/

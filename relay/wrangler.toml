@@ -1,0 +1,13 @@
+name = "vpn-rotator-relay"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+# Свой домен обязателен: *.workers.dev в России регулярно режут.
+# Раскомментируйте и подставьте ОТДЕЛЬНЫЙ домен — не тот, что обслуживает VPN,
+# чтобы контрольный канал и VPN-домен блокировались независимо друг от друга.
+#
+# routes = [
+#   { pattern = "relay.example.net/*", zone_name = "example.net" }
+# ]
+
+# Ключ кладётся не сюда, а командой:  wrangler secret put RELAY_KEY

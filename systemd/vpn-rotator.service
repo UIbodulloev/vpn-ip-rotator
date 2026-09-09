@@ -1,0 +1,39 @@
+[Unit]
+Description=vpn-ip-rotator — ротация IP VPN-сервера
+Documentation=https://github.com/OWNER/vpn-ip-rotator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vpnrotator
+Group=vpnrotator
+WorkingDirectory=/opt/vpn-rotator
+EnvironmentFile=-/etc/vpn-rotator/secrets.env
+ExecStart=/opt/vpn-rotator/venv/bin/python -m rotator run
+Restart=always
+RestartSec=10
+
+# Состояние и секреты — единственное, что сервису можно писать.
+StateDirectory=vpn-rotator
+ReadWritePaths=/etc/vpn-rotator /var/lib/vpn-rotator
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
