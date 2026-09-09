@@ -551,8 +551,18 @@ def run(ctx: Ctx, mode: str, *, zone: str = "", reason: str = "manual", resume: 
     if mode not in RUNNERS:
         raise RotationError(f"неизвестный режим {mode!r}, доступны: {', '.join(ALL_MODES)}")
     if ctx.cfg.get("dry_run"):
-        ctx.say(f"dry_run: ротация {mode} не выполняется, только сообщаю о намерении")
-        return {"mode": mode, "dry_run": True}
+        # Репетиция должна вести себя как настоящая ротация во всём, кроме
+        # действий: иначе cooldown и дневной лимит не применяются, серия неудач
+        # не сбрасывается, и автоматика присылает «запускаю ротацию» каждую минуту.
+        current = ctx.state["ipv4"]
+        ctx.say(
+            f"dry_run: ротация {mode}"
+            + (f" → {zone}" if zone else "")
+            + f" НЕ выполняется. В боевом режиме адрес {current or '—'} сменился бы сейчас."
+        )
+        ctx.state.record_rotation(mode, current, "(холостой прогон)", zone or ctx.state["zone"], reason)
+        ctx.state.update(fail_streak=0)
+        return {"mode": mode, "dry_run": True, "old_ip": current, "new_ip": "(холостой прогон)"}
     if mode == RECREATE:
         return recreate(ctx, zone=zone, reason=reason, resume=resume)
     return RUNNERS[mode](ctx, reason=reason, resume=resume)

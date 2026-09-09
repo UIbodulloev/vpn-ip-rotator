@@ -46,27 +46,47 @@ OPTIONAL_KEYS = [
     ("SSH_PUBKEY", "SSH-ключ, публичный", "прописать новому серверу при recreate"),
 ]
 
-HELP = """Команды
+# Единственный источник правды по командам: из него строится и /help, и меню
+# Telegram (setMyCommands), чтобы они не разъезжались.
+COMMANDS = [
+    ("status", "адрес, состояние сервера, последние пробы"),
+    ("probe", "проверить доступность VPN прямо сейчас"),
+    ("ip", "что у сервера и что стоит в DNS"),
+    ("simulate", "холостой прогон: что сделала бы автоматика"),
+    ("rotate", "сменить адрес"),
+    ("mode", "режим автоматики: auto / replace-ip / recreate / floating"),
+    ("pause", "выключить автоматику"),
+    ("resume", "включить автоматику"),
+    ("log", "последние строки журнала"),
+    ("setup", "пошаговая настройка доступов"),
+    ("check", "проверить все доступы"),
+    ("diag", "диагностика: версия, PID, чаты, чего ждёт бот"),
+    ("guide", "справка: как работает, режимы, ключи, проверки"),
+    ("zones", "зоны UpCloud"),
+    ("plans", "планы UpCloud"),
+    ("rollback", "пересоздать сервер из последнего шаблона"),
+]
 
-Наблюдение
-/status — адрес, зона, состояние сервера, последние пробы
-/probe — прогнать пробы прямо сейчас
-/ip — что у сервера и что реально стоит в DNS
-/log — последние строки журнала
+def _help_text() -> str:
+    """Собирается из COMMANDS, чтобы список в чате не расходился с меню."""
+    by_name = dict(COMMANDS)
+    blocks = []
+    for title, names in HELP_GROUPS:
+        rows = [f"/{n} — {by_name[n]}" for n in names if n in by_name]
+        blocks.append(title + "\n" + "\n".join(rows))
+    return "Команды\n\n" + "\n\n".join(blocks)
 
-Управление
-/rotate — сменить адрес
-/mode — режим автоматики
-/pause, /resume — выключить и включить автоматику
-/rollback — пересоздать сервер из последнего шаблона
 
-Настройка
-/setup — пошаговая настройка доступов
-/check — проверить всё разом
-/zones, /plans — что доступно в UpCloud
+HELP_GROUPS = [
+    ('Наблюдение', ['status', 'probe', 'ip', 'log']),
+    ('Проверка вхолостую', ['simulate']),
+    ('Управление', ['rotate', 'mode', 'pause', 'resume', 'rollback']),
+    ('Настройка', ['setup', 'check', 'diag', 'zones', 'plans']),
+    ('Справка', ['guide']),
+]
 
-Справка
-/guide — как это работает, режимы, ключи, проверки"""
+
+HELP = _help_text()
 
 FIELD_PROMPTS = {
     "UPCLOUD_TOKEN": (
@@ -289,6 +309,7 @@ class Bot:
                         me.get("username", "?"), __version__, os.getpid(), poll,
                         me.get("can_read_all_group_messages"), ", ".join(self.admins) or "—")
             self.warn_about_privacy(me)
+            self.publish_commands()
         else:
             logger.error("Telegram недоступен — проверьте релей и токен бота")
 
@@ -370,6 +391,8 @@ class Bot:
             self.send(self.status_text())
         elif command == "/probe":
             self.cmd_probe()
+        elif command == "/simulate":
+            self.cmd_simulate()
         elif command == "/ip":
             self.cmd_ip()
         elif command == "/rotate":
@@ -431,7 +454,9 @@ class Bot:
             "",
             f"Вердикт:  {probes.VERDICT_TEXT.get(state['last_verdict'], '—')}",
             f"Пробы:    " + _probe_line(probe) + f"  ({age} с назад)",
-            f"Серия неудач: {state['fail_streak']}/{self.cfg.get('detector.fail_threshold')}",
+            f"Серия неудач: {state['fail_streak']}/{self.cfg.get('detector.fail_threshold')}"
+            + (f"   (проверка каждые {self.cfg.get('detector.interval_sec')} с)"
+               if self.cfg.get("detector.enabled", True) else "   ⚠️ детектор выключен"),
             f"Ротаций сегодня: {state.rotations_today()}/{self.cfg.get('rotation.max_per_day')}",
         ]
         if self.cfg.get("dry_run"):
@@ -451,6 +476,54 @@ class Bot:
         suffix = "" if result.confident else "\n(уверенности нет — сузить причину нечем)"
         rotatable = "смена адреса поможет" if result.verdict in probes.ROTATABLE else "смена адреса не поможет"
         self.edit(message_id, f"{result.short()}\n\nВердикт: {verdict}\n{rotatable}{suffix}")
+
+    def cmd_simulate(self) -> None:
+        """Что сделала бы автоматика прямо сейчас. Ничего не меняет."""
+        message_id = self.send("Прогоняю вхолостую…")
+        result = self.engine.probe()
+
+        rotatable = result.verdict in probes.ROTATABLE
+        lines = [
+            "🧪 Холостой прогон — ничего не меняется",
+            "",
+            f"Пробы:   {result.short()}",
+            f"Вердикт: {probes.VERDICT_TEXT.get(result.verdict, result.verdict)}",
+            "",
+        ]
+
+        if not rotatable:
+            lines += [
+                "Ротация НЕ была бы запущена: смена адреса этот случай не лечит.",
+                "Автоматика прислала бы алерт и осталась ждать.",
+            ]
+        else:
+            mode, zone = self.engine.choose()
+            streak = self.engine.state["fail_streak"]
+            threshold = int(self.cfg.get("detector.fail_threshold", 5))
+            interval = int(self.cfg.get("detector.interval_sec", 60))
+            lines += [
+                f"Серия неудач: {streak} из {threshold} "
+                f"(порог набирается примерно за {threshold * interval // 60} мин)",
+            ]
+            if not mode:
+                lines.append("Эскалировать некуда: прошлый переезд не помог — автоматика позвала бы вас.")
+            else:
+                blocked = self.engine.guard()
+                lines.append(f"Выбранный режим: {mode}" + (f" → {zone}" if zone else ""))
+                lines.append("Предохранители: " + (f"держат — {blocked}" if blocked else "пропускают"))
+
+        lines += ["", "Что стоит в конфиге:"]
+        lines.append(f"  проверка каждые {self.cfg.get('detector.interval_sec')} с, "
+                     f"порог {self.cfg.get('detector.fail_threshold')} неудач подряд")
+        lines.append(f"  cooldown {self.cfg.get('rotation.cooldown_hours')} ч, "
+                     f"не больше {self.cfg.get('rotation.max_per_day')} ротаций в сутки")
+        if self.cfg.get("dry_run"):
+            lines += ["", "⚠️ dry_run включён: даже реальная ротация сейчас только имитируется."]
+        else:
+            lines += ["", "❗️ dry_run выключен: при настоящей блокировке адрес сменится по-настоящему."]
+
+        lines += ["", "Как проверить по-настоящему — /guide_checklist"]
+        self.edit(message_id, "\n".join(lines))
 
     def cmd_ip(self) -> None:
         try:
@@ -853,6 +926,16 @@ class Bot:
             "Разрешены: " + ", ".join(self.admins),
             [[{"text": "⚙️ К настройке", "callback_data": "wiz:board"}]],
         )
+
+    def publish_commands(self) -> None:
+        """Отдать список команд Telegram — тогда они появляются в меню чата.
+
+        Раньше это приходилось вбивать руками через @BotFather /setcommands.
+        """
+        result = self.api("setMyCommands", {
+            "commands": [{"command": name, "description": text} for name, text in COMMANDS]
+        })
+        logger.info("меню команд %s", "опубликовано" if result else "опубликовать не удалось")
 
     def warn_about_privacy(self, me: dict[str, Any]) -> None:
         """Классическая ловушка: в группе бот видит только команды.

@@ -296,6 +296,23 @@ class SetupWizardTest(unittest.TestCase):
         self.assertTrue(VALIDATORS["CF_ZONE_ID"]("коротко"))
         self.assertFalse(VALIDATORS["CF_ZONE_ID"]("f5bbcd30d3f695cbd828c8446efb4487"))
 
+    def test_меню_команд_публикуется_и_совпадает_со_справкой(self):
+        from rotator.bot import COMMANDS, HELP
+        self.h.bot.publish_commands()
+        self.assertIn("setMyCommands", self.h.tg.calls, "меню команд не отправлено в Telegram")
+        for name, _ in COMMANDS:
+            self.assertIn(f"/{name}", HELP, f"{name} есть в меню, но нет в /help")
+
+    def test_simulate_ничего_не_меняет(self):
+        before = dict(self.h.state.data)
+        self.h.tg.user_says("/simulate")
+        self.h.pump()
+        answer = self.h.tg.all_visible()
+        self.assertIn("Холостой прогон", answer)
+        self.assertIn("dry_run", answer, "не сказано, включён ли боевой режим")
+        for key in ("ipv4", "history", "last_rotation_ts", "server_uuid"):
+            self.assertEqual(self.h.state[key], before[key], f"{key} изменился при холостом прогоне")
+
     def test_из_неразрешённого_чата_бот_предлагает_его_добавить(self):
         """Реальный случай: в TG_ADMIN_ID вписан ID группы, а человек пишет в личку."""
         self.h.tg.user_says("привет", chat_id="537089165")

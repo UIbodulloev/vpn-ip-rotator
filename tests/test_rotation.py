@@ -212,6 +212,31 @@ class RecreateTest(unittest.TestCase):
         self.assertEqual(len(templatize_calls), 1, "шаблон снят повторно вместо переиспользования")
 
 
+class DryRunTest(unittest.TestCase):
+    """Репетиция должна вести себя как настоящая ротация во всём, кроме действий."""
+
+    def setUp(self):
+        self.h = Harness(CONFIG.replace("[vpn]", "dry_run = true\n\n[vpn]")
+                               .replace("cooldown_hours = 0", "cooldown_hours = 6"))
+
+    def test_ничего_не_трогает_но_включает_предохранители(self):
+        old_ip = self.h.ip
+        result = self.h.engine.rotate("replace-ip", force=True)
+
+        self.assertTrue(result["dry_run"])
+        # Сервер и адрес не тронуты.
+        self.assertEqual(self.h.cloud.servers[self.h.server_uuid]["state"], "started")
+        self.assertIn(old_ip, self.h.cloud.ips)
+        self.assertEqual(self.h.dns(), old_ip, "DNS не должен меняться вхолостую")
+        # Но cooldown теперь держит — иначе автоматика слала бы алерт каждую минуту.
+        self.assertIn("cooldown", self.h.engine.guard() or "")
+        self.assertEqual(self.h.state["fail_streak"], 0, "серия неудач не сброшена")
+
+    def test_попадает_в_историю_с_пометкой(self):
+        self.h.engine.rotate("replace-ip", force=True)
+        self.assertEqual(self.h.state["history"][0]["to"], "(холостой прогон)")
+
+
 class VerdictTest(unittest.TestCase):
     """Отличать блок адреса от блока порта — то, ради чего детектор вообще нужен."""
 
