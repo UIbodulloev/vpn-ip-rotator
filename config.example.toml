@@ -54,5 +54,7 @@ wait_storage_sec = 3600        # кросс-зонный клон диска б�
 wait_service_sec = 240
 
 [telegram]
-poll_timeout_sec = 50
-delete_secret_messages = true  # удалять сообщение с ключом сразу после чтения
+# Держать long-poll дольше рискованно: Cloudflare рвёт слишком долгие запросы
+# через воркер-релей, и бот начинает пропускать сообщения. 25 секунд безопасны.
+poll_timeout_sec = 25
+delete_secret_messages = true  # удалять сообщение с токеном сразу после чтения

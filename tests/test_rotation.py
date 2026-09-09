@@ -52,6 +52,11 @@ class Harness:
     """Собирает движок поверх фейкового облака."""
 
     def __init__(self, config_text: str = CONFIG):
+        # Пути выставляем на каждом создании: тестовые модули импортируются
+        # вместе и иначе делят один файл состояния.
+        os.environ["ROTATOR_CONFIG"] = str(TMP / "config.toml")
+        os.environ["ROTATOR_SECRETS"] = str(TMP / "secrets.env")
+        os.environ["ROTATOR_STATE"] = str(TMP / "state.json")
         for name in ("config.toml", "secrets.env", "state.json"):
             Path(TMP / name).unlink(missing_ok=True)
         Path(TMP / "config.toml").write_text(config_text)

@@ -28,11 +28,33 @@ def _auth_header(token: str) -> str:
     return f"Bearer {token}"
 
 
+def _resolve(source: Any) -> str:
+    """Токен может быть строкой или функцией — тогда он читается на каждом вызове.
+
+    Это важно: после /setup токен меняется на лету, и клиент, запомнивший
+    старое значение при старте, продолжал бы ходить с ним до перезапуска.
+    """
+    if callable(source):
+        try:
+            return str(source() or "")
+        except Exception:                                    # noqa: BLE001
+            return ""
+    return str(source or "")
+
+
 class UpCloud:
-    def __init__(self, relay: Relay, token: str, admin_token: str = ""):
+    def __init__(self, relay: Relay, token: Any, admin_token: Any = ""):
         self.relay = relay
-        self.token = token
-        self.admin_token = admin_token
+        self._token = token
+        self._admin_token = admin_token
+
+    @property
+    def token(self) -> str:
+        return _resolve(self._token)
+
+    @property
+    def admin_token(self) -> str:
+        return _resolve(self._admin_token)
 
     # --- транспорт ----------------------------------------------------------
 

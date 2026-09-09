@@ -25,8 +25,14 @@ def build(cfg: Config, secrets: Secrets) -> tuple[Relay, Engine, State]:
         prefer_direct=bool(cfg.get("prefer_direct", False)),
         allow_direct_fallback=bool(cfg.get("allow_direct_fallback", False)),
     )
-    uc = UpCloud(relay, secrets.get("UPCLOUD_TOKEN"), secrets.get("UPCLOUD_ADMIN_TOKEN"))
-    cf = Cloudflare(relay, secrets.get("CF_TOKEN"))
+    # Функции, а не значения: /setup меняет токены на лету, и клиенты обязаны
+    # подхватывать новые без перезапуска сервиса.
+    uc = UpCloud(
+        relay,
+        lambda: secrets.get("UPCLOUD_TOKEN"),
+        lambda: secrets.get("UPCLOUD_ADMIN_TOKEN"),
+    )
+    cf = Cloudflare(relay, lambda: secrets.get("CF_TOKEN"))
     state = State()
     # По умолчанию уведомления идут в stdout; в режиме run их перехватывает бот.
     engine = Engine(cfg, secrets, state, uc, cf, print)

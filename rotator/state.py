@@ -10,7 +10,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from .config import STATE_PATH
+from .config import state_path
 
 EMPTY: dict[str, Any] = {
     "server_uuid": "",
@@ -33,17 +33,18 @@ EMPTY: dict[str, Any] = {
     "last_verdict": "",
     "last_probe": {},
     "last_probe_ts": 0,
+    "awaiting": "",           # поле, значение которого мастер ждёт от пользователя
 }
 
 
 class State:
-    def __init__(self, path: Path = STATE_PATH):
-        self.path = path
+    def __init__(self, path: Path | None = None):
+        self.path = path or state_path()
         self._lock = threading.RLock()
         self.data = dict(EMPTY)
-        if path.exists():
+        if self.path.exists():
             try:
-                stored = json.loads(path.read_text(encoding="utf-8"))
+                stored = json.loads(self.path.read_text(encoding="utf-8"))
                 self.data = {**EMPTY, **stored}
             except (json.JSONDecodeError, OSError):
                 # Битый state лучше пересоздать, чем упасть в рестарт-луп.

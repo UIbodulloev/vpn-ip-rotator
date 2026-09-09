@@ -15,9 +15,18 @@ except ModuleNotFoundError:                                  # Python < 3.11
 
 from . import log
 
-CONFIG_PATH = Path(os.environ.get("ROTATOR_CONFIG", "/etc/vpn-rotator/config.toml"))
-SECRETS_PATH = Path(os.environ.get("ROTATOR_SECRETS", "/etc/vpn-rotator/secrets.env"))
-STATE_PATH = Path(os.environ.get("ROTATOR_STATE", "/var/lib/vpn-rotator/state.json"))
+# Пути вычисляются при создании объекта, а не при импорте: иначе переменные
+# окружения, выставленные позже (в тестах или обёртках), уже не действуют.
+def config_path() -> Path:
+    return Path(os.environ.get("ROTATOR_CONFIG", "/etc/vpn-rotator/config.toml"))
+
+
+def secrets_path() -> Path:
+    return Path(os.environ.get("ROTATOR_SECRETS", "/etc/vpn-rotator/secrets.env"))
+
+
+def state_path() -> Path:
+    return Path(os.environ.get("ROTATOR_STATE", "/var/lib/vpn-rotator/state.json"))
 
 # Без этих четырёх агент не стартует: без них не поднять даже канал до Telegram.
 BOOTSTRAP_KEYS = ("RELAY_URLS", "RELAY_KEY", "TG_BOT_TOKEN", "TG_ADMIN_ID")
@@ -30,6 +39,7 @@ SETUP_KEYS = (
     "SERVER_UUID",
     "CF_TOKEN",
     "CF_ZONE_ID",
+    "VPN_DOMAIN",
     "CF_A_RECORD_ID",
     "CF_AAAA_RECORD_ID",
     "SSH_KEY_PATH",
@@ -72,7 +82,7 @@ DEFAULTS: dict[str, Any] = {
         "dns_ttl": 60,
     },
     "telegram": {
-        "poll_timeout_sec": 50,
+        "poll_timeout_sec": 25,
         "delete_secret_messages": True,
     },
 }
@@ -89,11 +99,11 @@ def _deep_merge(base: dict, overlay: dict) -> dict:
 
 
 class Config:
-    def __init__(self, path: Path = CONFIG_PATH):
-        self.path = path
+    def __init__(self, path: Path | None = None):
+        self.path = path or config_path()
         raw: dict[str, Any] = {}
-        if path.exists():
-            raw = tomllib.loads(path.read_text(encoding="utf-8"))
+        if self.path.exists():
+            raw = tomllib.loads(self.path.read_text(encoding="utf-8"))
         self.data = _deep_merge(DEFAULTS, raw)
 
     def __getitem__(self, key: str) -> Any:
@@ -111,8 +121,8 @@ class Config:
 class Secrets:
     """KEY=VALUE файл 0600. Читается при старте, дописывается мастером /setup."""
 
-    def __init__(self, path: Path = SECRETS_PATH):
-        self.path = path
+    def __init__(self, path: Path | None = None):
+        self.path = path or secrets_path()
         self._lock = threading.Lock()
         self._values: dict[str, str] = {}
         self.reload()
@@ -163,6 +173,11 @@ class Secrets:
         os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
         tmp.replace(self.path)
         os.chmod(self.path, stat.S_IRUSR | stat.S_IWUSR)
+
+
+def domain_of(cfg: "Config", secrets: "Secrets") -> str:
+    """Домен из мастера имеет приоритет над config.toml: его правят из чата."""
+    return secrets.get("VPN_DOMAIN") or str(cfg.get("vpn.domain", ""))
 
 
 def masked(value: str) -> str:

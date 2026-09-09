@@ -34,6 +34,7 @@ class FakeCloud:
         self.records: dict[str, dict] = {}
         self.calls: list[tuple[str, str]] = []
         self.fail_on: dict[str, int] = {}      # путь -> сколько раз вернуть 500
+        self.telegram = None                   # подставляется FakeTelegram, если нужен бот
 
     # --- помощники ----------------------------------------------------------
 
@@ -120,8 +121,10 @@ class FakeCloud:
         if upstream == "uc":
             return self._upcloud(method.upper(), path, json or {}, params or {})
         if upstream == "cf":
-            return self._cloudflare(method.upper(), path, json or {})
+            return self._cloudflare(method.upper(), path, json or {}, params or {})
         if upstream == "tg":
+            if self.telegram is not None:
+                return self.telegram.request(method.upper(), path, json or {})
             return FakeResponse(200, {"ok": True, "result": {"message_id": 1, "username": "fakebot"}})
         return FakeResponse(404, {})
 
@@ -133,6 +136,12 @@ class FakeCloud:
                 {"id": "nl-ams1", "description": "Amsterdam", "public": "yes"},
                 {"id": "fi-hel1", "description": "Helsinki", "public": "yes"},
                 {"id": "de-fra1", "description": "Frankfurt", "public": "yes"},
+            ]}})
+
+        if path == "/1.3/server" and method == "GET":
+            return FakeResponse(200, {"servers": {"server": [
+                {k: v for k, v in s.items() if k not in ("networking", "storage_devices")}
+                for s in self.servers.values()
             ]}})
 
         match = re.fullmatch(r"/1\.3/server/([0-9a-f-]+)", path)
@@ -225,7 +234,7 @@ class FakeCloud:
 
         return FakeResponse(404, {"error": {"error_message": f"не заглушено: {path}"}})
 
-    def _cloudflare(self, method: str, path: str, body: dict) -> FakeResponse:
+    def _cloudflare(self, method: str, path: str, body: dict, params: dict | None = None) -> FakeResponse:
         if path.endswith("/user/tokens/verify"):
             return FakeResponse(200, {"success": True, "result": {"status": "active"}})
         match = re.search(r"/dns_records/([\w-]+)$", path)
@@ -237,5 +246,14 @@ class FakeCloud:
                 record.update({k: v for k, v in body.items() if k in ("content", "ttl", "proxied", "type", "name")})
             return FakeResponse(200, {"success": True, "result": record})
         if path.endswith("/dns_records"):
-            return FakeResponse(200, {"success": True, "result": list(self.records.values())})
+            found = list(self.records.values())
+            if params.get("type"):
+                found = [r for r in found if r["type"] == params["type"]]
+            if params.get("name"):
+                found = [r for r in found if r["name"] == params["name"]]
+            return FakeResponse(200, {"success": True, "result": found})
+        if path.endswith("/zones"):
+            return FakeResponse(200, {"success": True, "result": [
+                {"id": "zone1", "name": "example.com"},
+            ]})
         return FakeResponse(404, {"success": False, "errors": [{"code": 0, "message": path}]})

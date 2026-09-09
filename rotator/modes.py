@@ -14,7 +14,7 @@ from typing import Any, Callable
 
 from . import log, upcloud
 from .clouddns import Cloudflare
-from .config import Config, Secrets
+from .config import Config, Secrets, domain_of
 from .probes import tcp_open
 from .state import State
 from .upcloud import UpCloud, UpCloudError
@@ -75,7 +75,7 @@ def collect(ctx: Ctx) -> dict[str, Any]:
 def update_dns(ctx: Ctx, ipv4: str, ipv6: str = "") -> list[str]:
     """Обновляет A и, если настроено, AAAA. Возвращает человекочитаемый отчёт."""
     zone_id = ctx.secrets.get("CF_ZONE_ID")
-    domain = ctx.cfg.get("vpn.domain")
+    domain = domain_of(ctx.cfg, ctx.secrets)
     ttl = int(ctx.cfg.get("rotation.dns_ttl", 60))
     done: list[str] = []
 
