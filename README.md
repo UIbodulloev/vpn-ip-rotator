@@ -135,15 +135,19 @@ swapfile, SSH host key и `authorized_keys`. Клиентские конфиги
 
 ### Шаг 1. Релей
 
+Без node — только `curl` и `python3` (скрипт сам сгенерирует ключ, зальёт
+воркер, создаст DNS-запись и маршрут, проверит доступ):
+
 ```bash
-npm install -g wrangler && wrangler login
 cd relay
-openssl rand -hex 32            # ключ, он же RELAY_KEY — сохраните
-wrangler secret put RELAY_KEY   # вставьте его сюда
-# впишите свой домен в routes внутри wrangler.toml
-wrangler deploy
-curl -H "X-Relay-Key: <ключ>" https://relay.example.net/healthz   # → ok
+export CF_DEPLOY_TOKEN=$(cat ~/.cf-deploy-token)
+./deploy.sh relay.example.net
 ```
+
+Токен для развёртывания — отдельный, с правами `Workers Scripts: Edit`,
+`Workers Routes: Edit`, `DNS: Edit`, `Zone: Read`; **после развёртывания
+отзовите его**. Вариант через `wrangler` тоже поддержан — см.
+[relay/README.md](relay/README.md).
 
 Два обязательных условия: **отдельный домен** (не тот, что обслуживает VPN — иначе
 блокировка домена выносит разом и VPN, и канал управления) и **не `*.workers.dev`**
