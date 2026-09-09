@@ -152,7 +152,7 @@ curl -H "X-Relay-Key: <ключ>" https://relay.example.net/healthz   # → ok
 ### Шаг 2. Агент на российском сервере
 
 ```bash
-git clone https://github.com/OWNER/vpn-ip-rotator.git
+git clone https://github.com/UIbodulloev/vpn-ip-rotator.git
 cd vpn-ip-rotator
 sudo ./install.sh
 ```

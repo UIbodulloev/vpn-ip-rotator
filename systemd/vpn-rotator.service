@@ -1,6 +1,6 @@
 [Unit]
 Description=vpn-ip-rotator — ротация IP VPN-сервера
-Documentation=https://github.com/OWNER/vpn-ip-rotator
+Documentation=https://github.com/UIbodulloev/vpn-ip-rotator
 After=network-online.target
 Wants=network-online.target
 
