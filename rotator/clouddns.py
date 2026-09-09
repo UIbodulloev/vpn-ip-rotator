@@ -38,7 +38,8 @@ class Cloudflare:
                 return ""
         return str(source or "")
 
-    def _call(self, method: str, path: str, payload: Any = None, params: dict[str, Any] | None = None) -> Any:
+    def _call(self, method: str, path: str, payload: Any = None,
+              params: dict[str, Any] | None = None, timeout: float | None = None) -> Any:
         if not self.token:
             raise CloudflareError(path, {"errors": [{"code": 0, "message": "токен Cloudflare не задан"}]})
         response = self.relay.request(
@@ -48,6 +49,7 @@ class Cloudflare:
             json=payload,
             params=params,
             headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"},
+            timeout=timeout,
         )
         try:
             body = response.json()
@@ -57,17 +59,17 @@ class Cloudflare:
             raise CloudflareError(path, body)
         return body.get("result")
 
-    def verify_token(self) -> dict[str, Any]:
-        return self._call("GET", "/user/tokens/verify")
+    def verify_token(self, timeout: float | None = None) -> dict[str, Any]:
+        return self._call("GET", "/user/tokens/verify", timeout=timeout)
 
     def get_record(self, zone_id: str, record_id: str) -> dict[str, Any]:
         return self._call("GET", f"/zones/{zone_id}/dns_records/{record_id}")
 
-    def zones(self) -> list[dict[str, Any]]:
+    def zones(self, timeout: float | None = None) -> list[dict[str, Any]]:
         """Список зон. Токену, урезанному до одной зоны, вернётся она одна —
         этого мастеру достаточно. Если прав не хватит, вызов бросит исключение,
         и мастер откатится на ручной ввод Zone ID."""
-        return self._call("GET", "/zones", params={"per_page": 50}) or []
+        return self._call("GET", "/zones", params={"per_page": 50}, timeout=timeout) or []
 
     def list_records(self, zone_id: str, rtype: str = "A") -> list[dict[str, Any]]:
         """Чтение записей своей зоны входит в право DNS → Edit, Zone → Read не нужен."""

@@ -9,8 +9,10 @@ Long-polling идёт через релей, поэтому на российс�
 
 from __future__ import annotations
 
+import re
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from . import guide, log, modes, probes
@@ -19,6 +21,10 @@ from .engine import Engine
 from .relay import Relay
 
 logger = log.get("bot")
+
+# Интерактивные проверки не должны заставлять человека ждать: лучше быстрая
+# ошибка, чем полминуты тишины.
+UI_TIMEOUT = 12.0
 
 # Порядок обязательных шагов. CF_ZONE_ID выставляется по дороге, отдельным
 # шагом не показывается — пользователю про zone_id знать незачем.
@@ -104,6 +110,77 @@ FIELD_PROMPTS = {
     "CF_A_RECORD_ID": "ID A-записи в Cloudflare.",
     "CF_AAAA_RECORD_ID": "ID AAAA-записи в Cloudflare. /skip — не обновлять IPv6.",
 }
+
+
+# Что считать осмысленным значением. Без этого бот молча принимал мусор,
+# а падало всё позже и в другом месте — на вызовах API.
+def _check_upcloud_token(v: str) -> str:
+    if v.startswith("ucat_") and len(v) >= 20:
+        return ""
+    if ":" in v and len(v) >= 8:
+        return ""            # легаси-пара логин:пароль
+    return ("Токен UpCloud начинается с ucat_ и длиннее 30 символов.\n\n"
+            "Панель показывает полное значение ОДИН раз — сразу при создании. "
+            "Если окно уже закрыто, значение не восстановить: создайте новый токен "
+            "(People → API tokens → Create token) и скопируйте его целиком кнопкой копирования.")
+
+
+def _check_cf_token(v: str) -> str:
+    if len(v) >= 30 and " " not in v:
+        return ""
+    return ("Токен Cloudflare — сплошная строка примерно из 40 символов без пробелов.\n\n"
+            "dash.cloudflare.com → My Profile → API Tokens → Create Token → Create Custom Token.\n"
+            "Показывается один раз при создании; Global API Key не подойдёт.")
+
+
+def _check_uuid(v: str) -> str:
+    return "" if re.fullmatch(r"[0-9a-fA-F-]{32,36}", v) else "Это не похоже на UUID (36 символов с дефисами)."
+
+
+def _check_hex32(v: str) -> str:
+    return "" if re.fullmatch(r"[0-9a-fA-F]{32}", v) else "Идентификатор Cloudflare — 32 шестнадцатеричных символа."
+
+
+def _check_pubkey(v: str) -> str:
+    return "" if v.startswith(("ssh-", "ecdsa-")) else "Публичный ключ начинается с ssh-ed25519 или ssh-rsa."
+
+
+def _check_keypath(v: str) -> str:
+    if not v.startswith("/"):
+        return "Нужен абсолютный путь к файлу ключа на ЭТОМ сервере."
+    if not Path(v).exists():
+        return f"Файла {v} на этом сервере нет. Проверьте путь."
+    return ""
+
+
+def _check_domain(v: str) -> str:
+    return "" if "." in v and " " not in v else "Домен выглядит как vpn.example.com"
+
+
+def _check_plain(v: str) -> str:
+    return "" if v and " " not in v else "Значение не должно быть пустым и содержать пробелы."
+
+
+VALIDATORS = {
+    "UPCLOUD_TOKEN": _check_upcloud_token,
+    "UPCLOUD_ADMIN_TOKEN": _check_upcloud_token,
+    "UPCLOUD_SUBACCOUNT": _check_plain,
+    "SERVER_UUID": _check_uuid,
+    "CF_TOKEN": _check_cf_token,
+    "CF_ZONE_ID": _check_hex32,
+    "CF_A_RECORD_ID": _check_hex32,
+    "CF_AAAA_RECORD_ID": _check_hex32,
+    "SSH_KEY_PATH": _check_keypath,
+    "SSH_PUBKEY": _check_pubkey,
+    "VPN_DOMAIN": _check_domain,
+}
+
+
+def preview(value: str) -> str:
+    """Показать присланное, не раскрывая его целиком."""
+    if len(value) <= 8:
+        return f"«{value}» ({len(value)} симв.)"
+    return f"«{value[:4]}…{value[-2:]}» ({len(value)} симв.)"
 
 
 class Bot:
@@ -199,15 +276,24 @@ class Bot:
                 failures = 0
                 for update in updates:
                     self.offset = update["update_id"] + 1
-                    try:
-                        self.handle(update)
-                    except Exception as exc:                   # noqa: BLE001
-                        logger.exception("ошибка обработки апдейта: %s", exc)
-                        self.send(f"❌ {exc}")
+                    # Обработка уносится в отдельный поток: один медленный вызов
+                    # API иначе застопорил бы опрос, и Telegram успевал отвечать
+                    # «query is too old» на следующие нажатия.
+                    threading.Thread(
+                        target=self._handle_safely, args=(update,), name="update", daemon=True
+                    ).start()
             except Exception as exc:                           # noqa: BLE001
                 failures += 1
                 logger.warning("long-poll сорвался (%s подряд): %s", failures, exc)
                 stop_event.wait(min(5 * failures, 60))
+
+    def _handle_safely(self, update: dict[str, Any]) -> None:
+        try:
+            with self._lock:            # апдейты по одному: мастер имеет состояние
+                self.handle(update)
+        except Exception as exc:                               # noqa: BLE001
+            logger.exception("ошибка обработки апдейта: %s", exc)
+            self.send(f"❌ {exc}")
 
     def handle(self, update: dict[str, Any]) -> None:
         if "callback_query" in update:
@@ -534,7 +620,7 @@ class Bot:
     def pick_server(self) -> None:
         """Сервер выбирается кнопкой — UUID руками не вводят."""
         try:
-            servers = self.engine.uc.servers()
+            servers = self.engine.uc.servers(timeout=UI_TIMEOUT)
         except Exception as exc:                               # noqa: BLE001
             return self.send(
                 f"❌ не получилось получить список серверов: {exc}\n\n"
@@ -556,7 +642,7 @@ class Bot:
 
     def pick_zone(self) -> None:
         try:
-            zones = self.engine.cf.zones()
+            zones = self.engine.cf.zones(timeout=UI_TIMEOUT)
         except Exception as exc:                               # noqa: BLE001
             logger.info("список зон не получен: %s", exc)
             return self.ask_field("CF_ZONE_ID")
@@ -615,8 +701,21 @@ class Bot:
         self.send(f"{FIELD_PROMPTS.get(key, f'Пришлите значение {key}.')}{now}{hint}")
 
     def on_setup_value(self, message: dict[str, Any], text: str) -> None:
-        key, self.awaiting = self.awaiting, ""
+        key = self.awaiting
         value = text.strip()
+
+        problem = VALIDATORS.get(key, lambda _v: "")(value)
+        if problem:
+            # awaiting НЕ сбрасываем: можно просто прислать значение заново.
+            if "TOKEN" in key:
+                self.delete(message["chat"]["id"], message["message_id"])
+            return self.send(
+                f"❌ Не принял: {preview(value)}\n\n{problem}\n\n"
+                "Пришлите значение ещё раз, или /skip · /cancel.",
+                [[{"text": "❓ Где взять токены", "callback_data": "guide:where"}]],
+            )
+
+        self.awaiting = ""
         if self.cfg.get("telegram.delete_secret_messages", True) and "TOKEN" in key:
             self.delete(message["chat"]["id"], message["message_id"])
         self.secrets.set(key, value)
@@ -641,7 +740,7 @@ class Bot:
         """После каждого значения — сразу следующий шаг, чтобы не искать команду."""
         if key == "UPCLOUD_TOKEN":
             try:
-                account = self.engine.uc.account()
+                account = self.engine.uc.account(timeout=UI_TIMEOUT)
                 self.send(f"Токен принят, аккаунт {account.get('username', '?')}.")
             except Exception as exc:                           # noqa: BLE001
                 return self.send(
@@ -650,7 +749,7 @@ class Bot:
                 )
         if key == "CF_TOKEN":
             try:
-                self.engine.cf.verify_token()
+                self.engine.cf.verify_token(timeout=UI_TIMEOUT)
                 self.send("Токен Cloudflare принят.")
             except Exception as exc:                           # noqa: BLE001
                 return self.send(
@@ -752,7 +851,10 @@ class Bot:
             return
         data = callback.get("data", "")
         logger.info("нажата кнопка %s", data)
-        self.answer_callback(callback["id"])
+        # Ответить Telegram надо в первые секунды, иначе «query is too old».
+        threading.Thread(
+            target=self.answer_callback, args=(callback["id"],), daemon=True
+        ).start()
 
         if data == "cancel":
             self.awaiting = ""

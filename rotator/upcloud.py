@@ -91,11 +91,11 @@ class UpCloud:
 
     # --- аккаунт и справочники ---------------------------------------------
 
-    def account(self) -> dict[str, Any]:
-        return self._call("GET", "/1.3/account").get("account", {})
+    def account(self, timeout: float | None = None) -> dict[str, Any]:
+        return self._call("GET", "/1.3/account", timeout=timeout).get("account", {})
 
-    def zones(self) -> list[dict[str, Any]]:
-        return self._call("GET", "/1.3/zone").get("zones", {}).get("zone", [])
+    def zones(self, timeout: float | None = None) -> list[dict[str, Any]]:
+        return self._call("GET", "/1.3/zone", timeout=timeout).get("zones", {}).get("zone", [])
 
     def plans(self) -> list[dict[str, Any]]:
         return self._call("GET", "/1.3/plan").get("plans", {}).get("plan", [])
@@ -105,8 +105,8 @@ class UpCloud:
     def server(self, uuid: str) -> dict[str, Any]:
         return self._call("GET", f"/1.3/server/{uuid}").get("server", {})
 
-    def servers(self) -> list[dict[str, Any]]:
-        return self._call("GET", "/1.3/server").get("servers", {}).get("server", [])
+    def servers(self, timeout: float | None = None) -> list[dict[str, Any]]:
+        return self._call("GET", "/1.3/server", timeout=timeout).get("servers", {}).get("server", [])
 
     def stop_server(self, uuid: str, stop_type: str = "soft", timeout: int = 60) -> None:
         self._call(

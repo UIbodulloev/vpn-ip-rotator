@@ -28,6 +28,10 @@ from tests.fake_telegram import FakeTelegram                  # noqa: E402
 
 log.setup("CRITICAL")
 
+# Правдоподобные значения: валидатор отсекает короткие заглушки, и это правильно.
+GOOD_UC = "ucat_" + "a1b2c3d4e5" * 4
+GOOD_CF = "cfTOKEN" + "x9y8z7w6v5" * 4
+
 CONFIG = """
 [vpn]
 domain = "vpn.example.com"
@@ -119,16 +123,16 @@ class SetupWizardTest(unittest.TestCase):
         self.h.pump()
 
         before = len(self.h.tg.sent)
-        self.h.tg.user_says("ucat_рабочий_токен_1234567890")
+        self.h.tg.user_says(GOOD_UC)
         self.h.pump()
 
-        self.assertEqual(self.h.secrets.get("UPCLOUD_TOKEN"), "ucat_рабочий_токен_1234567890")
+        self.assertEqual(self.h.secrets.get("UPCLOUD_TOKEN"), GOOD_UC)
         self.assertGreater(len(self.h.tg.sent), before, "бот промолчал")
         # И сразу предложил выбрать сервер — это следующий шаг.
         self.assertIn("pick:server:0", [d for _, d in self.h.tg.buttons()])
 
     def test_сервер_выбирается_кнопкой_без_ввода_uuid(self):
-        self.h.secrets.set("UPCLOUD_TOKEN", "ucat_x")
+        self.h.secrets.set("UPCLOUD_TOKEN", GOOD_UC)
         self.h.tg.user_says("/setup")
         self.h.pump()
         self.h.tg.user_taps("wiz:next")
@@ -142,8 +146,8 @@ class SetupWizardTest(unittest.TestCase):
         self.assertEqual(self.h.bot.awaiting, "CF_TOKEN", "мастер не перешёл к токену Cloudflare")
 
     def test_зона_и_запись_выбираются_кнопками_а_домен_подставляется(self):
-        for key, value in (("UPCLOUD_TOKEN", "ucat_x"), ("SERVER_UUID", self.h.server_uuid),
-                           ("CF_TOKEN", "cf_x")):
+        for key, value in (("UPCLOUD_TOKEN", GOOD_UC), ("SERVER_UUID", self.h.server_uuid),
+                           ("CF_TOKEN", GOOD_CF)):
             self.h.secrets.set(key, value)
         self.h.tg.user_says("/setup")
         self.h.pump()
@@ -169,11 +173,11 @@ class SetupWizardTest(unittest.TestCase):
         self.h.pump()
         self.h.tg.user_taps("wiz:next")
         self.h.pump()
-        self.h.tg.user_says("ucat_token")          # печатаем токен
+        self.h.tg.user_says(GOOD_UC)               # печатаем токен
         self.h.pump()
         self.h.tg.user_taps("pick:server:0")       # дальше только кнопки
         self.h.pump()
-        self.h.tg.user_says("cf_token")            # печатаем второй токен
+        self.h.tg.user_says(GOOD_CF)               # печатаем второй токен
         self.h.pump()
         self.h.tg.user_taps("pick:zone:0")
         self.h.pump()
@@ -186,10 +190,10 @@ class SetupWizardTest(unittest.TestCase):
 
     def test_токен_подхватывается_без_перезапуска(self):
         """Клиенты обязаны читать токен заново — иначе /setup не даёт эффекта."""
-        self.h.secrets.set("UPCLOUD_TOKEN", "ucat_новый")
-        self.assertEqual(self.h.engine.uc.token, "ucat_новый")
-        self.h.secrets.set("CF_TOKEN", "cf_новый")
-        self.assertEqual(self.h.engine.cf.token, "cf_новый")
+        self.h.secrets.set("UPCLOUD_TOKEN", GOOD_UC)
+        self.assertEqual(self.h.engine.uc.token, GOOD_UC)
+        self.h.secrets.set("CF_TOKEN", GOOD_CF)
+        self.assertEqual(self.h.engine.cf.token, GOOD_CF)
 
     def test_мастер_переживает_перезапуск(self):
         self.h.tg.user_says("/setup")
@@ -210,10 +214,10 @@ class SetupWizardTest(unittest.TestCase):
         self.h.pump()
         self.h.tg.user_taps("wiz:next")
         self.h.pump()
-        self.h.tg.user_says("ucat_секрет_1234567890")
+        self.h.tg.user_says(GOOD_UC)
         self.h.pump()
         self.assertTrue(self.h.tg.deleted, "сообщение с токеном не удалено")
-        self.assertNotIn("ucat_секрет_1234567890", "\n".join(self.h.tg.texts()), "секрет утёк в ответ")
+        self.assertNotIn(GOOD_UC, "\n".join(self.h.tg.texts()), "секрет утёк в ответ")
 
     def test_справка_открывается_и_влезает_в_лимит(self):
         from rotator import guide
@@ -229,6 +233,54 @@ class SetupWizardTest(unittest.TestCase):
         self.h.pump()
         self.assertIn("Сначала настройка", self.h.tg.last_text())
         self.assertIn("wiz:board", [d for _, d in self.h.tg.buttons()])
+
+    def test_короткий_мусор_вместо_токена_отвергается(self):
+        """Реальный случай: в бота прилетело 6 символов вместо токена."""
+        self.h.tg.user_says("/setup")
+        self.h.pump()
+        self.h.tg.user_taps("wiz:next")
+        self.h.pump()
+
+        self.h.tg.user_says("ucat_")           # обрезанное значение из панели
+        self.h.pump()
+
+        self.assertEqual(self.h.secrets.get("UPCLOUD_TOKEN"), "", "мусор попал в секреты")
+        answer = self.h.tg.last_text()
+        self.assertIn("Не принял", answer, "бот промолчал вместо объяснения")
+        self.assertIn("5 симв", answer, "не показал, что именно получил")
+        self.assertIn("ucat_", answer, "не объяснил, как выглядит правильный токен")
+        self.assertEqual(self.h.bot.awaiting, "UPCLOUD_TOKEN",
+                         "после отказа надо остаться на том же шаге, а не терять его")
+
+    def test_после_отказа_можно_просто_прислать_заново(self):
+        self.h.tg.user_says("/setup")
+        self.h.pump()
+        self.h.tg.user_taps("wiz:next")
+        self.h.pump()
+        self.h.tg.user_says("ucat_")
+        self.h.pump()
+        self.h.tg.user_says(GOOD_UC)
+        self.h.pump()
+        self.assertEqual(self.h.secrets.get("UPCLOUD_TOKEN"), GOOD_UC)
+
+    def test_мусор_с_коротким_значением_тоже_удаляется_из_чата(self):
+        """Отвергнутый токен всё равно секрет — он не должен остаться в переписке."""
+        self.h.tg.user_says("/setup")
+        self.h.pump()
+        self.h.tg.user_taps("wiz:next")
+        self.h.pump()
+        self.h.tg.user_says("ucat_")
+        self.h.pump()
+        self.assertTrue(self.h.tg.deleted, "отвергнутое значение осталось в чате")
+
+    def test_кривой_uuid_и_кривой_ключ_отвергаются(self):
+        from rotator.bot import VALIDATORS
+        self.assertTrue(VALIDATORS["SERVER_UUID"]("не-uuid"))
+        self.assertFalse(VALIDATORS["SERVER_UUID"]("0074bb45-dabe-4e06-9a32-55edb9b2af16"))
+        self.assertTrue(VALIDATORS["SSH_PUBKEY"]("просто текст"))
+        self.assertFalse(VALIDATORS["SSH_PUBKEY"]("ssh-ed25519 AAAAC3Nza"))
+        self.assertTrue(VALIDATORS["CF_ZONE_ID"]("коротко"))
+        self.assertFalse(VALIDATORS["CF_ZONE_ID"]("f5bbcd30d3f695cbd828c8446efb4487"))
 
     def test_чужой_чат_игнорируется(self):
         self.h.tg.user_says("/setup", chat_id="999")
