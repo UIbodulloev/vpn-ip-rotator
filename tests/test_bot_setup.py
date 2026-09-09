@@ -296,6 +296,43 @@ class SetupWizardTest(unittest.TestCase):
         self.assertTrue(VALIDATORS["CF_ZONE_ID"]("коротко"))
         self.assertFalse(VALIDATORS["CF_ZONE_ID"]("f5bbcd30d3f695cbd828c8446efb4487"))
 
+    def test_plan_показывает_шаги_и_ничего_не_делает(self):
+        for key, value in (("UPCLOUD_TOKEN", GOOD_UC), ("SERVER_UUID", self.h.server_uuid)):
+            self.h.secrets.set(key, value)
+        before = dict(self.h.cloud.servers[self.h.server_uuid])
+
+        for mode in ("replace-ip", "recreate", "floating"):
+            self.h.tg.timeline.clear()
+            self.h.tg.user_says(f"/plan {mode}")
+            self.h.pump()
+            card = self.h.tg.all_visible()
+            self.assertIn(mode, card, f"режим {mode} не назван")
+            self.assertIn("Что произойдёт", card, f"нет шагов для {mode}")
+            self.assertIn("Цена вопроса", card, f"нет цены для {mode}")
+
+        self.assertEqual(self.h.cloud.servers[self.h.server_uuid], before,
+                         "/plan изменил состояние сервера")
+
+    def test_plan_без_аргумента_предлагает_выбрать_режим(self):
+        self.h.tg.user_says("/plan")
+        self.h.pump()
+        buttons = [d for _, d in self.h.tg.buttons()]
+        for mode in ("plan:replace-ip", "plan:recreate", "plan:floating"):
+            self.assertIn(mode, buttons)
+
+    def test_сообщения_размечены_html_и_не_ломаются(self):
+        """Значение с угловой скобкой не должно превращать бота в молчуна."""
+        self.h.secrets.set("SERVER_UUID", self.h.server_uuid)
+        self.h.cloud.servers[self.h.server_uuid]["hostname"] = "сервер <test> & co"
+        self.h.tg.user_says("/status")
+        self.h.pump()
+        self.assertTrue(self.h.tg.timeline, "бот промолчал")
+
+    def test_кнопка_инструкции_есть_в_главном_меню(self):
+        self.h.tg.user_says("/help")
+        self.h.pump()
+        self.assertIn("guide:menu", [d for _, d in self.h.tg.buttons()])
+
     def test_меню_команд_публикуется_и_совпадает_со_справкой(self):
         from rotator.bot import COMMANDS, HELP
         self.h.bot.publish_commands()

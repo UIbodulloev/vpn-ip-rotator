@@ -422,8 +422,9 @@ def _prune_templates(ctx: Ctx, keep: int, extra: list[str]) -> None:
         except UpCloudError as exc:
             logger.warning("промежуточный диск %s не удалён: %s", uuid, exc)
 
+    # keep=0 — удалить все шаблоны: точки отката не будет, зато не тарифицируется.
     templates = ctx.state["templates"]
-    for entry in templates[max(keep, 1):]:
+    for entry in templates[max(keep, 0):]:
         try:
             ctx.uc.delete_storage(entry["uuid"])
             ctx.state.drop_template(entry["uuid"])

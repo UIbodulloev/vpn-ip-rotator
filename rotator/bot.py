@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import guide, log, modes, probes
+from . import guide, log, modes, probes, ui
 from .config import Secrets, domain_of, masked
 from .engine import Engine
 from .relay import Relay
@@ -53,6 +53,7 @@ COMMANDS = [
     ("probe", "проверить доступность VPN прямо сейчас"),
     ("ip", "что у сервера и что стоит в DNS"),
     ("simulate", "холостой прогон: что сделала бы автоматика"),
+    ("plan", "что именно сделает каждый режим на вашем сервере"),
     ("rotate", "сменить адрес"),
     ("mode", "режим автоматики: auto / replace-ip / recreate / floating"),
     ("pause", "выключить автоматику"),
@@ -79,7 +80,7 @@ def _help_text() -> str:
 
 HELP_GROUPS = [
     ('Наблюдение', ['status', 'probe', 'ip', 'log']),
-    ('Проверка вхолостую', ['simulate']),
+    ('Проверка вхолостую', ['simulate', 'plan']),
     ('Управление', ['rotate', 'mode', 'pause', 'resume', 'rollback']),
     ('Настройка', ['setup', 'check', 'diag', 'zones', 'plans']),
     ('Справка', ['guide']),
@@ -87,6 +88,14 @@ HELP_GROUPS = [
 
 
 HELP = _help_text()
+
+# Одна и та же «подвал-клавиатура» на всех экранах — чтобы не искать, куда идти.
+MAIN_KEYBOARD = [
+    [{"text": "📊 Состояние", "callback_data": "cmd:status"},
+     {"text": "🔍 Проверить", "callback_data": "cmd:probe"}],
+    [{"text": "📖 Инструкция", "callback_data": "guide:menu"},
+     {"text": "⚙️ Настройка", "callback_data": "wiz:board"}],
+]
 
 FIELD_PROMPTS = {
     "UPCLOUD_TOKEN": (
@@ -263,23 +272,35 @@ class Bot:
         payload: dict[str, Any] = {
             "chat_id": chat or self.admin,
             "text": text[:4000],
+            "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }
         if keyboard:
             payload["reply_markup"] = {"inline_keyboard": keyboard}
         result = self.api("sendMessage", payload)
+        if result is None:
+            # Неожиданный символ в значении не должен превращать бота в молчуна:
+            # повторяем то же самое без разметки.
+            payload["text"] = ui.strip_tags(text)[:4000]
+            payload.pop("parse_mode", None)
+            result = self.api("sendMessage", payload)
         return (result or {}).get("message_id", 0)
 
     def edit(self, message_id: int, text: str, keyboard: list[list[dict]] | None = None) -> None:
         if not message_id:
             return
-        self.api("editMessageText", {
+        payload = {
             "chat_id": self.admin,
             "message_id": message_id,
             "text": text[:4000],
+            "parse_mode": "HTML",
             "disable_web_page_preview": True,
             "reply_markup": {"inline_keyboard": keyboard or []},
-        })
+        }
+        if self.api("editMessageText", payload) is None:
+            payload["text"] = ui.strip_tags(text)[:4000]
+            payload.pop("parse_mode", None)
+            self.api("editMessageText", payload)
 
     def delete(self, chat_id: Any, message_id: int) -> None:
         self.api("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
@@ -385,14 +406,18 @@ class Bot:
         if command.startswith("/guide"):
             return self.cmd_guide(command)
         if command in ("/start", "/help"):
-            self.send(HELP, [[{"text": "❓ Как это всё работает", "callback_data": "guide:overview"}],
-                             [{"text": "⚙️ Настройка", "callback_data": "wiz:board"}]])
+            self.send(
+                ui.joined(ui.title("Команды", "🤖"), ui.esc(HELP.split("\n", 2)[-1].strip())),
+                MAIN_KEYBOARD,
+            )
         elif command == "/status":
             self.send(self.status_text())
         elif command == "/probe":
             self.cmd_probe()
         elif command == "/simulate":
             self.cmd_simulate()
+        elif command == "/plan":
+            self.cmd_plan(argument)
         elif command == "/ip":
             self.cmd_ip()
         elif command == "/rotate":
@@ -429,53 +454,202 @@ class Bot:
         page = command.replace("/guide", "").lstrip("_")
         if page in guide.PAGES:
             return self.show_guide(page)
-        rows = [[{"text": title, "callback_data": f"guide:{key}"}] for key, (title, _) in guide.PAGES.items()]
+        rows = [[{"text": heading, "callback_data": f"guide:{key}"}]
+                for key, (heading, _) in guide.PAGES.items()]
         rows.append([{"text": "⚙️ Перейти к настройке", "callback_data": "wiz:board"}])
-        self.send(guide.MENU, rows)
+        self.send(ui.joined(ui.title("Инструкция", "📖"), ui.esc(guide.MENU.split("\n", 2)[-1].strip())), rows)
 
     def show_guide(self, page: str) -> None:
-        title, body = guide.PAGES[page]
+        heading, body = guide.PAGES[page]
         others = [[{"text": t, "callback_data": f"guide:{k}"}]
                   for k, (t, _) in guide.PAGES.items() if k != page]
-        self.send(body, others + [[{"text": "⚙️ Настройка", "callback_data": "wiz:board"}]])
+        self.send(
+            ui.joined(ui.title(heading), ui.esc(body.split("\n", 2)[-1].strip())),
+            others + [[{"text": "⚙️ Настройка", "callback_data": "wiz:board"}]],
+        )
 
     def status_text(self) -> str:
         state = self.engine.state
         probe = state["last_probe"] or {}
-        age = int(time.time() - (state["last_probe_ts"] or time.time()))
         mode = state["mode"] or self.cfg.get("rotation.mode", "auto")
-        history = state["history"]
-        lines = [
-            f"Адрес:    {state['ipv4'] or '—'}" + (f"  /  {state['ipv6']}" if state["ipv6"] else ""),
-            f"Домен:    {domain_of(self.cfg, self.secrets) or '—'}",
-            f"Зона:     {state['zone'] or '—'}   план: {state['plan'] or '—'}",
-            f"Сервер:   {probe.get('server_state') or '—'}",
-            f"Режим:    {mode}" + ("   ⏸ пауза" if state["paused"] else ""),
-            "",
-            f"Вердикт:  {probes.VERDICT_TEXT.get(state['last_verdict'], '—')}",
-            f"Пробы:    " + _probe_line(probe) + f"  ({age} с назад)",
-            f"Серия неудач: {state['fail_streak']}/{self.cfg.get('detector.fail_threshold')}"
-            + (f"   (проверка каждые {self.cfg.get('detector.interval_sec')} с)"
-               if self.cfg.get("detector.enabled", True) else "   ⚠️ детектор выключен"),
-            f"Ротаций сегодня: {state.rotations_today()}/{self.cfg.get('rotation.max_per_day')}",
+        verdict = state["last_verdict"]
+
+        head = ui.title("Состояние", _verdict_emoji(verdict))
+        server = ui.table([
+            ("Адрес", state["ipv4"]),
+            ("IPv6", state["ipv6"]),
+            ("Домен", domain_of(self.cfg, self.secrets)),
+            ("Локация", " · ".join(x for x in (state["zone"], state["plan"]) if x)),
+            ("Сервер", probe.get("server_state") or "—"),
+            ("Режим", mode + ("   ⏸ пауза" if state["paused"] else "")),
+        ])
+
+        if probe.get("ip"):
+            age = int(time.time() - (state["last_probe_ts"] or time.time()))
+            checks = ui.table([
+                ("свой канал", ui.mark(probe.get("sanity"))),
+                (f"порт {self.cfg.get('vpn.probe_port')}", ui.mark(probe.get("work_port"))),
+                (f"порт {self.cfg.get('vpn.control_port')}", ui.mark(probe.get("control_port"))),
+            ])
+            checks = ui.joined(
+                ui.title(f"Проверка · {age} с назад"),
+                checks,
+                ui.note(probes.VERDICT_TEXT.get(verdict, "—")),
+            )
+        else:
+            checks = ui.joined(ui.title("Проверка"), ui.note("проб ещё не было"))
+
+        footer_rows = [
+            f"серия неудач   {state['fail_streak']} из {self.cfg.get('detector.fail_threshold')}",
+            f"ротаций сегодня {state.rotations_today()} из {self.cfg.get('rotation.max_per_day')}",
         ]
+        if self.cfg.get("detector.enabled", True):
+            footer_rows.append(f"проверка каждые {self.cfg.get('detector.interval_sec')} с")
+        else:
+            footer_rows.append("детектор выключен")
+        footer = ui.block(footer_rows)
+
+        flags = []
         if self.cfg.get("dry_run"):
-            lines.append("⚠️ dry_run включён — ротации только имитируются")
+            flags.append(f"{ui.WARN} dry_run: ротации только имитируются")
         if state["pending"]:
-            lines.append(f"⚠️ незавершённая ротация: {state['pending'].get('mode')} / {state['pending'].get('step')}")
+            pending = state["pending"]
+            flags.append(f"{ui.WARN} незавершённая ротация: {pending.get('mode')} / {pending.get('step')}")
+
+        history = state["history"]
+        last = ""
         if history:
-            last = history[0]
-            when = time.strftime("%d.%m %H:%M", time.localtime(last["ts"]))
-            lines += ["", f"Последняя: {when} {last['mode']} {last['from']} → {last['to']} ({last['reason']})"]
-        return "\n".join(lines)
+            entry = history[0]
+            when = time.strftime("%d.%m %H:%M", time.localtime(entry["ts"]))
+            last = ui.joined(
+                ui.title("Последняя ротация"),
+                ui.block([f"{when}  {entry['mode']}",
+                          f"{entry['from']} → {entry['to']}",
+                          f"причина: {entry['reason']}"]),
+            )
+
+        return ui.joined(head, server, checks, footer, "\n".join(flags), last)
 
     def cmd_probe(self) -> None:
-        message_id = self.send("Проверяю…")
+        message_id = self.send(f"{ui.WAIT} Проверяю…")
         result = self.engine.probe()
-        verdict = probes.VERDICT_TEXT.get(result.verdict, result.verdict)
-        suffix = "" if result.confident else "\n(уверенности нет — сузить причину нечем)"
-        rotatable = "смена адреса поможет" if result.verdict in probes.ROTATABLE else "смена адреса не поможет"
-        self.edit(message_id, f"{result.short()}\n\nВердикт: {verdict}\n{rotatable}{suffix}")
+        self.edit(message_id, self._probe_card(result), [
+            [{"text": "📊 Состояние", "callback_data": "cmd:status"}],
+            [{"text": "🧪 Что сделала бы автоматика", "callback_data": "cmd:simulate"}],
+        ])
+
+    def _probe_card(self, result: probes.ProbeResult) -> str:
+        rotatable = result.verdict in probes.ROTATABLE
+        head = ui.title("Проверка доступности", _verdict_emoji(result.verdict))
+        if not result.ip:
+            return ui.joined(head, ui.note("адрес сервера неизвестен — сначала /setup"))
+
+        checks = ui.table([
+            ("свой канал", ui.mark(result.sanity)),
+            (f"порт {self.cfg.get('vpn.probe_port')}", ui.mark(result.work_port)),
+            (f"порт {self.cfg.get('vpn.control_port')}", ui.mark(result.control_port)),
+            ("сервер", result.server_state or "—"),
+        ] + ([("сессия Reality", ui.mark(result.reality))] if result.reality is not None else [])
+          + ([("хендшейк AmneziaWG", ui.mark(result.awg))] if result.awg is not None else []))
+
+        verdict = ui.joined(
+            ui.title("Вердикт"),
+            ui.block([probes.VERDICT_TEXT.get(result.verdict, result.verdict)]),
+            ui.note("смена адреса помогла бы" if rotatable else "смена адреса не помогла бы"),
+        )
+        doubt = ui.note("уверенности нет: сузить причину нечем") if not result.confident else ""
+        return ui.joined(head, ui.block([f"адрес {result.ip}"]), checks, verdict, doubt)
+
+    def cmd_plan(self, argument: str) -> None:
+        """Пошаговый разбор режима на реальных данных сервера. Ничего не делает."""
+        if argument not in modes.ALL_MODES:
+            return self.send(
+                ui.joined(
+                    ui.title("Что именно сделает скрипт", "📋"),
+                    ui.esc("Выберите режим — покажу точные шаги с вашими значениями. "
+                           "Ничего при этом не выполняется."),
+                ),
+                [[{"text": m, "callback_data": f"plan:{m}"}] for m in modes.ALL_MODES]
+                + [[{"text": "◀️ Назад", "callback_data": "cmd:status"}]],
+            )
+
+        message_id = self.send(f"{ui.WAIT} Собираю данные сервера…")
+        try:
+            info = self.engine.refresh()
+        except Exception as exc:                               # noqa: BLE001
+            return self.edit(message_id, ui.joined(
+                ui.title("Не удалось прочитать сервер", ui.NO), ui.block([str(exc)])))
+
+        domain = domain_of(self.cfg, self.secrets) or "—"
+        short_uuid = (info["uuid"] or "")[:8] + "…"
+        facts = ui.table([
+            ("сервер", f"{info['hostname']} ({short_uuid})"),
+            ("адрес", info["ipv4"]),
+            ("зона", info["zone"]),
+            ("план", info["plan"]),
+            ("диск", f"{info['storage_size']} ГБ, {info['storage_tier'] or 'standard'}"),
+            ("домен", domain),
+        ])
+
+        if argument == modes.REPLACE_IP:
+            plan = ui.steps([
+                ("Остановить сервер", "мягко, с ожиданием до "
+                 f"{self.cfg.get('rotation.wait_stop_sec')} с"),
+                ("Заказать новый IPv4", f"на интерфейс {info['mac'] or '—'}"),
+                (f"Освободить {info['ipv4']}", "строго после выдачи нового"),
+                ("Запустить сервер", "адрес приезжает по DHCP, netplan не трогаем"),
+                (f"Переписать A-запись {domain}", f"TTL {self.cfg.get('rotation.dns_ttl')} с"),
+                ("Дождаться порта 443", "подтверждение, что VPN поднялся"),
+            ])
+            cost = ["даунтайм ~2–3 минуты", "денег не стоит", "конфиги клиентов не меняются"]
+
+        elif argument == modes.RECREATE:
+            target = self.engine.next_zone() or info["zone"]
+            same = target == info["zone"]
+            plan = ui.steps([
+                ("Остановить сервер", "шаблон снимается только с остановленного"),
+                (f"Снять шаблон диска {info['storage_size']} ГБ",
+                 "внутри всё: ключи, клиенты, swap, authorized_keys"),
+            ] + ([] if same else [(f"Скопировать диск в {target}", "самый долгий шаг, до получаса")]) + [
+                (f"Создать сервер {info['plan']} в {target}", "из шаблона, адрес выдаётся бесплатно"),
+                (f"Переписать A и AAAA {domain}", "старые конфиги остаются рабочими"),
+                (f"Удалить старый сервер", f"адрес {info['ipv4']} освобождается автоматически"),
+                ("Прибрать шаблоны", f"остаётся {self.cfg.get('rotation.keep_templates')} как точка отката"),
+            ])
+            cost = [
+                f"даунтайм ~5–10 минут" + ("" if same else " плюс копирование диска"),
+                "новый адрес бесплатный, остаток за старый сервер возвращается",
+                f"шаблон {info['storage_size']} ГБ тарифицируется как доп. хранилище",
+                "конфиги клиентов не меняются: ключи внутри шаблона",
+            ]
+
+        else:
+            previous = self.engine.state.data.get("floating_ip") or "—"
+            plan = ui.steps([
+                ("Заказать плавающий адрес", f"на интерфейс {info['mac'] or '—'}, сервер не останавливается"),
+                ("Поднять его по SSH", "netplan 99-floating.yaml, соединение не рвётся"),
+                (f"Переписать A-запись {domain}", ""),
+                (f"Освободить прошлый плавающий {previous}", "основной адрес сервера не трогается"),
+            ])
+            cost = [
+                "даунтайма нет",
+                "плавающий адрес тарифицируется помесячно",
+                "нужен SSH-ключ; если заблокирован и 22-й порт, режим не сработает",
+                "конфиги клиентов не меняются",
+            ]
+
+        self.edit(message_id, ui.joined(
+            ui.title(f"Режим {argument}", "📋"),
+            facts,
+            ui.title("Что произойдёт"),
+            plan,
+            ui.title("Цена вопроса"),
+            ui.block(cost),
+            ui.note("Это только описание — ничего не выполнено."),
+        ), [
+            [{"text": f"▶️ Выполнить {argument}", "callback_data": f"rot:{argument}"}],
+            [{"text": "◀️ Другие режимы", "callback_data": "cmd:plan"}],
+        ])
 
     def cmd_simulate(self) -> None:
         """Что сделала бы автоматика прямо сейчас. Ничего не меняет."""
@@ -526,23 +700,40 @@ class Bot:
         self.edit(message_id, "\n".join(lines))
 
     def cmd_ip(self) -> None:
+        message_id = self.send(f"{ui.WAIT} Сверяю сервер и DNS…")
         try:
             info = self.engine.refresh()
         except Exception as exc:                               # noqa: BLE001
-            return self.send(f"❌ UpCloud не ответил: {exc}")
-        lines = [f"UpCloud:   {info['ipv4']}" + (f" / {info['ipv6']}" if info["ipv6"] else "")]
+            return self.edit(message_id, ui.joined(
+                ui.title("UpCloud не ответил", ui.NO), ui.block([str(exc)])))
+
+        rows = [("UpCloud IPv4", info["ipv4"]), ("UpCloud IPv6", info["ipv6"] or "—")]
+        problems = []
         zone_id = self.secrets.get("CF_ZONE_ID")
-        for key, rtype in (("CF_A_RECORD_ID", "A"), ("CF_AAAA_RECORD_ID", "AAAA")):
+        for key, rtype, expected in (("CF_A_RECORD_ID", "A", info["ipv4"]),
+                                     ("CF_AAAA_RECORD_ID", "AAAA", info["ipv6"])):
             record_id = self.secrets.get(key)
             if not (zone_id and record_id):
                 continue
             try:
                 record = self.engine.cf.get_record(zone_id, record_id)
-                mark = "✅" if record.get("content") in (info["ipv4"], info["ipv6"]) else "❌ расходится"
-                lines.append(f"DNS {rtype:<4}: {record.get('content')} (TTL {record.get('ttl')}) {mark}")
+                agrees = record.get("content") == expected
+                rows.append((f"DNS {rtype}", f"{record.get('content')} {ui.mark(agrees)}"))
+                if not agrees:
+                    problems.append(f"{rtype}-запись расходится с адресом сервера")
+                ttl = record.get("ttl")
+                if isinstance(ttl, int) and ttl > 120:
+                    problems.append(f"TTL {rtype}-записи {ttl} с — поставьте 60")
+                if record.get("proxied"):
+                    problems.append(f"{rtype}-запись проксируется — через оранжевое облако VPN не ходит")
             except Exception as exc:                           # noqa: BLE001
-                lines.append(f"DNS {rtype:<4}: ошибка — {exc}")
-        self.send("\n".join(lines))
+                rows.append((f"DNS {rtype}", f"ошибка: {exc}"))
+
+        self.edit(message_id, ui.joined(
+            ui.title("Адрес и DNS", "🌐"),
+            ui.table(rows),
+            ui.block(problems) if problems else ui.note("расхождений нет"),
+        ), [[{"text": "📊 Состояние", "callback_data": "cmd:status"}]])
 
     def cmd_mode(self, argument: str) -> None:
         choices = ("auto",) + modes.ALL_MODES
@@ -640,13 +831,14 @@ class Bot:
         )
 
     def start_rotation(self, mode: str, zone: str) -> None:
-        header = f"Ротация {mode}" + (f" → {zone}" if zone else "")
-        message_id = self.send(f"{header}\n\n…")
+        header = ui.title(f"Ротация {mode}" + (f" → {zone}" if zone else ""), "🔄")
+        message_id = self.send(ui.joined(header, ui.note("начинаю…")))
         lines: list[str] = []
 
         def progress(text: str) -> None:
-            lines.append(f"• {text}")
-            self.edit(message_id, f"{header}\n\n" + "\n".join(lines[-14:]))
+            lines.append(text)
+            body = ui.block([f"{i:>2}. {line}" for i, line in enumerate(lines[-14:], 1)])
+            self.edit(message_id, ui.joined(header, body))
 
         def worker() -> None:
             try:
@@ -683,32 +875,37 @@ class Bot:
     def setup_board(self) -> None:
         """Доска состояния: что готово, что осталось, одна кнопка «дальше»."""
         done = [key for key, _ in REQUIRED_STEPS if self.secrets.get(key)]
-        lines = [f"⚙️ Настройка — {len(done)} из {len(REQUIRED_STEPS)}", ""]
-        for number, (key, title) in enumerate(REQUIRED_STEPS, 1):
-            mark = "✅" if self.secrets.get(key) else "▫️"
+        rows = []
+        for number, (key, name) in enumerate(REQUIRED_STEPS, 1):
+            filled = bool(self.secrets.get(key))
             extra = ""
-            if key == "SERVER_UUID" and self.secrets.get(key):
-                extra = f" — {self.engine.state['ipv4'] or self.secrets.get(key)[:8] + '…'}"
-            if key == "CF_A_RECORD_ID" and self.secrets.get(key):
-                extra = f" — {domain_of(self.cfg, self.secrets)}"
-            lines.append(f"{mark} {number}. {title}{extra}")
+            if filled and key == "SERVER_UUID":
+                extra = self.engine.state["ipv4"] or ""
+            if filled and key == "CF_A_RECORD_ID":
+                extra = domain_of(self.cfg, self.secrets)
+            rows.append(f"{ui.YES if filled else '▫️'} {number}. {name}" + (f"  ({extra})" if extra else ""))
 
-        filled = [t for k, t, _ in OPTIONAL_KEYS if self.secrets.get(k)]
-        lines += ["", f"Необязательное: {len(filled)} из {len(OPTIONAL_KEYS)}"]
-        if filled:
-            lines.append("  " + ", ".join(filled))
+        optional_done = [name for k, name, _ in OPTIONAL_KEYS if self.secrets.get(k)]
 
-        rows: list[list[dict]] = []
+        head = ui.joined(
+            ui.title("Настройка", "⚙️"),
+            ui.block([f"{ui.bar(len(done), len(REQUIRED_STEPS))}  {len(done)} из {len(REQUIRED_STEPS)}"]),
+            ui.block(rows),
+            ui.note(f"необязательное: {len(optional_done)} из {len(OPTIONAL_KEYS)}"
+                    + (" · " + ", ".join(optional_done) if optional_done else "")),
+        )
+
+        keyboard: list[list[dict]] = []
         if len(done) < len(REQUIRED_STEPS):
-            nxt = next(t for k, t in REQUIRED_STEPS if not self.secrets.get(k))
-            rows.append([{"text": f"▶️ Дальше: {nxt}", "callback_data": "wiz:next"}])
-            lines += ["", "Жмите «Дальше» — я проведу по шагам."]
+            nxt = next(name for k, name in REQUIRED_STEPS if not self.secrets.get(k))
+            keyboard.append([{"text": f"▶️  Дальше: {nxt}", "callback_data": "wiz:next"}])
+            head = ui.joined(head, ui.note("Печатать нужно только два токена — остальное выбирается кнопками."))
         else:
-            lines += ["", "Всё обязательное готово. Проверьте доступы: /check"]
-            rows.append([{"text": "✅ Проверить всё", "callback_data": "wiz:check"}])
-        rows.append([{"text": "⚙️ Необязательное", "callback_data": "wiz:opt"}])
-        rows.append([{"text": "❓ Зачем эти ключи", "callback_data": "guide:keys"}])
-        self.send("\n".join(lines), rows)
+            keyboard.append([{"text": f"{ui.YES} Проверить всё", "callback_data": "wiz:check"}])
+            head = ui.joined(head, ui.note("Обязательное готово."))
+        keyboard.append([{"text": "⚙️ Необязательное", "callback_data": "wiz:opt"},
+                         {"text": "📖 Инструкция", "callback_data": "guide:keys"}])
+        self.send(head, keyboard)
 
     def wizard_next(self) -> None:
         """Следующий незакрытый обязательный шаг. Вызывается после каждого успеха."""
@@ -797,16 +994,17 @@ class Bot:
         )
 
     def optional_menu(self) -> None:
-        rows = []
-        for key, title, why in OPTIONAL_KEYS:
-            mark = "✅" if self.secrets.get(key) else "▫️"
-            rows.append([{"text": f"{mark} {title}", "callback_data": f"set:{key}"}])
-        rows.append([{"text": "◀️ К настройке", "callback_data": "wiz:board"}])
-        lines = ["⚙️ Необязательные ключи", "", "Каждый включает отдельную возможность:", ""]
-        for key, title, why in OPTIONAL_KEYS:
-            mark = "✅" if self.secrets.get(key) else "▫️"
-            lines.append(f"{mark} {title} — {why}")
-        self.send("\n".join(lines), rows)
+        rows = [f"{ui.YES if self.secrets.get(k) else '▫️'} {name} — {why}"
+                for k, name, why in OPTIONAL_KEYS]
+        keyboard = [[{"text": f"{ui.YES if self.secrets.get(k) else '▫️'} {name}",
+                      "callback_data": f"set:{k}"}] for k, name, _ in OPTIONAL_KEYS]
+        keyboard.append([{"text": "◀️ К настройке", "callback_data": "wiz:board"}])
+        self.send(ui.joined(
+            ui.title("Необязательные ключи", "⚙️"),
+            ui.note("Каждый включает отдельную возможность. Без них работают "
+                    "replace-ip и recreate."),
+            ui.block(rows),
+        ), keyboard)
 
     def ask_field(self, key: str) -> None:
         self.awaiting = key
@@ -1006,69 +1204,104 @@ class Bot:
     # --- проверка доступов --------------------------------------------------
 
     def cmd_check(self) -> None:
-        message_id = self.send("Проверяю доступы…")
-        lines: list[str] = []
+        message_id = self.send(f"{ui.WAIT} Проверяю доступы…")
+        sections: list[str] = []
+        problems: list[str] = []
 
-        for url, status in self.relay.health().items():
-            lines.append(f"{'✅' if status == 'ok' else '❌'} релей {url} — {status}")
-        lines.append("✅ Telegram отвечает" if self.api("getMe") else "❌ Telegram не отвечает")
+        # Связь
+        rows = [(url.replace("https://", ""), f"{ui.mark(status == 'ok')} {status}")
+                for url, status in self.relay.health().items()]
+        telegram_ok = bool(self.api("getMe"))
+        rows.append(("telegram", ui.mark(telegram_ok)))
+        if not telegram_ok:
+            problems.append("Telegram не отвечает")
+        sections.append(ui.joined(ui.title("Связь"), ui.table(rows)))
 
+        # UpCloud
+        rows = []
         if not self.secrets.get("UPCLOUD_TOKEN"):
-            lines.append("❌ токен UpCloud не задан")
+            rows.append(("токен", f"{ui.NO} не задан"))
+            problems.append("нет токена UpCloud")
         else:
             try:
-                lines.append(f"✅ UpCloud: аккаунт {self.engine.uc.account().get('username', '?')}")
+                rows.append(("аккаунт", f"{ui.YES} {self.engine.uc.account(timeout=UI_TIMEOUT).get('username', '?')}"))
             except Exception as exc:                           # noqa: BLE001
-                lines.append(f"❌ UpCloud: {exc}")
-
+                rows.append(("аккаунт", f"{ui.NO} {exc}"))
+                problems.append("токен UpCloud не принят")
         if not self.secrets.get("SERVER_UUID"):
-            lines.append("❌ сервер не выбран")
+            rows.append(("сервер", f"{ui.NO} не выбран"))
+            problems.append("сервер не выбран")
         else:
             try:
                 info = self.engine.refresh()
-                lines.append(f"✅ сервер {info['hostname']}: {info['state']}, {info['ipv4']}, {info['zone']}")
+                rows += [("сервер", f"{ui.YES} {info['hostname']}"),
+                         ("состояние", info["state"]),
+                         ("адрес", info["ipv4"]),
+                         ("зона", f"{info['zone']} · {info['plan']}")]
                 if not info["mac"]:
-                    lines.append("⚠️ MAC публичного интерфейса не определился — replace-ip не сработает")
+                    problems.append("MAC интерфейса не определился — replace-ip не сработает")
                 if not info["storage_uuid"]:
-                    lines.append("⚠️ системный диск не определился — recreate не сработает")
+                    problems.append("системный диск не определился — recreate не сработает")
             except Exception as exc:                           # noqa: BLE001
-                lines.append(f"❌ сервер недоступен через API: {exc}")
+                rows.append(("сервер", f"{ui.NO} {exc}"))
+                problems.append("сервер недоступен через API")
+        sections.append(ui.joined(ui.title("UpCloud"), ui.table(rows)))
 
-        if self.secrets.get("UPCLOUD_SUBACCOUNT") and not self.secrets.get("UPCLOUD_ADMIN_TOKEN"):
-            lines.append("⚠️ задан субаккаунт, но нет админ-токена: после recreate прав на новый "
-                         "сервер не будет, следующая ротация упрётся в 403")
-
+        # Cloudflare
+        rows = []
         zone_id = self.secrets.get("CF_ZONE_ID")
         if not self.secrets.get("CF_TOKEN"):
-            lines.append("❌ токен Cloudflare не задан")
+            rows.append(("токен", f"{ui.NO} не задан"))
+            problems.append("нет токена Cloudflare")
         else:
             try:
-                self.engine.cf.verify_token()
-                lines.append("✅ Cloudflare: токен действителен")
+                self.engine.cf.verify_token(timeout=UI_TIMEOUT)
+                rows.append(("токен", f"{ui.YES} действителен"))
             except Exception as exc:                           # noqa: BLE001
-                lines.append(f"❌ Cloudflare: {exc}")
-            record_id = self.secrets.get("CF_A_RECORD_ID")
-            if zone_id and record_id:
-                try:
-                    record = self.engine.cf.get_record(zone_id, record_id)
-                    ttl = record.get("ttl")
-                    warn = "  ⚠️ TTL большой, поставьте 60" if isinstance(ttl, int) and ttl > 120 else ""
-                    proxied = "  ⚠️ включён proxy — VPN через оранжевое облако не работает" if record.get("proxied") else ""
-                    lines.append(f"✅ A-запись {record.get('name')} → {record.get('content')} TTL {ttl}{warn}{proxied}")
-                except Exception as exc:                       # noqa: BLE001
-                    lines.append(f"❌ A-запись: {exc}")
-            else:
-                lines.append("❌ DNS-запись не выбрана")
+                rows.append(("токен", f"{ui.NO} {exc}"))
+                problems.append("токен Cloudflare не принят")
+        record_id = self.secrets.get("CF_A_RECORD_ID")
+        if zone_id and record_id:
+            try:
+                record = self.engine.cf.get_record(zone_id, record_id)
+                rows += [("A-запись", f"{ui.YES} {record.get('name')}"),
+                         ("указывает на", record.get("content")),
+                         ("TTL", f"{record.get('ttl')} с")]
+                ttl = record.get("ttl")
+                if isinstance(ttl, int) and ttl > 120:
+                    problems.append(f"TTL {ttl} с — поставьте 60, иначе клиенты долго видят старый адрес")
+                if record.get("proxied"):
+                    problems.append("A-запись проксируется — через оранжевое облако VPN не работает")
+            except Exception as exc:                           # noqa: BLE001
+                rows.append(("A-запись", f"{ui.NO} {exc}"))
+        else:
+            rows.append(("A-запись", f"{ui.NO} не выбрана"))
+            problems.append("DNS-запись не выбрана")
+        sections.append(ui.joined(ui.title("Cloudflare"), ui.table(rows)))
 
-        lines.append("✅ SSH-ключ задан — floating доступен" if self.secrets.get("SSH_KEY_PATH")
-                     else "➖ SSH-ключа нет — floating недоступен, остальные режимы работают")
+        # Режимы
+        ssh = bool(self.secrets.get("SSH_KEY_PATH"))
+        admin = bool(self.secrets.get("UPCLOUD_ADMIN_TOKEN"))
+        sub = bool(self.secrets.get("UPCLOUD_SUBACCOUNT"))
+        sections.append(ui.joined(ui.title("Доступные режимы"), ui.table([
+            ("replace-ip", ui.YES),
+            ("recreate", ui.YES if (admin or not sub) else f"{ui.WARN} после переезда нужны права вручную"),
+            ("floating", ui.YES if ssh else f"{ui.SKIP} нет SSH-ключа"),
+        ])))
+        if sub and not admin:
+            problems.append("субаккаунт без админ-токена: после recreate ротация упрётся в 403")
         if self.cfg.get("dry_run"):
-            lines.append("⚠️ dry_run включён — ротации только имитируются")
+            problems.append("dry_run включён — ротации только имитируются")
 
-        rows = [[{"text": "📋 Что проверить до боя", "callback_data": "guide:checklist"}]]
-        if any(line.startswith("❌") for line in lines):
-            rows.insert(0, [{"text": "⚙️ Донастроить", "callback_data": "wiz:board"}])
-        self.edit(message_id, "Проверка:\n\n" + "\n".join(lines), rows)
+        head = ui.title("Проверка доступов", ui.YES if not problems else ui.WARN)
+        tail = ui.joined(ui.title("На что обратить внимание"), ui.block(problems)) if problems \
+            else ui.note("всё в порядке")
+
+        keyboard = [[{"text": "📋 Что сделает каждый режим", "callback_data": "cmd:plan"}],
+                    [{"text": "📖 Проверки до боя", "callback_data": "guide:checklist"}]]
+        if problems:
+            keyboard.insert(0, [{"text": "⚙️ Донастроить", "callback_data": "wiz:board"}])
+        self.edit(message_id, ui.joined(head, *sections, tail), keyboard)
 
     # --- инлайн-кнопки ------------------------------------------------------
 
@@ -1086,6 +1319,8 @@ class Bot:
         if data == "cancel":
             self.awaiting = ""
             return self.send("Отменено. /setup — вернуться к настройке.")
+        if data == "guide:menu":
+            return self.cmd_guide("/guide")
         if data.startswith("guide:"):
             return self.show_guide(data.split(":", 1)[1])
         if data == "wiz:board":
@@ -1096,6 +1331,10 @@ class Bot:
             return self.optional_menu()
         if data == "wiz:check":
             return self.cmd_check()
+        if data.startswith("plan:"):
+            return self.cmd_plan(data.split(":", 1)[1])
+        if data.startswith("cmd:"):
+            return self.on_command("/" + data.split(":", 1)[1])
         if data.startswith("addchat:"):
             return self.add_admin_chat(data.split(":", 1)[1])
         if data.startswith("set:"):
@@ -1154,6 +1393,17 @@ class Bot:
             except Exception:                                  # noqa: BLE001
                 logger.debug("AAAA не найдена", exc_info=True)
             return self.wizard_next()
+
+
+def _verdict_emoji(verdict: str) -> str:
+    return {
+        probes.OK: "🟢",
+        probes.IP_BLOCKED: "🔴",
+        probes.PORT_BLOCKED: "🟠",
+        probes.FINGERPRINT_BLOCKED: "🟠",
+        probes.SERVER_DOWN: "🟠",
+        probes.OWN_NET_DOWN: "⚪️",
+    }.get(verdict, "⚪️")
 
 
 def _describe(update: dict[str, Any]) -> str:
