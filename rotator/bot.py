@@ -26,6 +26,9 @@ logger = log.get("bot")
 # ошибка, чем полминуты тишины.
 UI_TIMEOUT = 12.0
 
+# Потолок длины long-poll независимо от конфига.
+MAX_POLL_SEC = 25
+
 # Порядок обязательных шагов. CF_ZONE_ID выставляется по дороге, отдельным
 # шагом не показывается — пользователю про zone_id знать незачем.
 REQUIRED_STEPS = [
@@ -263,7 +266,14 @@ class Bot:
     # --- цикл ---------------------------------------------------------------
 
     def run(self, stop_event: threading.Event) -> None:
-        poll = int(self.cfg.get("telegram.poll_timeout_sec", 25))
+        configured = int(self.cfg.get("telegram.poll_timeout_sec", 25))
+        # Cloudflare рвёт слишком долгие запросы через воркер-релей, и опрос
+        # начинает срываться. Ограничиваем независимо от того, что в конфиге:
+        # старые config.toml остаются с прежним значением, install.sh их не трогает.
+        poll = min(configured, MAX_POLL_SEC)
+        if poll != configured:
+            logger.warning("long-poll укорочен с %s до %s с: через релей длинные "
+                           "запросы обрывает Cloudflare", configured, poll)
         import os
 
         from . import __version__
@@ -290,6 +300,9 @@ class Bot:
                 if failures >= 3:
                     self.send(f"🟢 связь с Telegram восстановилась (было {failures} обрывов подряд)")
                 failures = 0
+                if updates:
+                    logger.info("получено апдейтов: %s (%s)", len(updates),
+                                ", ".join(_describe(u) for u in updates))
                 for update in updates:
                     self.offset = update["update_id"] + 1
                     # Обработка уносится в отдельный поток: один медленный вызов
@@ -326,7 +339,9 @@ class Bot:
         logger.info("сообщение от админа: %s символов, ждём поле %r",
                     len(text), self.awaiting or "—")
         if self.awaiting and not text.startswith("/"):
+            logger.info("→ как значение поля %s", self.awaiting)
             return self.on_setup_value(message, text)
+        logger.info("→ как команда %r", text.split()[0][:20] if text else "")
         self.on_command(text)
 
     # --- команды ------------------------------------------------------------
@@ -982,6 +997,19 @@ class Bot:
             except Exception:                                  # noqa: BLE001
                 logger.debug("AAAA не найдена", exc_info=True)
             return self.wizard_next()
+
+
+def _describe(update: dict[str, Any]) -> str:
+    """Короткая сводка по апдейту для журнала — без текста, там бывают токены."""
+    uid = update.get("update_id")
+    if "callback_query" in update:
+        return f"#{uid} кнопка {update['callback_query'].get('data')}"
+    message = update.get("message") or {}
+    chat = (message.get("chat") or {}).get("id")
+    if "text" in message:
+        return f"#{uid} текст {len(message['text'])} симв. от {chat}"
+    kinds = [k for k in ("photo", "document", "voice", "sticker", "video", "caption") if k in message]
+    return f"#{uid} сообщение без текста ({', '.join(kinds) or 'неизвестный тип'}) от {chat}"
 
 
 def _probe_line(probe: dict[str, Any]) -> str:
