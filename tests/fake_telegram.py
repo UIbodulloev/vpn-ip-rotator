@@ -9,8 +9,9 @@ from .fake_api import FakeResponse
 
 
 class FakeTelegram:
-    def __init__(self, admin_id: str = "42"):
+    def __init__(self, admin_id: str = "42", can_read_all_group_messages: bool = True):
         self.admin_id = admin_id
+        self.can_read_all = can_read_all_group_messages
         self.pending: list[dict] = []      # апдейты, которые отдаст getUpdates
         self.sent: list[dict] = []         # sendMessage
         self.edited: list[dict] = []       # editMessageText
@@ -23,14 +24,14 @@ class FakeTelegram:
 
     # --- подготовка входящих ------------------------------------------------
 
-    def user_says(self, text: str, chat_id: str | None = None) -> None:
+    def user_says(self, text: str, chat_id: str | None = None, chat_type: str = "private") -> None:
         self._update_id += 1
         self._message_id += 1
         self.pending.append({
             "update_id": self._update_id,
             "message": {
                 "message_id": self._message_id,
-                "chat": {"id": int(chat_id or self.admin_id)},
+                "chat": {"id": int(chat_id or self.admin_id), "type": chat_type},
                 "text": text,
             },
         })
@@ -82,7 +83,10 @@ class FakeTelegram:
         self.calls.append(api_method)
 
         if api_method == "getMe":
-            return FakeResponse(200, {"ok": True, "result": {"username": "fakebot", "id": 1}})
+            return FakeResponse(200, {"ok": True, "result": {
+                "username": "fakebot", "id": 1,
+                "can_read_all_group_messages": self.can_read_all,
+            }})
 
         if api_method == "getUpdates":
             batch, self.pending = self.pending, []

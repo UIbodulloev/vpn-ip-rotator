@@ -193,7 +193,11 @@ class Bot:
         self.engine = engine
         self.cfg = cfg
         self.token = secrets.get("TG_BOT_TOKEN")
-        self.admin = str(secrets.get("TG_ADMIN_ID"))
+        # Разрешённых чатов может быть несколько через запятую: обычно личка
+        # плюс группа. Первый — основной, в него уходят уведомления.
+        self.admins = [a.strip() for a in str(secrets.get("TG_ADMIN_ID")).split(",") if a.strip()]
+        self.admin = self.admins[0] if self.admins else ""
+        self._unknown_chats_seen: set[str] = set()
         self.offset = 0
         self._picks: dict[str, list] = {}
         self._lock = threading.Lock()
@@ -280,8 +284,11 @@ class Bot:
 
         me = self.api("getMe")
         if me:
-            logger.info("бот @%s на связи · версия %s · PID %s · long-poll %s с",
-                        me.get("username", "?"), __version__, os.getpid(), poll)
+            logger.info("бот @%s на связи · версия %s · PID %s · long-poll %s с · "
+                        "видит весь текст в группах: %s · разрешённые чаты: %s",
+                        me.get("username", "?"), __version__, os.getpid(), poll,
+                        me.get("can_read_all_group_messages"), ", ".join(self.admins) or "—")
+            self.warn_about_privacy(me)
         else:
             logger.error("Telegram недоступен — проверьте релей и токен бота")
 
@@ -328,9 +335,12 @@ class Bot:
         if "callback_query" in update:
             return self.on_callback(update["callback_query"])
         message = update.get("message") or {}
-        chat_id = str((message.get("chat") or {}).get("id", ""))
-        if chat_id != self.admin:
-            logger.info("сообщение от постороннего чата %s — игнорирую", chat_id)
+        chat = message.get("chat") or {}
+        chat_id = str(chat.get("id", ""))
+        if chat_id not in self.admins:
+            logger.info("сообщение из чата %s (%s) не в списке разрешённых",
+                        chat_id, chat.get("type", "?"))
+            self.offer_chat(chat_id, chat)
             return
         text = (message.get("text") or "").strip()
         if not text:
@@ -814,6 +824,60 @@ class Bot:
         self.send(f"✅ {rtype} {record['name']} → {record['content']} (TTL {record.get('ttl')})")
         self.after_field_set(key)
 
+    def offer_chat(self, chat_id: str, chat: dict[str, Any]) -> None:
+        """Написали из неразрешённого чата — предложить владельцу его добавить.
+
+        Частая ситуация: в TG_ADMIN_ID вписан ID группы, а человек пишет в личку.
+        Молча игнорировать такое — верный способ потерять полчаса.
+        """
+        if not chat_id or chat_id in self._unknown_chats_seen:
+            return
+        self._unknown_chats_seen.add(chat_id)
+        kind = "личный чат" if chat.get("type") == "private" else f"чат типа {chat.get('type')}"
+        who = chat.get("username") or chat.get("first_name") or chat.get("title") or "—"
+        self.send(
+            f"⚠️ Пришло сообщение из чата, которого нет в списке разрешённых.\n\n"
+            f"ID: {chat_id}  ({kind}, {who})\n"
+            f"Сейчас разрешены: {', '.join(self.admins)}\n\n"
+            "Если это вы — добавьте чат кнопкой ниже, и пишите оттуда.",
+            [[{"text": f"➕ Разрешить чат {chat_id}", "callback_data": f"addchat:{chat_id}"}]],
+        )
+
+    def add_admin_chat(self, chat_id: str) -> None:
+        if chat_id in self.admins:
+            return self.send("Этот чат уже разрешён.")
+        self.admins.append(chat_id)
+        self.secrets.set("TG_ADMIN_ID", ",".join(self.admins))
+        self.send(
+            f"✅ Чат {chat_id} разрешён. Теперь можно работать оттуда.\n\n"
+            "Разрешены: " + ", ".join(self.admins),
+            [[{"text": "⚙️ К настройке", "callback_data": "wiz:board"}]],
+        )
+
+    def warn_about_privacy(self, me: dict[str, Any]) -> None:
+        """Классическая ловушка: в группе бот видит только команды.
+
+        Telegram по умолчанию включает боту privacy mode, и в группу ему
+        доставляются только команды и ответы на его сообщения. Обычный текст —
+        например присланный токен — не приходит вовсе, без следа в журнале.
+        """
+        groups = [a for a in self.admins if a.startswith("-")]
+        if not groups or me.get("can_read_all_group_messages"):
+            return
+        logger.warning("privacy mode включён, а среди разрешённых чатов есть группа %s", groups)
+        self.send(
+            "⚠️ Бот настроен на работу в группе, но у него включён режим приватности Telegram.\n\n"
+            "В группах такой бот получает ТОЛЬКО команды (/check, /setup и т.п.). "
+            "Обычный текст ему не доставляется вообще — поэтому присланный токен "
+            "пропадает без следа, хотя команды работают.\n\n"
+            "Два выхода:\n\n"
+            "1) Проще — настраивать в личном чате. Напишите мне в личку любое сообщение, "
+            "я предложу разрешить этот чат кнопкой.\n\n"
+            "2) Либо отключите приватность: @BotFather → /setprivacy → выберите бота → "
+            "Disable. После этого ОБЯЗАТЕЛЬНО удалите бота из группы и добавьте заново — "
+            "иначе настройка не применится."
+        )
+
     def cmd_diag(self) -> None:
         """Что бот о себе знает — первое, что стоит спросить, когда он «молчит»."""
         import os
@@ -830,6 +894,7 @@ class Bot:
             f"PID:      {os.getpid()} на {platform.node()}",
             f"Потоков:  {threading.active_count()}",
             "",
+            f"Разрешённые чаты: {', '.join(self.admins) or '—'}",
             f"Жду поле: {self.awaiting or '— (текст пойдёт как команда)'}",
             f"Offset:   {self.offset}",
             f"Заполнено: {', '.join(filled) or 'ничего'}",
@@ -840,6 +905,13 @@ class Bot:
         ]
         for url, status in self.relay.health().items():
             lines.append(f"  {'✅' if status == 'ok' else '❌'} {url} — {status}")
+
+        me = self.api("getMe") or {}
+        reads_all = me.get("can_read_all_group_messages")
+        lines += ["", f"Видит весь текст в группах: {'да' if reads_all else 'НЕТ (privacy mode)'}"]
+        if not reads_all and any(a.startswith("-") for a in self.admins):
+            lines.append("  ⚠️ в группе дойдут только команды — обычный текст не доставляется")
+
         lines += ["", "Журнал (последние строки):"] + [f"  {line}" for line in log.tail(8)]
         lines += [
             "",
@@ -919,7 +991,7 @@ class Bot:
 
     def on_callback(self, callback: dict[str, Any]) -> None:
         chat_id = str(((callback.get("message") or {}).get("chat") or {}).get("id", ""))
-        if chat_id != self.admin:
+        if chat_id not in self.admins:
             return
         data = callback.get("data", "")
         logger.info("нажата кнопка %s", data)
@@ -941,6 +1013,8 @@ class Bot:
             return self.optional_menu()
         if data == "wiz:check":
             return self.cmd_check()
+        if data.startswith("addchat:"):
+            return self.add_admin_chat(data.split(":", 1)[1])
         if data.startswith("set:"):
             return self.ask_field(data.split(":", 1)[1])
         if data.startswith("pick:"):

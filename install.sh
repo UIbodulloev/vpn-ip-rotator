@@ -116,7 +116,9 @@ else
   ask RELAY_URLS  "URL релея (через запятую, напр. https://relay.example.net)"
   ask RELAY_KEY   "Ключ релея (значение RELAY_KEY воркера)" --secret
   ask TG_BOT_TOKEN "Токен бота от @BotFather" --secret
-  ask TG_ADMIN_ID "Ваш chat_id в Telegram (узнать: @userinfobot)"
+  echo "    Укажите ЛИЧНЫЙ chat_id (узнать у @userinfobot), а не ID группы:"
+  echo "    в группах бот по умолчанию не видит обычный текст, только команды."
+  ask TG_ADMIN_ID "Ваш личный chat_id в Telegram"
 
   # Значения, уже лежавшие в файле, переносим.
   if [[ -f "$ETC_DIR/secrets.env" ]]; then

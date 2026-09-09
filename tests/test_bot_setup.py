@@ -296,10 +296,65 @@ class SetupWizardTest(unittest.TestCase):
         self.assertTrue(VALIDATORS["CF_ZONE_ID"]("коротко"))
         self.assertFalse(VALIDATORS["CF_ZONE_ID"]("f5bbcd30d3f695cbd828c8446efb4487"))
 
-    def test_чужой_чат_игнорируется(self):
-        self.h.tg.user_says("/setup", chat_id="999")
+    def test_из_неразрешённого_чата_бот_предлагает_его_добавить(self):
+        """Реальный случай: в TG_ADMIN_ID вписан ID группы, а человек пишет в личку."""
+        self.h.tg.user_says("привет", chat_id="537089165")
         self.h.pump()
-        self.assertEqual(self.h.tg.sent, [], "бот ответил постороннему чату")
+
+        # Постороннему чату бот не отвечает…
+        self.assertTrue(all(m["chat_id"] == "42" for m in self.h.tg.sent),
+                        "бот ответил в посторонний чат")
+        # …но владельца предупреждает, с готовой кнопкой.
+        self.assertIn("537089165", self.h.tg.all_visible())
+        self.assertIn("addchat:537089165", [d for _, d in self.h.tg.buttons()])
+
+    def test_кнопка_разрешает_чат_и_он_начинает_работать(self):
+        self.h.tg.user_says("привет", chat_id="537089165")
+        self.h.pump()
+        self.h.tg.user_taps("addchat:537089165")
+        self.h.pump()
+
+        self.assertIn("537089165", self.h.secrets.get("TG_ADMIN_ID"))
+        self.assertIn("537089165", self.h.bot.admins)
+
+        self.h.tg.timeline.clear()
+        self.h.tg.user_says("/status", chat_id="537089165")
+        self.h.pump()
+        self.assertTrue(self.h.tg.timeline, "разрешённый чат всё ещё игнорируется")
+
+    def test_о_неразрешённом_чате_предупреждают_один_раз(self):
+        for _ in range(3):
+            self.h.tg.user_says("привет", chat_id="537089165")
+            self.h.pump()
+        offers = [m for m in self.h.tg.sent if "нет в списке разрешённых" in m["text"]]
+        self.assertEqual(len(offers), 1, "бот спамит предупреждением на каждое сообщение")
+
+    def test_несколько_чатов_через_запятую(self):
+        self.h.secrets.set("TG_ADMIN_ID", "42,537089165")
+        from rotator.bot import Bot
+        bot = Bot(self.h.cloud, self.h.secrets, self.h.engine, self.h.cfg)
+        self.assertEqual(bot.admins, ["42", "537089165"])
+        self.assertEqual(bot.admin, "42", "основным должен остаться первый")
+
+    def test_privacy_mode_в_группе_объясняется_при_старте(self):
+        """Главная ловушка: в группе бот получает только команды."""
+        self.h.secrets.set("TG_ADMIN_ID", "-100500")
+        self.h.tg.can_read_all = False
+        from rotator.bot import Bot
+        bot = Bot(self.h.cloud, self.h.secrets, self.h.engine, self.h.cfg)
+        self.h.tg.timeline.clear()
+        bot.warn_about_privacy(self.h.tg.request("POST", "/getMe", {}).json()["result"])
+
+        warning = self.h.tg.all_visible()
+        self.assertIn("режим приватности", warning)
+        self.assertIn("setprivacy", warning)
+        self.assertIn("добавьте заново", warning, "не сказано, что бота надо переподключить к группе")
+
+    def test_privacy_mode_не_беспокоит_если_чат_личный(self):
+        self.h.tg.can_read_all = False
+        self.h.tg.timeline.clear()
+        self.h.bot.warn_about_privacy({"can_read_all_group_messages": False})
+        self.assertEqual(self.h.tg.timeline, [], "предупреждение про группы в личном чате лишнее")
 
 
 if __name__ == "__main__":
