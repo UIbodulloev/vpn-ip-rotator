@@ -370,6 +370,55 @@ class SetupWizardTest(unittest.TestCase):
         self.h.pump()
         self.assertIn("Шаблонов нет", self.h.tg.all_visible())
 
+    def test_ключ_предлагает_три_способа(self):
+        self.h.tg.user_taps("set:SSH_KEY_PATH")
+        self.h.pump()
+        buttons = [d for _, d in self.h.tg.buttons()]
+        for target in ("ssh:gen", "ssh:paste", "ssh:path"):
+            self.assertIn(target, buttons, f"нет способа {target}")
+        self.assertIn("два ключа", self.h.tg.all_visible(),
+                      "не объяснено, зачем ключей может быть два")
+
+    def test_генерация_пары_сохраняет_путь_и_публичный_ключ(self):
+        self.h.tg.user_taps("ssh:gen")
+        self.h.pump()
+        path = self.h.secrets.get("SSH_KEY_PATH")
+        self.assertTrue(path and Path(path).is_file(), "приватный ключ не создан")
+        self.assertEqual(oct(Path(path).stat().st_mode)[-3:], "600", "права не 0600")
+        self.assertTrue(self.h.secrets.get("SSH_PUBKEY").startswith("ssh-"),
+                        "публичная часть не выведена")
+        card = self.h.tg.all_visible()
+        self.assertIn("authorized_keys", card, "не показана команда разрешения ключа")
+
+    def test_приватный_ключ_текстом_принимается_и_стирается_из_чата(self):
+        from rotator import sshkeys
+        source = Path(TMP / "source-key")
+        source.unlink(missing_ok=True)
+        Path(str(source) + ".pub").unlink(missing_ok=True)
+        _, expected_pub = sshkeys.generate(TMP, name="source-key")
+        material = source.read_text()
+
+        self.h.tg.user_taps("ssh:paste")
+        self.h.pump()
+        self.assertEqual(self.h.bot.awaiting, "SSH_PRIVATE_KEY")
+
+        self.h.tg.user_says(material)
+        self.h.pump()
+
+        self.assertEqual(self.h.secrets.get("SSH_PUBKEY"), expected_pub,
+                         "публичная часть не совпала с исходной парой")
+        self.assertTrue(self.h.tg.deleted, "сообщение с приватным ключом не удалено")
+        self.assertNotIn("PRIVATE KEY", self.h.tg.all_visible(), "ключ засветился в ответе")
+
+    def test_публичный_ключ_вместо_приватного_отвергается(self):
+        self.h.tg.user_taps("ssh:paste")
+        self.h.pump()
+        self.h.tg.user_says("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 user@host")
+        self.h.pump()
+        self.assertEqual(self.h.secrets.get("SSH_KEY_PATH"), "", "мусор принят как ключ")
+        self.assertIn("не похоже на приватный ключ", self.h.tg.all_visible())
+        self.assertEqual(self.h.bot.awaiting, "SSH_PRIVATE_KEY", "шаг потерян после отказа")
+
     def test_контейнеры_без_ssh_объясняют_чего_не_хватает(self):
         self.h.secrets.set("SERVER_UUID", self.h.server_uuid)
         self.h.tg.user_taps("srv:docker")

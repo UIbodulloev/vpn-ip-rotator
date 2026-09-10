@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import guide, log, modes, probes, remote, ui
+from . import guide, log, modes, probes, remote, sshkeys, ui
 from .config import Secrets, domain_of, masked
 from .engine import Engine
 from .relay import Relay
@@ -42,8 +42,8 @@ OPTIONAL_KEYS = [
     ("UPCLOUD_ADMIN_TOKEN", "Админ-токен UpCloud", "чтобы recreate работал под субаккаунтом"),
     ("UPCLOUD_SUBACCOUNT", "Логин субаккаунта", "в паре с админ-токеном"),
     ("CF_AAAA_RECORD_ID", "AAAA-запись", "обновлять заодно и IPv6"),
-    ("SSH_KEY_PATH", "SSH-ключ, приватный", "нужен только режиму floating"),
-    ("SSH_PUBKEY", "SSH-ключ, публичный", "прописать новому серверу при recreate"),
+    ("SSH_KEY_PATH", "SSH-ключ агента", "контейнеры, протоколы и плавающий адрес"),
+    ("SSH_PUBKEY", "SSH-ключ, публичный", "прописать новому серверу при копии и переезде"),
 ]
 
 # Единственный источник правды по командам: из него строится и /help, и меню
@@ -208,9 +208,18 @@ VALIDATORS = {
     "CF_A_RECORD_ID": _check_hex32,
     "CF_AAAA_RECORD_ID": _check_hex32,
     "SSH_KEY_PATH": _check_keypath,
+    "SSH_PRIVATE_KEY": sshkeys.looks_like_private,
     "SSH_PUBKEY": _check_pubkey,
     "VPN_DOMAIN": _check_domain,
 }
+
+
+# Поля, сообщение с которыми удаляется из переписки сразу после чтения.
+SECRET_FIELDS = ("UPCLOUD_TOKEN", "UPCLOUD_ADMIN_TOKEN", "CF_TOKEN", "SSH_PRIVATE_KEY")
+
+
+def is_secret(key: str) -> bool:
+    return key in SECRET_FIELDS or "TOKEN" in key
 
 
 def preview(value: str) -> str:
@@ -1273,10 +1282,98 @@ class Bot:
             ui.block(rows),
         ), keyboard)
 
+    # --- SSH-ключ агента -----------------------------------------------------
+
+    def ssh_menu(self) -> None:
+        current = self.secrets.get("SSH_KEY_PATH")
+        body = ui.joined(
+            ui.title("SSH-ключ агента", "🔑"),
+            ui.esc(
+                "Нужен только ручному управлению: посмотреть контейнеры и протоколы "
+                "на VPN-сервере, и режиму «плавающий адрес». Смене адреса он не нужен — "
+                "там всё через API."
+            ),
+            ui.note("Разумно держать на сервере два ключа: ваш личный — для работы "
+                    "руками с компьютера, и отдельный ключ агента. Тогда компрометация "
+                    "российского сервера не даёт доступа вашим ключом. Но можно и один."),
+            ui.table([("сейчас", current or "не задан")]) if current else "",
+        )
+        self.send(body, [
+            [{"text": "🔑 Сгенерировать пару здесь", "callback_data": "ssh:gen"}],
+            [{"text": "📋 Прислать приватный ключ текстом", "callback_data": "ssh:paste"}],
+            [{"text": "📂 Указать путь к файлу", "callback_data": "ssh:path"}],
+            [{"text": "◀️ Назад", "callback_data": "wiz:opt"}],
+        ])
+
+    def ssh_action(self, action: str) -> None:
+        if action == "path":
+            return self.ask_field("SSH_KEY_PATH")
+        if action == "paste":
+            self.awaiting = "SSH_PRIVATE_KEY"
+            return self.send(ui.joined(
+                ui.title("Приватный ключ текстом", "📋"),
+                ui.esc(
+                    "Пришлите содержимое приватного ключа одним сообщением — целиком, "
+                    "вместе со строками BEGIN и END. Я сохраню его в файл с правами 0600 "
+                    "и удалю ваше сообщение."
+                ),
+                ui.note("Ключ пройдёт через серверы Telegram и Cloudflare. Если это "
+                        "неприемлемо — лучше «Сгенерировать пару здесь»: тогда приватная "
+                        "часть никуда не уезжает."),
+                ui.esc("/cancel — выйти"),
+            ))
+        if action == "gen":
+            return self.generate_key()
+
+    def generate_key(self) -> None:
+        message_id = self.send(f"{ui.WAIT} Генерирую пару…")
+        directory = Path(self.secrets.path).parent
+        try:
+            private, public = sshkeys.generate(directory)
+        except sshkeys.KeyError_ as exc:
+            return self.edit(message_id, ui.joined(ui.title("Не вышло", ui.NO), ui.block([str(exc)])))
+        self._store_key(private, public)
+        self.edit(message_id, self._key_installed_text(private, public, generated=True))
+
+    def install_private_key(self, text: str, receipt: int) -> None:
+        directory = Path(self.secrets.path).parent
+        try:
+            private, public = sshkeys.install(text, directory)
+        except sshkeys.KeyError_ as exc:
+            self.awaiting = "SSH_PRIVATE_KEY"          # остаёмся на шаге
+            return self.edit(receipt, ui.joined(
+                ui.title("Ключ не принят", ui.NO),
+                ui.esc(str(exc)),
+                ui.esc("Пришлите ещё раз или /cancel."),
+            ))
+        self._store_key(private, public)
+        self.edit(receipt, self._key_installed_text(private, public, generated=False))
+
+    def _store_key(self, private: Path, public: str) -> None:
+        self.secrets.set("SSH_KEY_PATH", str(private))
+        self.secrets.set("SSH_PUBKEY", public)
+
+    def _key_installed_text(self, private: Path, public: str, *, generated: bool) -> str:
+        head = ui.title("Ключ сгенерирован" if generated else "Ключ принят", ui.YES)
+        note = ("Приватная часть создана здесь и никуда не передавалась."
+                if generated else "Сообщение с ключом удалено из переписки.")
+        return ui.joined(
+            head,
+            ui.table([("приватный", str(private)), ("права", "0600"),
+                      ("публичный", str(private) + ".pub")]),
+            ui.note(note),
+            ui.title("Осталось разрешить его на VPN-сервере"),
+            ui.esc("Выполните это на VPN-сервере — через консоль UpCloud или своим "
+                   "личным SSH-ключом:"),
+            ui.block([sshkeys.authorize_command(public)]),
+            ui.note("Ваш личный ключ при этом остаётся на месте: команда дописывает "
+                    "строку, а не заменяет файл."),
+        )
+
     def ask_field(self, key: str) -> None:
         self.awaiting = key
         current = self.secrets.get(key)
-        now = f"\n\nСейчас: {masked(current) if 'TOKEN' in key else current}" if current else ""
+        now = f"\n\nСейчас: {masked(current) if is_secret(key) else current}" if current else ""
         optional = any(key == k for k, _, _ in OPTIONAL_KEYS)
         hint = "\n\n/skip — пропустить · /cancel — выйти" if optional else "\n\n/cancel — выйти"
         self.send(f"{FIELD_PROMPTS.get(key, f'Пришлите значение {key}.')}{now}{hint}")
@@ -1292,7 +1389,7 @@ class Bot:
         problem = VALIDATORS.get(key, lambda _v: "")(value)
         if problem:
             # awaiting НЕ сбрасываем: можно просто прислать значение заново.
-            if "TOKEN" in key:
+            if is_secret(key):
                 self.delete(message["chat"]["id"], message["message_id"])
             return self.edit(
                 receipt,
@@ -1302,10 +1399,12 @@ class Bot:
             )
 
         self.awaiting = ""
-        if self.cfg.get("telegram.delete_secret_messages", True) and "TOKEN" in key:
+        if self.cfg.get("telegram.delete_secret_messages", True) and is_secret(key):
             self.delete(message["chat"]["id"], message["message_id"])
+        if key == "SSH_PRIVATE_KEY":
+            return self.install_private_key(value, receipt)
         self.secrets.set(key, value)
-        shown = masked(value) if "TOKEN" in key else value
+        shown = masked(value) if is_secret(key) else value
         self.edit(receipt, f"✅ {key.replace('_', ' ').lower()}: {shown}")
         self.after_field_set(key)
 
@@ -1637,8 +1736,13 @@ class Bot:
             return self.on_command("/" + data.split(":", 1)[1])
         if data.startswith("addchat:"):
             return self.add_admin_chat(data.split(":", 1)[1])
+        if data.startswith("ssh:"):
+            return self.ssh_action(data.split(":", 1)[1])
         if data.startswith("set:"):
-            return self.ask_field(data.split(":", 1)[1])
+            field = data.split(":", 1)[1]
+            if field == "SSH_KEY_PATH":
+                return self.ssh_menu()
+            return self.ask_field(field)
         if data.startswith("pick:"):
             return self.on_pick(data)
         if data.startswith("mode:"):
