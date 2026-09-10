@@ -35,6 +35,7 @@ class FakeCloud:
         self.calls: list[tuple[str, str]] = []
         self.fail_on: dict[str, int] = {}      # путь -> сколько раз вернуть 500
         self.telegram = None                   # подставляется FakeTelegram, если нужен бот
+        self.last_server_spec: dict = {}       # чем именно создавали последний сервер
 
     # --- помощники ----------------------------------------------------------
 
@@ -173,6 +174,7 @@ class FakeCloud:
 
         if path == "/1.3/server" and method == "POST":
             spec = body["server"]
+            self.last_server_spec = spec
             source = spec["storage_devices"]["storage_device"][0]["storage"]
             if source not in self.storages:
                 return FakeResponse(404, {"error": {"error_message": "шаблон не найден"}})

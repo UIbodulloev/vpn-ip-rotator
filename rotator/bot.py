@@ -134,10 +134,12 @@ FIELD_PROMPTS = {
         "Пришлите путь или /skip."
     ),
     "SSH_PUBKEY": (
-        "Публичный SSH-ключ (необязательно) — пропишется новому серверу при recreate, "
+        "Публичный SSH-ключ — пропишется новому серверу при копии и переезде, "
         "чтобы вы не потеряли к нему доступ.\n\n"
-        "Строка целиком, начинается с ssh-ed25519 или ssh-rsa.\n"
-        "Пришлите её или /skip."
+        "В UpCloud нет общего хранилища ключей: ключ передаётся строкой при создании "
+        "сервера. Строка целиком, начинается с ssh-ed25519 или ssh-rsa.\n\n"
+        "/auto — взять из файла рядом с приватным ключом (<путь>.pub)\n"
+        "/skip — пропустить"
     ),
     "VPN_DOMAIN": "Домен, чью DNS-запись переписывать. Например vpn.example.com",
     "SERVER_UUID": "UUID сервера в UpCloud.",
@@ -974,9 +976,12 @@ class Bot:
                 {"type": "public", "ip_addresses": {"ip_address": [{"family": "IPv6"}]}},
             ]}},
         }
-        pubkey = self.secrets.get("SSH_PUBKEY")
+        pubkey = modes.resolve_pubkey(self.secrets)
         if pubkey:
             spec["login_user"] = {"username": "root", "ssh_keys": {"ssh_key": [pubkey]}}
+        else:
+            say(f"{ui.WARN} публичный SSH-ключ не задан — доступ будет только тем, "
+                "что запечён в шаблоне")
         say(f"создаю сервер в {entry['zone']} из шаблона {entry['uuid'][:8]}…")
         created = self.engine.uc.create_server(spec)
         new_uuid = created.get("uuid", "")
@@ -1315,6 +1320,8 @@ class Bot:
             self.send(f"Пропущено: {key}")
             return self.after_field_set(key)
         if command == "/auto":
+            if key == "SSH_PUBKEY":
+                return self.autodiscover_pubkey()
             return self.autodiscover_record(key)
 
     def after_field_set(self, key: str) -> None:
@@ -1340,6 +1347,22 @@ class Bot:
         if any(key == k for k, _, _ in OPTIONAL_KEYS):
             return self.optional_menu()
         self.wizard_next()
+
+    def autodiscover_pubkey(self) -> None:
+        """Публичный ключ почти всегда лежит рядом с приватным: <путь>.pub."""
+        found = modes.resolve_pubkey(self.secrets)
+        if not found:
+            path = self.secrets.get("SSH_KEY_PATH")
+            return self.send(ui.joined(
+                ui.title("Не нашёл", ui.NO),
+                ui.esc(f"Рядом с {path or '(ключ не задан)'} файла .pub нет. "
+                       "Пришлите строку ключа сообщением или сгенерируйте пару:"),
+                ui.block(['ssh-keygen -t ed25519 -f /etc/vpn-rotator/id_vpn -N ""']),
+            ))
+        self.secrets.set("SSH_PUBKEY", found)
+        self.send(ui.joined(ui.title("Ключ найден", ui.YES),
+                            ui.block([found[:60] + "…"])))
+        self.after_field_set("SSH_PUBKEY")
 
     def autodiscover_record(self, key: str) -> None:
         rtype = "AAAA" if "AAAA" in key else "A"
@@ -1550,6 +1573,9 @@ class Bot:
             ("переезд", ui.YES if (admin or not sub) else f"{ui.WARN} после неё нужны права вручную"),
             ("плавающий адрес", ui.YES if ssh else f"{ui.SKIP} нет SSH-ключа"),
         ])))
+        if not modes.resolve_pubkey(self.secrets):
+            problems.append("публичный SSH-ключ не задан: новый сервер получит доступ "
+                            "только тем ключом, что запечён в шаблоне")
         if sub and not admin:
             problems.append("субаккаунт без админ-токена: после recreate ротация упрётся в 403")
         if self.cfg.get("dry_run"):

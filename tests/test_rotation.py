@@ -219,6 +219,43 @@ class DryRunTest(unittest.TestCase):
         self.assertEqual(self.h.state["history"][0]["to"], "(холостой прогон)")
 
 
+class SshKeyTest(unittest.TestCase):
+    """В UpCloud нет хранилища ключей — ключ передаётся строкой при создании."""
+
+    def setUp(self):
+        self.h = Harness()
+        self._orig = modes.tcp_open
+        modes.tcp_open = always_open
+
+    def tearDown(self):
+        modes.tcp_open = self._orig
+
+    def test_явно_заданный_ключ_уходит_в_новый_сервер(self):
+        self.h.secrets.set("SSH_PUBKEY", "ssh-ed25519 AAAAC3NzaTEST user@host")
+        self.h.engine.rotate(modes.CLONE, force=True)
+        created = [c for c in self.h.cloud.calls if c == ("POST", "/1.3/server")]
+        self.assertTrue(created, "сервер не создавался")
+        self.assertEqual(self.h.cloud.last_server_spec["login_user"]["ssh_keys"]["ssh_key"],
+                         ["ssh-ed25519 AAAAC3NzaTEST user@host"])
+
+    def test_ключ_подбирается_рядом_с_приватным(self):
+        private = Path(TMP / "id_test")
+        private.write_text("private")
+        Path(str(private) + ".pub").write_text("ssh-ed25519 AAAAC3NzaCOMPANION user@host\n")
+        self.h.secrets.set("SSH_KEY_PATH", str(private))
+        self.assertEqual(modes.resolve_pubkey(self.h.secrets),
+                         "ssh-ed25519 AAAAC3NzaCOMPANION user@host")
+
+    def test_без_ключа_сервер_всё_равно_создаётся_но_с_предупреждением(self):
+        said = []
+        self.h.engine.notify = said.append
+        self.h.engine.rotate(modes.CLONE, force=True)
+        self.assertNotIn("login_user", self.h.cloud.last_server_spec,
+                         "передан пустой login_user")
+        self.assertTrue(any("SSH-ключ не задан" in s for s in said),
+                        "о рисках доступа не предупредили")
+
+
 class VerdictTest(unittest.TestCase):
     """Отличать блок адреса от блока порта — то, ради чего детектор вообще нужен."""
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import shlex
 import subprocess
+from pathlib import Path
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -307,6 +308,27 @@ def recreate(
     return _finish(ctx, mode_name, data["old_ip"], data["new_ip"], target_zone, reason, dns)
 
 
+def resolve_pubkey(secrets: Secrets) -> str:
+    """Публичный ключ для нового сервера.
+
+    В UpCloud нет хранилища ключей на уровне аккаунта: ключ передаётся строкой
+    при создании сервера. Берём заданный явно, иначе — спутник приватного ключа
+    (<путь>.pub), который почти всегда лежит рядом.
+    """
+    explicit = secrets.get("SSH_PUBKEY").strip()
+    if explicit:
+        return explicit
+    key_path = secrets.get("SSH_KEY_PATH").strip()
+    if key_path:
+        companion = Path(key_path + ".pub")
+        try:
+            if companion.is_file():
+                return companion.read_text(encoding="utf-8").strip().splitlines()[0]
+        except OSError as exc:
+            logger.warning("не прочитать %s: %s", companion, exc)
+    return ""
+
+
 def _server_spec(ctx: Ctx, data: dict[str, Any], template_uuid: str, zone: str) -> dict[str, Any]:
     spec: dict[str, Any] = {
         "zone": zone,
@@ -335,9 +357,14 @@ def _server_spec(ctx: Ctx, data: dict[str, Any], template_uuid: str, zone: str) 
             }
         },
     }
-    pubkey = ctx.secrets.get("SSH_PUBKEY")
+    pubkey = resolve_pubkey(ctx.secrets)
     if pubkey:
         spec["login_user"] = {"username": "root", "ssh_keys": {"ssh_key": [pubkey]}}
+    else:
+        # Ключ из authorized_keys уезжает внутри шаблона, поэтому доступ обычно
+        # сохраняется и без этого. Но полагаться на это молча нельзя.
+        ctx.say(f"{'⚠️'} публичный SSH-ключ не задан: доступ к новому серверу "
+                "будет только тем ключом, что запечён в шаблоне")
     return spec
 
 
