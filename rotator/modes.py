@@ -137,8 +137,23 @@ def _stop_and_wait(ctx: Ctx, uuid: str) -> None:
 
 
 def _start_and_wait(ctx: Ctx, uuid: str) -> dict[str, Any]:
+    """Запустить сервер, если он ещё не запущен.
+
+    UpCloud поднимает сервер сам после некоторых операций с дисками, и тогда
+    безусловный start отвечал SERVER_STATE_ILLEGAL. Восстановление после сбоя
+    из-за этого проваливалось на ровном месте.
+    """
+    server = ctx.uc.server(uuid)
+    if server.get("state") == "started":
+        ctx.say("сервер уже работает")
+        return server
     ctx.say("запускаю сервер…")
-    ctx.uc.start_server(uuid)
+    try:
+        ctx.uc.start_server(uuid)
+    except UpCloudError as exc:
+        if "SERVER_STATE_ILLEGAL" not in exc.body:
+            raise
+        logger.info("start вернул SERVER_STATE_ILLEGAL — видимо, сервер уже поднимается")
     server = ctx.uc.wait_server_state(uuid, "started", int(ctx.cfg.get("rotation.wait_start_sec", 300)))
     ctx.say("сервер запущен")
     return server
@@ -206,7 +221,40 @@ def recreate(
             data["stopped"] = True
             ctx.state.set_pending(CLONE, "stopped", **data)
 
-        if not data.get("template_uuid"):
+        # Кастомный шаблон живёт только в своей зоне: в целевой его не видно,
+        # и clone отвечает ZONE_MISMATCH. Поэтому при переезде кросс-зонно
+        # копируется сам диск, а шаблон снимается уже на той стороне.
+        if not same_zone and not data.get("zone_template_uuid"):
+            if not data.get("clone_uuid"):
+                ctx.state.set_pending(CLONE, "cloning", **data)
+                ctx.say(f"копирую диск {data['storage_size']} ГБ в {target_zone} — самый долгий шаг…")
+                clone = ctx.uc.clone_storage(
+                    data["storage_uuid"], target_zone,
+                    f"rotator-clone-{target_zone}-{int(time.time())}",
+                    tier=data.get("storage_tier") or "",
+                )
+                data["clone_uuid"] = clone.get("uuid", "")
+                if not data["clone_uuid"]:
+                    raise RotationError(f"clone не вернул uuid: {clone}")
+                ctx.state.set_pending(CLONE, "cloning", **data)
+            ctx.uc.wait_storage_online(
+                data["clone_uuid"],
+                int(ctx.cfg.get("rotation.wait_storage_sec", 3600)),
+                on_tick=lambda st, left: ctx.say(f"копирование… ({st}, осталось ≤{left} с)"),
+            )
+            ctx.say(f"диск скопирован в {target_zone}, снимаю с него шаблон…")
+            zone_template = ctx.uc.templatize(
+                data["clone_uuid"], f"rotator-{target_zone}-{int(time.time())}")
+            data["zone_template_uuid"] = zone_template.get("uuid", "")
+            ctx.state.set_pending(CLONE, "cloning", **data)
+            ctx.uc.wait_storage_online(
+                data["zone_template_uuid"], int(ctx.cfg.get("rotation.wait_storage_sec", 3600)))
+            ctx.state.add_template(data["zone_template_uuid"], target_zone)
+            ctx.say(f"шаблон в {target_zone} готов")
+
+        # Локальный шаблон нужен только копии в своей зоне: при переезде он
+        # бесполезен и стоил бы лишнего хранилища.
+        if same_zone and not data.get("template_uuid"):
             ctx.state.set_pending(CLONE, "templatizing", **data)
             ctx.say("снимаю шаблон системного диска (ключи, клиенты, swap — всё внутри)…")
             stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -223,30 +271,9 @@ def recreate(
             ctx.state.add_template(data["template_uuid"], data["src_zone"])
             ctx.say("шаблон готов")
 
-        # Кросс-зонный переезд: клонируем шаблон в целевую зону и делаем шаблон уже там.
-        if not same_zone and not data.get("zone_template_uuid"):
-            ctx.state.set_pending(CLONE, "cloning", **data)
-            ctx.say(f"копирую диск в {target_zone} — самый долгий шаг…")
-            clone = ctx.uc.clone_storage(
-                data["template_uuid"], target_zone, f"rotator-clone-{target_zone}-{int(time.time())}"
-            )
-            data["clone_uuid"] = clone.get("uuid", "")
-            ctx.state.set_pending(CLONE, "cloning", **data)
-            ctx.uc.wait_storage_online(
-                data["clone_uuid"],
-                int(ctx.cfg.get("rotation.wait_storage_sec", 3600)),
-                on_tick=lambda st, left: ctx.say(f"копирование… ({st}, осталось ≤{left} с)"),
-            )
-            zone_template = ctx.uc.templatize(data["clone_uuid"], f"rotator-{target_zone}-{int(time.time())}")
-            data["zone_template_uuid"] = zone_template.get("uuid", "")
-            ctx.state.set_pending(CLONE, "cloning", **data)
-            ctx.uc.wait_storage_online(
-                data["zone_template_uuid"], int(ctx.cfg.get("rotation.wait_storage_sec", 3600))
-            )
-            ctx.state.add_template(data["zone_template_uuid"], target_zone)
-            ctx.say(f"диск в {target_zone} готов")
-
-        source_template = data.get("zone_template_uuid") or data["template_uuid"]
+        source_template = data.get("zone_template_uuid") or data.get("template_uuid", "")
+        if not source_template:
+            raise RotationError("нечего разворачивать: шаблон не создан")
 
         if not data.get("new_uuid"):
             ctx.state.set_pending(CLONE, "creating", **data)
@@ -562,4 +589,7 @@ def run(ctx: Ctx, mode: str, *, zone: str = "", reason: str = "manual", resume: 
     except Exception:
         # Сервер могли остановить на первом шаге — оставлять его лежать нельзя.
         _ensure_running(ctx, ctx.secrets.get("SERVER_UUID") or uuid)
+        # Отметка остаётся: по ней ротацию можно доиграть, переиспользовав уже
+        # снятый шаблон. Запереть бота она больше не может — ручной запуск идёт
+        # с force, а неудачное доигрывание её снимает.
         raise

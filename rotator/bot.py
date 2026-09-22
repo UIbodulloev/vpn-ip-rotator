@@ -1126,7 +1126,12 @@ class Bot:
                 self.send(self.status_text())
             except Exception as exc:                           # noqa: BLE001
                 logger.exception("ротация не удалась")
-                progress(f"❌ {exc}")
+                progress(f"{ui.NO} {exc}")
+                rows = [[{"text": "🖥 Проверить сервер", "callback_data": "srv:menu"}]]
+                if self.engine.state["pending"]:
+                    rows.insert(0, [{"text": "🧹 Снять отметку и попробовать снова",
+                                     "callback_data": "wiz:unstick"}])
+                self.send("Что дальше?", rows)
 
         threading.Thread(target=worker, name="rotate", daemon=True).start()
 
@@ -1718,6 +1723,13 @@ class Bot:
             return self.optional_menu()
         if data == "wiz:check":
             return self.cmd_check()
+        if data == "wiz:unstick":
+            self.engine.state.clear_pending()
+            return self.send(
+                ui.joined(ui.title("Отметка снята", ui.YES),
+                          ui.esc("Незавершённая ротация забыта, бот снова свободен.")),
+                [[{"text": "🔄 Сменить адрес", "callback_data": "cmd:rotate"}],
+                 [{"text": "🖥 Управление сервером", "callback_data": "srv:menu"}]])
         if data == "srv:menu":
             return self.server_menu()
         if data == "srv:docker":

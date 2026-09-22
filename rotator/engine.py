@@ -87,10 +87,12 @@ class Engine:
         """Возвращает причину, по которой ротацию запускать нельзя."""
         if self.busy:
             return "ротация уже идёт"
+        if force:
+            # Ручной запуск важнее записи о прошлом сбое: иначе зависшая отметка
+            # запирает бота наглухо, и починить его можно только правкой файла.
+            return None
         if self.state["pending"]:
             return "есть незавершённая ротация — сначала докатываю её"
-        if force:
-            return None
         if self.state["paused"]:
             return "автоматика на паузе (/resume чтобы снять)"
         cooldown = float(self.cfg.get("rotation.cooldown_hours", 6))
@@ -204,6 +206,16 @@ class Engine:
                     reason="resume",
                     resume=data,
                 )
+            except Exception as exc:                          # noqa: BLE001
+                # Доиграть не вышло. Держать отметку дальше нельзя: она запрёт
+                # и автоматику, и ручной запуск.
+                self.state.clear_pending()
+                self.notify(
+                    f"❌ доиграть не удалось: {exc}\n\n"
+                    "Отметка снята, бот снова свободен. Проверьте /server и запустите "
+                    "смену адреса заново."
+                )
+                return None
             finally:
                 self.busy = False
 
@@ -260,6 +272,12 @@ class Engine:
 
         blocked = self.guard()
         if blocked:
+            if self.state["pending"]:
+                # Самолечение: незавершённая ротация не должна ждать перезапуска
+                # сервиса, чтобы кто-нибудь её доиграл.
+                self.notify("⚠️ блокировка подтверждена, но мешает незавершённая ротация — доигрываю её")
+                self.resume_pending()
+                return
             self._alert_once(f"⚠️ блокировка адреса подтверждена, но ротация не запущена: {blocked}")
             return
 

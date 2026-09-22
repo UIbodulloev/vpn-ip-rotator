@@ -36,6 +36,7 @@ class FakeCloud:
         self.fail_on: dict[str, int] = {}      # путь -> сколько раз вернуть 500
         self.telegram = None                   # подставляется FakeTelegram, если нужен бот
         self.last_server_spec: dict = {}       # чем именно создавали последний сервер
+        self.autostart_after_templatize = False  # UpCloud иногда так делает
 
     # --- помощники ----------------------------------------------------------
 
@@ -223,11 +224,27 @@ class FakeCloud:
                 return FakeResponse(404, {})
             new_uuid = str(uuidlib.uuid4())
             zone = body["storage"].get("zone", source["zone"])
+            # Кастомный шаблон виден только в своей зоне — на этом и сломалась
+            # боевая ротация, пока фейк разрешал клонировать шаблон куда угодно.
+            if (match.group(2) == "clone" and source.get("type") == "template"
+                    and zone != source["zone"]):
+                return FakeResponse(409, {"error": {
+                    "error_code": "ZONE_MISMATCH",
+                    "error_message": (f"Cannot find the storage {match.group(1)} "
+                                      f"from the zone '{zone}'."),
+                }})
             self.storages[new_uuid] = {
                 "uuid": new_uuid, "state": "online", "size": source["size"],
                 "tier": source["tier"], "title": body["storage"]["title"], "zone": zone,
                 "type": "template" if match.group(2) == "templatize" else "normal",
             }
+            if self.autostart_after_templatize and match.group(2) == "templatize":
+                # UpCloud возвращает сервер в работу сам, и безусловный start
+                # после этого отвечал SERVER_STATE_ILLEGAL.
+                for server in self.servers.values():
+                    devices = server["storage_devices"]["storage_device"]
+                    if any(d["storage"] == match.group(1) for d in devices):
+                        server["state"] = "started"
             return FakeResponse(202, {"storage": self.storages[new_uuid]})
 
         match = re.fullmatch(r"/1\.3/storage/([0-9a-f-]+)", path)

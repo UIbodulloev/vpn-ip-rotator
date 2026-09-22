@@ -167,6 +167,31 @@ class RecreateTest(unittest.TestCase):
         for storage in self.h.cloud.storages.values():
             self.assertNotIn("rotator-clone", storage["title"])
 
+    def test_переезд_копирует_диск_а_не_шаблон(self):
+        """Шаблон виден только в своей зоне — клонировать надо исходный диск."""
+        self.h.engine.rotate(modes.MOVE, zone="fi-hel1", force=True)
+        clones = [p for m, p in self.h.cloud.calls if p.endswith("/clone")]
+        self.assertEqual(len(clones), 1, "клонирование прошло не один раз")
+        self.assertIn(self.h.storage_uuid, clones[0],
+                      "клонировали не исходный диск, а что-то другое")
+        new_uuid = self.h.secrets.get("SERVER_UUID")
+        self.assertEqual(self.h.cloud.servers[new_uuid]["zone"], "fi-hel1")
+
+    def test_переезд_не_снимает_лишний_шаблон_в_своей_зоне(self):
+        self.h.engine.rotate(modes.MOVE, zone="fi-hel1", force=True)
+        templatized = [p for m, p in self.h.cloud.calls if p.endswith("/templatize")]
+        self.assertEqual(len(templatized), 1,
+                         "при переезде хватает одного шаблона — на той стороне")
+
+    def test_запуск_идемпотентен_если_upcloud_поднял_сервер_сам(self):
+        """Боевой случай: после templatize сервер уже started, и start падал 409."""
+        self.h.cloud.autostart_after_templatize = True
+        self.h.cloud.fail_on["POST /1.3/server"] = 99
+        with self.assertRaises(Exception):
+            self.h.engine.rotate(modes.CLONE, force=True)
+        # Главное: восстановление не свалилось на SERVER_STATE_ILLEGAL.
+        self.assertEqual(self.h.cloud.servers[self.h.server_uuid]["state"], "started")
+
     def test_сбой_создания_возвращает_старый_сервер_в_работу(self):
         old_uuid, old_ip = self.h.server_uuid, self.h.ip
         self.h.cloud.fail_on["POST /1.3/server"] = 99
@@ -217,6 +242,38 @@ class DryRunTest(unittest.TestCase):
     def test_попадает_в_историю_с_пометкой(self):
         self.h.engine.rotate(modes.CLONE, force=True)
         self.assertEqual(self.h.state["history"][0]["to"], "(холостой прогон)")
+
+
+class StuckPendingTest(unittest.TestCase):
+    """Зависшая отметка о ротации не должна запирать бота насмерть."""
+
+    def setUp(self):
+        self.h = Harness()
+        self._orig = modes.tcp_open
+        modes.tcp_open = always_open
+
+    def tearDown(self):
+        modes.tcp_open = self._orig
+
+    def test_ручной_запуск_сильнее_зависшей_отметки(self):
+        self.h.state.set_pending(modes.CLONE, "cloning", old_ip="1.2.3.4")
+        self.assertIn("незавершённая", self.h.engine.guard() or "")
+        self.assertIsNone(self.h.engine.guard(force=True),
+                          "ручной запуск заперт отметкой о прошлом сбое")
+        result = self.h.engine.rotate(modes.CLONE, force=True)
+        self.assertTrue(result["new_ip"])
+
+    def test_неудачное_доигрывание_снимает_отметку(self):
+        self.h.cloud.fail_on["POST /1.3/server"] = 99
+        with self.assertRaises(Exception):
+            self.h.engine.rotate(modes.CLONE, force=True)
+        self.assertIsNotNone(self.h.state["pending"], "отметка не сохранена для доигрывания")
+
+        said = []
+        self.h.engine.notify = said.append
+        self.h.engine.resume_pending()
+        self.assertIsNone(self.h.state["pending"], "после неудачного доигрывания отметка осталась")
+        self.assertTrue(any("снята" in s for s in said), "о снятии отметки не сообщили")
 
 
 class SshKeyTest(unittest.TestCase):
