@@ -37,6 +37,7 @@ class FakeCloud:
         self.telegram = None                   # подставляется FakeTelegram, если нужен бот
         self.last_server_spec: dict = {}       # чем именно создавали последний сервер
         self.autostart_after_templatize = False  # UpCloud иногда так делает
+        self.floating: set[str] = set()        # какие адреса плавающие
 
     # --- помощники ----------------------------------------------------------
 
@@ -133,6 +134,30 @@ class FakeCloud:
     def _upcloud(self, method: str, path: str, body: dict, params: dict) -> FakeResponse:
         if path == "/1.3/account":
             return FakeResponse(200, {"account": {"username": "fake"}})
+        if path == "/1.3/price":
+            # Реальные величины из документации UpCloud: сотые доли валюты за час.
+            return FakeResponse(200, {"prices": {"zone": [{
+                "name": "nl-ams1",
+                "firewall": {"amount": 1, "price": 0.5},
+                "ipv4_address": {"amount": 1, "price": 0.3},
+                "ipv6_address": {"amount": 1, "price": 0.0},
+                "storage_maxiops": {"amount": 1, "price": 0.028},
+                "storage_standard": {"amount": 1, "price": 0.0093},
+                "server_plan_1xCPU-1GB": {"amount": 1, "price": 0.5556},
+                "server_plan_STARTER-1xCPU-1GB": {"amount": 1, "price": 0.4167},
+            }]}})
+
+        if path == "/1.3/ip_address" and method == "GET":
+            return FakeResponse(200, {"ip_addresses": {"ip_address": [
+                {"address": a, "access": "public", "family": "IPv4",
+                 "floating": "yes" if a in self.floating else "no"}
+                for a in self.ips
+            ]}})
+
+        match = re.fullmatch(r"/1\.3/storage/(private|template|normal)", path)
+        if match and method == "GET":
+            return FakeResponse(200, {"storages": {"storage": list(self.storages.values())}})
+
         if path == "/1.3/zone":
             return FakeResponse(200, {"zones": {"zone": [
                 {"id": "nl-ams1", "description": "Amsterdam", "public": "yes"},

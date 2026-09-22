@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import guide, log, modes, probes, remote, sshkeys, ui
+from . import costs, guide, log, modes, probes, remote, sshkeys, ui
 from .config import Secrets, domain_of, masked
 from .engine import Engine
 from .relay import Relay
@@ -56,6 +56,7 @@ COMMANDS = [
     ("ip", "что у сервера и что стоит в DNS"),
     ("simulate", "холостой прогон: что сделала бы автоматика"),
     ("plan", "что именно сделает каждый режим на вашем сервере"),
+    ("costs", "расходы в UpCloud: за что и сколько"),
     ("rotate", "сменить адрес"),
     ("mode", "режим автоматики: auto / clone / move / floating"),
     ("pause", "выключить автоматику"),
@@ -83,7 +84,7 @@ def _help_text() -> str:
 HELP_GROUPS = [
     ('Главное', ['menu', 'server']),
     ('Наблюдение', ['status', 'probe', 'ip', 'log']),
-    ('Проверка вхолостую', ['simulate', 'plan']),
+    ('Проверка вхолостую', ['simulate', 'plan', 'costs']),
     ('Управление', ['rotate', 'mode', 'pause', 'resume', 'rollback']),
     ('Настройка', ['setup', 'check', 'diag', 'zones', 'plans']),
     ('Справка', ['guide']),
@@ -436,6 +437,8 @@ class Bot:
             self.cmd_simulate()
         elif command == "/plan":
             self.cmd_plan(argument)
+        elif command == "/costs":
+            self.cmd_costs()
         elif command == "/ip":
             self.cmd_ip()
         elif command == "/rotate":
@@ -657,6 +660,78 @@ class Bot:
             [{"text": "◀️ Другие режимы", "callback_data": "cmd:plan"}],
         ])
 
+    def cmd_costs(self) -> None:
+        """Расходы по прайсу вашего аккаунта, а не по средним цифрам из интернета."""
+        message_id = self.send(f"{ui.WAIT} Читаю прайс аккаунта…")
+        uc = self.engine.uc
+        try:
+            account = uc.account(timeout=UI_TIMEOUT)
+            server = uc.server(self.secrets.get("SERVER_UUID"))
+            prices = uc.prices(timeout=UI_TIMEOUT)
+            storages = uc.storages(timeout=UI_TIMEOUT)
+            addresses = uc.ip_addresses(timeout=UI_TIMEOUT)
+        except Exception as exc:                               # noqa: BLE001
+            return self.edit(message_id, ui.joined(
+                ui.title("Не удалось посчитать", ui.NO), ui.block([str(exc)])))
+
+        result = costs.estimate(
+            prices=prices,
+            currency=account.get("currency") or "?",
+            server=server,
+            storages=storages,
+            ip_addresses=addresses,
+            template_uuids={x["uuid"] for x in self.engine.state["templates"]},
+        )
+        cur = result.currency
+
+        standing = [(line.what, f"{line.per_month:.2f} {cur}/мес") for line in result.lines if line.always]
+        details = [f"{line.what}: {line.detail}" for line in result.lines if line.always]
+        transient = [(line.what, f"≈{line.per_month / 730 * 0.5:.3f} {cur} за полчаса")
+                     for line in result.lines if not line.always]
+
+        blocks = [
+            ui.title("Расходы в UpCloud", "💶"),
+            ui.table(standing + [("ИТОГО", f"{result.standing:.2f} {cur}/мес")]),
+            ui.block(details) if details else "",
+        ]
+        if transient:
+            blocks += [ui.title("Только во время ротации"), ui.table(transient)]
+        if result.unknown:
+            blocks += [ui.note("не удалось определить: " + "; ".join(result.unknown))]
+        blocks += [
+            ui.title("Когда списывается"),
+            ui.esc("Тарификация почасовая, счёт приходит раз в месяц. Остановленный "
+                   "сервер продолжает считаться за хранилище и адреса, но не за CPU и "
+                   "память. Удалённый сервер перестаёт считаться сразу."),
+            ui.note("Оценка по прайсу вашего аккаунта (GET /1.3/price). "
+                    "Точная сумма — в счёте UpCloud."),
+        ]
+        rows = [[{"text": "📖 Подробнее про деньги", "callback_data": "guide:money"}]]
+        if any(line.what == "Шаблон диска" for line in result.lines):
+            rows.insert(0, [{"text": "🧹 Убрать лишние шаблоны", "callback_data": "costs:prune"}])
+        self.edit(message_id, ui.joined(*blocks), rows)
+
+    def prune_templates(self) -> None:
+        templates = self.engine.state["templates"]
+        if len(templates) <= 1:
+            return self.send(ui.joined(
+                ui.title("Убирать нечего", ui.SKIP),
+                ui.esc("Хранится не больше одного шаблона — это точка отката для /rollback. "
+                       "Чтобы не хранить и его, поставьте keep_templates = 0 в конфиге.")))
+        removed = []
+        for entry in templates[1:]:
+            try:
+                self.engine.uc.delete_storage(entry["uuid"])
+                self.engine.state.drop_template(entry["uuid"])
+                removed.append(entry["uuid"][:8])
+            except Exception as exc:                           # noqa: BLE001
+                logger.warning("шаблон %s не удалён: %s", entry["uuid"], exc)
+        self.send(ui.joined(
+            ui.title("Убрано", ui.YES),
+            ui.block([f"удалено шаблонов: {len(removed)}"] + removed),
+            ui.note("Самый свежий оставлен как точка отката."),
+        ), [[{"text": "💶 Пересчитать", "callback_data": "cmd:costs"}]])
+
     def cmd_simulate(self) -> None:
         """Что сделала бы автоматика прямо сейчас. Ничего не меняет."""
         message_id = self.send("Прогоняю вхолостую…")
@@ -796,6 +871,7 @@ class Bot:
             [{"text": "🖥 Управление сервером", "callback_data": "srv:menu"}],
             [{"text": "🧪 Вхолостую", "callback_data": "cmd:simulate"},
              {"text": "📋 Что произойдёт", "callback_data": "cmd:plan"}],
+            [{"text": "💶 Расходы", "callback_data": "cmd:costs"}],
             [{"text": "⚙️ Настройка", "callback_data": "wiz:board"},
              {"text": "📖 Инструкция", "callback_data": "guide:menu"}],
         ])
@@ -1742,6 +1818,8 @@ class Bot:
             return self.server_action(data.split(":", 2)[2])
         if data.startswith("srv:create:"):
             return self.server_action("create", data.split(":", 2)[2])
+        if data == "costs:prune":
+            return self.prune_templates()
         if data.startswith("plan:"):
             return self.cmd_plan(data.split(":", 1)[1])
         if data.startswith("cmd:"):

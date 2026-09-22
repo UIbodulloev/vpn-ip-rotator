@@ -313,6 +313,53 @@ class SshKeyTest(unittest.TestCase):
                         "о рисках доступа не предупредили")
 
 
+class CostsTest(unittest.TestCase):
+    """Цены UpCloud приходят в сотых долях валюты за час."""
+
+    def test_пересчёт_в_месяц(self):
+        from rotator.costs import monthly
+        # Сверено с публичным прайсом UpCloud по трём позициям.
+        self.assertAlmostEqual(monthly(2.2321), 16.29, places=1)   # план 1xCPU-2GB
+        self.assertAlmostEqual(monthly(0.3), 2.19, places=2)       # IPv4
+        self.assertAlmostEqual(monthly(0.028, 10), 2.04, places=1) # 10 ГБ maxiops
+
+    def test_разбивка_по_реальному_аккаунту(self):
+        from rotator import costs
+        h = Harness()
+        server = h.cloud.servers[h.server_uuid]
+        server["plan"] = "STARTER-1xCPU-1GB"
+        # Шаблон, оставшийся от прошлой ротации, — он и тарифицируется.
+        h.cloud.storages["tpl"] = {"uuid": "tpl", "state": "online", "size": 10,
+                                   "tier": "standard", "title": "rotator-…",
+                                   "type": "template", "zone": "nl-ams1"}
+        result = costs.estimate(
+            prices=h.engine.uc.prices(), currency="EUR", server=server,
+            storages=list(h.cloud.storages.values()),
+            ip_addresses=h.engine.uc.ip_addresses(), template_uuids={"tpl"},
+        )
+        names = [line.what for line in result.lines]
+        self.assertIn("Сервер", names)
+        self.assertIn("Шаблон диска", names, "шаблон не попал в расходы")
+        self.assertEqual(result.unknown, [], f"что-то не посчиталось: {result.unknown}")
+        # Диск самого сервера входит в план и отдельной строкой идти не должен.
+        self.assertEqual(names.count("Отдельный диск"), 0)
+        self.assertGreater(result.standing, 0)
+        self.assertGreater(result.transient, 0, "второй сервер при ротации не учтён")
+
+    def test_плавающий_адрес_считается_платным(self):
+        from rotator import costs
+        h = Harness()
+        h.cloud.ips["203.0.113.99"] = h.server_uuid
+        h.cloud.floating.add("203.0.113.99")
+        result = costs.estimate(
+            prices=h.engine.uc.prices(), currency="EUR",
+            server=h.cloud.servers[h.server_uuid],
+            storages=[], ip_addresses=h.engine.uc.ip_addresses(), template_uuids=set(),
+        )
+        self.assertTrue(any("203.0.113.99" in line.detail for line in result.lines),
+                        "плавающий адрес не попал в расходы")
+
+
 class VerdictTest(unittest.TestCase):
     """Отличать блок адреса от блока порта — то, ради чего детектор вообще нужен."""
 

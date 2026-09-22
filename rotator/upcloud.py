@@ -100,6 +100,16 @@ class UpCloud:
     def plans(self) -> list[dict[str, Any]]:
         return self._call("GET", "/1.3/plan").get("plans", {}).get("plan", [])
 
+    def prices(self, timeout: float | None = None) -> list[dict[str, Any]]:
+        """Прайс аккаунта по зонам. Цены — в СОТЫХ долях валюты за час."""
+        return self._call("GET", "/1.3/price", timeout=timeout).get("prices", {}).get("zone", [])
+
+    def storages(self, kind: str = "private", timeout: float | None = None) -> list[dict[str, Any]]:
+        return self._call("GET", f"/1.3/storage/{kind}", timeout=timeout).get("storages", {}).get("storage", [])
+
+    def ip_addresses(self, timeout: float | None = None) -> list[dict[str, Any]]:
+        return self._call("GET", "/1.3/ip_address", timeout=timeout).get("ip_addresses", {}).get("ip_address", [])
+
     # --- серверы ------------------------------------------------------------
 
     def server(self, uuid: str) -> dict[str, Any]:
