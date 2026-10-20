@@ -75,6 +75,9 @@ def cmd_run(cfg: Config, secrets: Secrets) -> int:
     # Незавершённая ротация опаснее всего: сервер мог остаться остановленным.
     if state["pending"]:
         threading.Thread(target=_resume, args=(engine,), name="resume", daemon=True).start()
+    elif state["templates"]:
+        # Образы от прошлых запусков тарифицируются молча — подметаем на старте.
+        threading.Thread(target=engine.sweep_templates, name="sweep", daemon=True).start()
 
     try:
         while not stop.is_set():

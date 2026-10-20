@@ -623,12 +623,18 @@ class Bot:
                 (f"Создать сервер {info['plan']} в {target}", "из шаблона, адрес выдаётся бесплатно"),
                 (f"Переписать A и AAAA {domain}", "старые конфиги клиентов остаются рабочими"),
                 ("Удалить старый сервер", f"адрес {info['ipv4']} освобождается автоматически"),
-                ("Прибрать шаблоны", f"остаётся {self.cfg.get('rotation.keep_templates')} как точка отката"),
+                ("Удалить образ диска",
+                 "сразу после успеха — он тарифицируется, пока существует"
+                 if int(self.cfg.get("rotation.keep_templates", 0)) == 0
+                 else f"оставляем {self.cfg.get('rotation.keep_templates')} как точку отката, "
+                      "за ежемесячную плату"),
             ])
             cost = [
                 "даунтайм ~5–10 минут" + ("" if same else " плюс копирование диска"),
                 "адрес бесплатный, остаток за старый сервер возвращается на счёт",
-                f"шаблон {info['storage_size']} ГБ тарифицируется как доп. хранилище",
+                (f"образ {info['storage_size']} ГБ живёт только во время операции"
+                 if int(self.cfg.get("rotation.keep_templates", 0)) == 0
+                 else f"образ {info['storage_size']} ГБ остаётся и тарифицируется ежемесячно"),
                 "конфиги клиентов не меняются: ключи внутри шаблона",
             ]
 
@@ -712,25 +718,36 @@ class Bot:
         self.edit(message_id, ui.joined(*blocks), rows)
 
     def prune_templates(self) -> None:
-        templates = self.engine.state["templates"]
-        if len(templates) <= 1:
-            return self.send(ui.joined(
-                ui.title("Убирать нечего", ui.SKIP),
-                ui.esc("Хранится не больше одного шаблона — это точка отката для /rollback. "
-                       "Чтобы не хранить и его, поставьте keep_templates = 0 в конфиге.")))
-        removed = []
-        for entry in templates[1:]:
+        """Убрать образы диска — и те, что в state, и осиротевшие от прошлых сбоев."""
+        message_id = self.send(f"{ui.WAIT} Убираю образы…")
+        ctx = self.engine.ctx(lambda _t: None)
+        lines: list[str] = []
+
+        removed = modes.cleanup_templates(ctx, force=True)
+        lines.append(f"по записям: удалено {len(removed)}")
+
+        try:
+            orphans = modes.orphan_templates(ctx)
+        except Exception as exc:                               # noqa: BLE001
+            orphans = []
+            lines.append(f"поиск осиротевших не удался: {exc}")
+        for storage in orphans:
             try:
-                self.engine.uc.delete_storage(entry["uuid"])
-                self.engine.state.drop_template(entry["uuid"])
-                removed.append(entry["uuid"][:8])
+                self.engine.uc.delete_storage(storage["uuid"])
+                lines.append(f"осиротевший {storage.get('title', '')[:30]} · "
+                             f"{storage.get('size')} ГБ — удалён")
             except Exception as exc:                           # noqa: BLE001
-                logger.warning("шаблон %s не удалён: %s", entry["uuid"], exc)
-        self.send(ui.joined(
-            ui.title("Убрано", ui.YES),
-            ui.block([f"удалено шаблонов: {len(removed)}"] + removed),
-            ui.note("Самый свежий оставлен как точка отката."),
-        ), [[{"text": "💶 Пересчитать", "callback_data": "cmd:costs"}]])
+                lines.append(f"{storage.get('title', '')[:30]} — не удалён: {exc}")
+
+        keep = int(self.cfg.get("rotation.keep_templates", 0))
+        tail = (ui.note("keep_templates = 0: образ живёт только во время ротации — "
+                        "ежемесячной платы за него нет")
+                if keep == 0 else
+                ui.note(f"keep_templates = {keep}: последний образ оставлен как точка "
+                        "отката для /rollback и продолжает тарифицироваться"))
+        self.edit(message_id, ui.joined(
+            ui.title("Уборка образов", ui.YES), ui.block(lines), tail,
+        ), [[{"text": "💶 Пересчитать расходы", "callback_data": "cmd:costs"}]])
 
     def cmd_simulate(self) -> None:
         """Что сделала бы автоматика прямо сейчас. Ничего не меняет."""
@@ -984,6 +1001,8 @@ class Bot:
             return say(f"{ui.YES} перезагружен, адрес {info['ipv4']}")
 
         if action == "template":
+            say(ui.strip_tags("Образ тарифицируется как отдельное хранилище, пока существует. "
+                              "Снятый вручную не удаляется сам — уберите его через /costs."))
             info = self.engine.refresh()
             was_running = info["state"] == "started"
             if was_running:

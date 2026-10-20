@@ -330,7 +330,9 @@ def recreate(
     except UpCloudError as exc:
         ctx.say(f"старый сервер удалить не удалось ({exc}) — удалите вручную, он тарифицируется")
 
-    _prune_templates(ctx, keep=int(ctx.cfg.get("rotation.keep_templates", 1)), extra=[data.get("clone_uuid", "")])
+    # force: отметка снимается чуть позже, в _finish, но здесь мы уже на успешном
+    # пути — новый сервер поднят и DNS переписан, доигрывать нечего.
+    cleanup_templates(ctx, extra=[data.get("clone_uuid", "")], force=True)
     mode_name = CLONE if same_zone else MOVE
     return _finish(ctx, mode_name, data["old_ip"], data["new_ip"], target_zone, reason, dns)
 
@@ -413,24 +415,57 @@ def _grant_permission(ctx: Ctx, new_uuid: str) -> None:
         ctx.say(f"⚠️ не удалось выдать права субаккаунту: {exc}")
 
 
-def _prune_templates(ctx: Ctx, keep: int, extra: list[str]) -> None:
-    """Оставляем последний шаблон как точку отката, промежуточные клоны удаляем."""
-    for uuid in [u for u in extra if u]:
+def cleanup_templates(ctx: Ctx, *, keep: int | None = None, extra: list[str] | None = None,
+                      force: bool = False) -> list[str]:
+    """Удалить образы диска, которые больше не нужны.
+
+    Образ тарифицируется как отдельное хранилище всё время, пока существует, —
+    на 10 ГБ это сопоставимо со стоимостью самого сервера. Поэтому по умолчанию
+    он живёт только те минуты, пока разворачивается новый сервер.
+
+    Пока висит незавершённая ротация, образ может понадобиться для доигрывания,
+    поэтому без force он не трогается.
+    """
+    if keep is None:
+        keep = int(ctx.cfg.get("rotation.keep_templates", 0))
+    removed: list[str] = []
+
+    for uuid in [u for u in (extra or []) if u]:
         try:
             ctx.uc.delete_storage(uuid)
             ctx.state.drop_template(uuid)
+            removed.append(uuid)
         except UpCloudError as exc:
             logger.warning("промежуточный диск %s не удалён: %s", uuid, exc)
 
-    # keep=0 — удалить все шаблоны: точки отката не будет, зато не тарифицируется.
-    templates = ctx.state["templates"]
-    for entry in templates[max(keep, 0):]:
+    if ctx.state["pending"] and not force:
+        logger.info("образы оставлены: есть незавершённая ротация, они могут понадобиться")
+        return removed
+
+    for entry in list(ctx.state["templates"])[max(keep, 0):]:
         try:
             ctx.uc.delete_storage(entry["uuid"])
             ctx.state.drop_template(entry["uuid"])
-            logger.info("удалён устаревший шаблон %s", entry["uuid"])
+            removed.append(entry["uuid"])
+            logger.info("удалён образ диска %s", entry["uuid"])
         except UpCloudError as exc:
-            logger.warning("шаблон %s не удалён: %s", entry["uuid"], exc)
+            if exc.status == 404:
+                ctx.state.drop_template(entry["uuid"])   # уже исчез вместе с сервером
+            else:
+                logger.warning("образ %s не удалён: %s", entry["uuid"], exc)
+    return removed
+
+
+def orphan_templates(ctx: Ctx) -> list[dict[str, Any]]:
+    """Образы ротатора, про которые state не знает — остатки прошлых сбоев."""
+    known = {entry["uuid"] for entry in ctx.state["templates"]}
+    found = []
+    for storage in ctx.uc.storages():
+        if storage.get("type") != "template" or storage.get("uuid") in known:
+            continue
+        if str(storage.get("title") or "").startswith(("rotator-", "manual-")):
+            found.append(storage)
+    return found
 
 
 # --- режим 3: floating ------------------------------------------------------

@@ -154,9 +154,10 @@ class RecreateTest(unittest.TestCase):
         self.assertIn(new_uuid, self.h.cloud.servers)
         self.assertEqual(self.h.cloud.servers[new_uuid]["state"], "started")
         self.assertEqual(self.h.dns(), result["new_ip"])
-        # Шаблон остаётся как точка отката.
-        self.assertEqual(len(self.h.state["templates"]), 1)
-        self.assertIn(self.h.state["templates"][0]["uuid"], self.h.cloud.storages)
+        # По умолчанию образ не хранится: он тарифицируется, пока существует.
+        self.assertEqual(self.h.state["templates"], [], "образ остался и будет тарифицироваться")
+        leftovers = [s for s in self.h.cloud.storages.values() if s.get("type") == "template"]
+        self.assertEqual(leftovers, [], f"в аккаунте остались образы: {leftovers}")
 
     def test_переезд_в_другую_зону(self):
         result = self.h.engine.rotate(modes.MOVE, zone="fi-hel1", force=True)
@@ -274,6 +275,59 @@ class StuckPendingTest(unittest.TestCase):
         self.h.engine.resume_pending()
         self.assertIsNone(self.h.state["pending"], "после неудачного доигрывания отметка осталась")
         self.assertTrue(any("снята" in s for s in said), "о снятии отметки не сообщили")
+
+
+class TemplateCostTest(unittest.TestCase):
+    """Образ диска тарифицируется, пока существует, — он не должен переживать ротацию."""
+
+    def setUp(self):
+        self.h = Harness()
+        self._orig = modes.tcp_open
+        modes.tcp_open = always_open
+
+    def tearDown(self):
+        modes.tcp_open = self._orig
+
+    def test_точку_отката_можно_оставить_осознанно(self):
+        h = Harness(CONFIG.replace("[rotation]", "[rotation]\nkeep_templates = 1"))
+        h.engine.rotate(modes.CLONE, force=True)
+        self.assertEqual(len(h.state["templates"]), 1, "осознанно оставленный образ исчез")
+
+    def test_после_сбоя_образ_не_остаётся_навсегда(self):
+        """Раньше неудачная ротация оставляла образ, и он тарифицировался молча."""
+        self.h.cloud.fail_on["POST /1.3/server"] = 99
+        with self.assertRaises(Exception):
+            self.h.engine.rotate(modes.CLONE, force=True)
+        # Образ сохранён для доигрывания, пока отметка висит.
+        self.assertTrue(self.h.state["templates"], "образ потерян, доигрывать будет нечем")
+
+        said = []
+        self.h.engine.notify = said.append
+        self.h.engine.resume_pending()                 # доиграть не выйдет — тот же сбой
+        self.assertEqual(self.h.state["templates"], [], "образ остался после снятия отметки")
+
+    def test_пока_висит_отметка_образ_не_трогаем(self):
+        self.h.state.add_template("tpl-1", "nl-ams1")
+        self.h.cloud.storages["tpl-1"] = {"uuid": "tpl-1", "state": "online", "size": 10,
+                                          "tier": "standard", "title": "rotator-x",
+                                          "type": "template", "zone": "nl-ams1"}
+        self.h.state.set_pending(modes.CLONE, "creating", template_uuid="tpl-1")
+        modes.cleanup_templates(self.h.engine.ctx(lambda _t: None))
+        self.assertIn("tpl-1", self.h.cloud.storages, "образ удалён, хотя нужен для доигрывания")
+
+    def test_осиротевшие_образы_находятся(self):
+        self.h.cloud.storages["lost"] = {"uuid": "lost", "state": "online", "size": 10,
+                                         "tier": "standard", "title": "rotator-amnezia-old",
+                                         "type": "template", "zone": "nl-ams1"}
+        found = modes.orphan_templates(self.h.engine.ctx(lambda _t: None))
+        self.assertEqual([s["uuid"] for s in found], ["lost"])
+
+    def test_чужие_образы_не_трогаются(self):
+        self.h.cloud.storages["mine"] = {"uuid": "mine", "state": "online", "size": 10,
+                                         "tier": "standard", "title": "my-own-golden-image",
+                                         "type": "template", "zone": "nl-ams1"}
+        found = modes.orphan_templates(self.h.engine.ctx(lambda _t: None))
+        self.assertEqual(found, [], "ротатор полез в чужой образ")
 
 
 class SshKeyTest(unittest.TestCase):

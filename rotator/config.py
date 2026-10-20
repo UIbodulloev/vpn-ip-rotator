@@ -74,7 +74,7 @@ DEFAULTS: dict[str, Any] = {
         "max_per_day": 2,
         "escalate_after_hours": 6,   # новый IP умер быстрее — значит подсеть/протокол
         "zone_rotation": ["fi-hel1", "de-fra1", "nl-ams1", "uk-lon1"],
-        "keep_templates": 1,
+        "keep_templates": 0,   # 0 — удалять образ сразу: он тарифицируется, пока существует
         "wait_stop_sec": 240,
         "wait_start_sec": 300,
         "wait_storage_sec": 3600,

@@ -193,6 +193,7 @@ class Engine:
                 f"(шаг «{step}»). Запись убрана. Проверяю, работает ли сервер…"
             )
             modes._ensure_running(self.ctx(progress), self.secrets.get("SERVER_UUID"))
+            self.sweep_templates()
             return None
 
         self.notify(f"⚠️ найдена незавершённая ротация {mode} на шаге «{step}» — доигрываю")
@@ -215,9 +216,26 @@ class Engine:
                     "Отметка снята, бот снова свободен. Проверьте /server и запустите "
                     "смену адреса заново."
                 )
+                # Образ после неудачи больше не нужен, а тарифицируется.
+                self.sweep_templates()
                 return None
             finally:
                 self.busy = False
+
+    def sweep_templates(self, *, announce: bool = True) -> list[str]:
+        """Убрать образы диска, оставшиеся от прошлых ротаций.
+
+        Образ нужен только пока разворачивается новый сервер, а тарифицируется
+        всё время существования. Сбой ротации раньше оставлял его навсегда.
+        """
+        try:
+            removed = modes.cleanup_templates(self.ctx(lambda _t: None))
+        except Exception as exc:                              # noqa: BLE001
+            logger.warning("уборка образов не удалась: %s", exc)
+            return []
+        if removed and announce:
+            self.notify(f"🧹 убрано образов диска: {len(removed)} — они тарифицировались впустую")
+        return removed
 
     # --- цикл детектора -----------------------------------------------------
 
