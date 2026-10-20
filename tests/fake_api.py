@@ -38,6 +38,7 @@ class FakeCloud:
         self.last_server_spec: dict = {}       # чем именно создавали последний сервер
         self.autostart_after_templatize = False  # UpCloud иногда так делает
         self.floating: set[str] = set()        # какие адреса плавающие
+        self.restored: list[str] = []          # из каких снимков восстанавливали
 
     # --- помощники ----------------------------------------------------------
 
@@ -143,6 +144,7 @@ class FakeCloud:
                 "ipv6_address": {"amount": 1, "price": 0.0},
                 "storage_maxiops": {"amount": 1, "price": 0.028},
                 "storage_standard": {"amount": 1, "price": 0.0093},
+                "storage_backup": {"amount": 1, "price": 0.0082},
                 "server_plan_1xCPU-1GB": {"amount": 1, "price": 0.5556},
                 "server_plan_STARTER-1xCPU-1GB": {"amount": 1, "price": 0.4167},
             }]}})
@@ -154,9 +156,12 @@ class FakeCloud:
                 for a in self.ips
             ]}})
 
-        match = re.fullmatch(r"/1\.3/storage/(private|template|normal)", path)
+        match = re.fullmatch(r"/1\.3/storage/(private|template|normal|backup)", path)
         if match and method == "GET":
-            return FakeResponse(200, {"storages": {"storage": list(self.storages.values())}})
+            found = list(self.storages.values())
+            if match.group(1) == "backup":
+                found = [s for s in found if s.get("type") == "backup"]
+            return FakeResponse(200, {"storages": {"storage": found}})
 
         if path == "/1.3/zone":
             return FakeResponse(200, {"zones": {"zone": [
@@ -185,8 +190,13 @@ class FakeCloud:
             for entry in list(server["ip_addresses"]["ip_address"]):
                 self.ips.pop(entry["address"], None)
             if params.get("storages") in ("1", 1, True):
-                for device in server["storage_devices"]["storage_device"]:
-                    self.storages.pop(device["storage"], None)
+                disks = [d["storage"] for d in server["storage_devices"]["storage_device"]]
+                for disk in disks:
+                    self.storages.pop(disk, None)
+                if params.get("backups") == "delete":
+                    for uuid, storage in list(self.storages.items()):
+                        if storage.get("type") == "backup" and storage.get("origin") in disks:
+                            self.storages.pop(uuid, None)
             del self.servers[server_uuid]
             return FakeResponse(204)
 
@@ -240,6 +250,34 @@ class FakeCloud:
             if address not in self.ips:
                 return FakeResponse(404, {})
             self._detach_ip(address)
+            return FakeResponse(204)
+
+        match = re.fullmatch(r"/1\.3/storage/([0-9a-f-]+)/backup", path)
+        if match:
+            source = self.storages.get(match.group(1))
+            if not source:
+                return FakeResponse(404, {})
+            new_uuid = str(uuidlib.uuid4())
+            self.storages[new_uuid] = {
+                "uuid": new_uuid, "state": "online", "size": source["size"],
+                "title": body["storage"]["title"], "zone": source["zone"],
+                "type": "backup", "origin": match.group(1),
+            }
+            return FakeResponse(201, {"storage": self.storages[new_uuid]})
+
+        match = re.fullmatch(r"/1\.3/storage/([0-9a-f-]+)/restore", path)
+        if match:
+            backup = self.storages.get(match.group(1))
+            if not backup or backup.get("type") != "backup":
+                return FakeResponse(404, {})
+            origin = self.storages.get(backup.get("origin"))
+            if not origin:
+                return FakeResponse(404, {"error": {"error_code": "STORAGE_NOT_FOUND"}})
+            for server in self.servers.values():
+                devices = server["storage_devices"]["storage_device"]
+                if any(d["storage"] == origin["uuid"] for d in devices) and server["state"] != "stopped":
+                    return FakeResponse(409, {"error": {"error_code": "SERVER_STATE_ILLEGAL"}})
+            self.restored.append(match.group(1))
             return FakeResponse(204)
 
         match = re.fullmatch(r"/1\.3/storage/([0-9a-f-]+)/(templatize|clone)", path)

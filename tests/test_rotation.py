@@ -330,6 +330,78 @@ class TemplateCostTest(unittest.TestCase):
         self.assertEqual(found, [], "ротатор полез в чужой образ")
 
 
+class BackupTest(unittest.TestCase):
+    """Эталонный снимок: страховка, которая переживает удаление старого сервера."""
+
+    def setUp(self):
+        self.h = Harness()
+        self._orig = modes.tcp_open
+        modes.tcp_open = always_open
+
+    def tearDown(self):
+        modes.tcp_open = self._orig
+
+    def test_снимок_делается_до_остановки_сервера(self):
+        self.h.engine.rotate(modes.CLONE, force=True)
+        order = [f"{m} {p}" for m, p in self.h.cloud.calls]
+        backup_at = next(i for i, c in enumerate(order) if c.endswith("/backup"))
+        stop_at = next(i for i, c in enumerate(order) if c.endswith("/stop"))
+        self.assertLess(backup_at, stop_at, "снимок снят после остановки, а не на лету")
+
+    def test_эталон_переживает_удаление_старого_сервера(self):
+        """Главная ловушка: backups=delete уничтожил бы снимок вместе с диском."""
+        self.h.engine.rotate(modes.CLONE, force=True)
+        kept = self.h.state["backups"]
+        self.assertEqual(len(kept), 1, "эталон не сохранён")
+        self.assertIn(kept[0]["uuid"], self.h.cloud.storages,
+                      "снимок удалён вместе со старым сервером")
+        self.assertEqual(self.h.cloud.storages[kept[0]["uuid"]]["type"], "backup")
+
+    def test_образ_удаляется_а_снимок_остаётся(self):
+        self.h.engine.rotate(modes.CLONE, force=True)
+        kinds = [s.get("type") for s in self.h.cloud.storages.values()]
+        self.assertNotIn("template", kinds, "образ остался и тарифицируется")
+        self.assertIn("backup", kinds, "снимок не сохранился")
+
+    def test_хранится_только_заданное_число_снимков(self):
+        self.h.engine.rotate(modes.CLONE, force=True)
+        first = self.h.state["backups"][0]["uuid"]
+        self.h.state.update(last_rotation_ts=0)
+        self.h.engine.rotate(modes.CLONE, force=True)
+        self.assertEqual(len(self.h.state["backups"]), 1, "снимки копятся")
+        self.assertNotIn(first, self.h.cloud.storages, "старый снимок не удалён")
+
+    def test_без_снимков_ничего_не_тарифицируется(self):
+        h = Harness(CONFIG.replace("[rotation]", "[rotation]\nkeep_backups = 0"))
+        modes.tcp_open = always_open
+        h.engine.rotate(modes.CLONE, force=True)
+        self.assertEqual(h.state["backups"], [])
+        leftovers = [s for s in h.cloud.storages.values() if s.get("type") in ("backup", "template")]
+        self.assertEqual(leftovers, [], f"что-то осталось: {leftovers}")
+
+    def test_снимок_можно_отключить(self):
+        h = Harness(CONFIG.replace("[rotation]", "[rotation]\nbackup_before_rotation = false"))
+        modes.tcp_open = always_open
+        h.engine.rotate(modes.CLONE, force=True)
+        self.assertEqual([c for m, c in h.cloud.calls if c.endswith("/backup")], [])
+
+    def test_сбой_снимка_не_останавливает_ротацию(self):
+        """Страховка полезна, но её отсутствие не повод оставлять адрес заблокированным."""
+        self.h.cloud.fail_on[f"POST /1.3/storage/{self.h.storage_uuid}/backup"] = 99
+        said = []
+        self.h.engine.notify = said.append
+        result = self.h.engine.rotate(modes.CLONE, force=True)
+        self.assertTrue(result["new_ip"], "ротация не прошла из-за неудачного снимка")
+        self.assertTrue(any("снимок не удался" in s for s in said))
+
+    def test_осиротевшие_снимки_находятся(self):
+        self.h.cloud.storages["lost"] = {"uuid": "lost", "state": "online", "size": 10,
+                                         "title": "rotator-backup-old", "type": "backup",
+                                         "zone": "nl-ams1", "origin": "gone"}
+        found = modes.orphan_backups(self.h.engine.ctx(lambda _t: None))
+        self.assertEqual([s["uuid"] for s in found], ["lost"])
+
+
 class SshKeyTest(unittest.TestCase):
     """В UpCloud нет хранилища ключей — ключ передаётся строкой при создании."""
 

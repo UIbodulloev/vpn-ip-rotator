@@ -615,8 +615,12 @@ class Bot:
         if argument == modes.CLONE or argument == modes.MOVE:
             target = (self.engine.next_zone() or info["zone"]) if argument == modes.MOVE else info["zone"]
             same = target == info["zone"]
-            plan = ui.steps([
-                ("Остановить сервер", "шаблон снимается только с остановленного"),
+            steps_list = []
+            if self.cfg.get("rotation.backup_before_rotation", True):
+                steps_list.append(("Снять страховочный снимок",
+                                   "на работающем сервере, до остановки"))
+            plan = ui.steps(steps_list + [
+                ("Остановить сервер", "образ снимается только с остановленного"),
                 (f"Снять шаблон диска {info['storage_size']} ГБ",
                  "внутри всё: ключи, клиенты, swap, authorized_keys"),
             ] + ([] if same else [(f"Скопировать диск в {target}", "самый долгий шаг, до получаса")]) + [
@@ -628,7 +632,10 @@ class Bot:
                  if int(self.cfg.get("rotation.keep_templates", 0)) == 0
                  else f"оставляем {self.cfg.get('rotation.keep_templates')} как точку отката, "
                       "за ежемесячную плату"),
-            ])
+            ] + ([("Оставить снимок как эталон",
+                   f"хранится {self.cfg.get('rotation.keep_backups')}, "
+                   "переживает удаление старого сервера")]
+                 if int(self.cfg.get("rotation.keep_backups", 1)) > 0 else []))
             cost = [
                 "даунтайм ~5–10 минут" + ("" if same else " плюс копирование диска"),
                 "адрес бесплатный, остаток за старый сервер возвращается на счёт",
@@ -913,7 +920,8 @@ class Bot:
                 ("адрес", info["ipv4"]),
                 ("локация", f"{info['zone']} · {info['plan']}"),
                 ("диск", f"{info['storage_size']} ГБ, {info['storage_tier'] or 'standard'}"),
-                ("шаблонов", len(templates)),
+                ("образов", len(templates)),
+                ("снимков", len(self.engine.state["backups"])),
             ]),
             ui.note("Действия ниже выполняются вручную и не трогают DNS, "
                     "если не сказано иное."),
@@ -922,7 +930,8 @@ class Bot:
                  if running else [{"text": "▶️ Запустить", "callback_data": "srv:go:start"}])
         self.send(head, [
             power + [{"text": "🔁 Перезагрузить", "callback_data": "srv:ask:reboot"}],
-            [{"text": "📸 Снять шаблон (дамп)", "callback_data": "srv:ask:template"}],
+            [{"text": "📸 Снять образ (дамп)", "callback_data": "srv:ask:template"}],
+            [{"text": "💾 Эталонные снимки", "callback_data": "srv:backups"}],
             [{"text": "🆕 Поднять сервер из шаблона", "callback_data": "srv:new"}],
             [{"text": "🐳 Контейнеры", "callback_data": "srv:docker"},
              {"text": "🔍 Протоколы", "callback_data": "srv:go:protocols"}],
@@ -941,6 +950,9 @@ class Bot:
                      "Сервер будет остановлен на время снятия, потом запущен обратно. "
                      "Шаблон — это дамп: ключи, клиенты, настройки. "
                      "Он тарифицируется как дополнительное хранилище.", "📸 Да, снять"),
+        "backup-del": ("Удалить все снимки",
+                       "Эталонные снимки будут удалены безвозвратно. Платы за них не станет, "
+                       "но и вернуть диск к прежнему состоянию будет нечем.", "🗑 Да, удалить"),
         "delete": ("Удалить сервер",
                    "СЕРВЕР И ЕГО ДИСК БУДУТ УДАЛЕНЫ БЕЗВОЗВРАТНО, адрес освободится. "
                    "Если шаблона нет — восстановить будет нечем. "
@@ -1030,6 +1042,47 @@ class Bot:
             return say(f"{ui.YES} сервер удалён, адрес {info['ipv4']} освобождён. "
                        "Поднимите новый: 🖥 → 🆕")
 
+        if action == "backup-now":
+            info = self.engine.refresh()
+            say(f"снимаю снимок диска {info['storage_size']} ГБ…")
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            backup = uc.create_backup(info["storage_uuid"],
+                                      f"rotator-backup-{info['hostname']}-{stamp}")
+            self.engine.state.add_backup(backup["uuid"], info["zone"],
+                                         int(info["storage_size"] or 0))
+            uc.wait_storage_online(backup["uuid"],
+                                   int(self.cfg.get("rotation.wait_storage_sec", 3600)),
+                                   on_tick=lambda st, left: say(f"готовится… ({st})"))
+            removed = modes.cleanup_backups(ctx, force=True)
+            if removed:
+                say(f"убрано старых снимков: {len(removed)}")
+            return say(f"{ui.YES} снимок готов")
+
+        if action == "backup-del":
+            removed = modes.cleanup_backups(ctx, keep=0, force=True)
+            for storage in modes.orphan_backups(ctx):
+                try:
+                    uc.delete_storage(storage["uuid"])
+                    removed.append(storage["uuid"])
+                except Exception as exc:                       # noqa: BLE001
+                    say(f"{storage.get('title', '')[:30]} — не удалён: {exc}")
+            return say(f"{ui.YES} удалено снимков: {len(removed)}. Платы за них больше нет.")
+
+        if action.startswith("restore:"):
+            backup_uuid = action.split(":", 1)[1]
+            info = self.engine.refresh()
+            was_running = info["state"] == "started"
+            if was_running:
+                modes._stop_and_wait(ctx, uuid)
+            say("записываю снимок обратно на диск…")
+            uc.restore_backup(backup_uuid)
+            uc.wait_storage_online(info["storage_uuid"],
+                                   int(self.cfg.get("rotation.wait_storage_sec", 3600)),
+                                   on_tick=lambda st, left: say(f"восстановление… ({st})"))
+            if was_running:
+                modes._start_and_wait(ctx, uuid)
+            return say(f"{ui.YES} диск восстановлен, адрес {info['ipv4']} не менялся")
+
         if action in ("containers", "protocols", "docker-up", "docker-restart"):
             return self._remote_action(action, say)
 
@@ -1117,6 +1170,49 @@ class Bot:
             [{"text": "◀️ Назад", "callback_data": "srv:menu"}],
         ]
         self.send(body, rows)
+
+    def backups_menu(self) -> None:
+        """Снимок — страховка: из него нельзя поднять сервер напрямую, но можно
+        вернуть диск к прежнему состоянию."""
+        kept = self.engine.state["backups"]
+        keep = int(self.cfg.get("rotation.keep_backups", 1))
+        auto = self.cfg.get("rotation.backup_before_rotation", True)
+
+        rows = [f"{time.strftime('%d.%m %H:%M', time.localtime(b['created']))} · "
+                f"{b.get('size', '?')} ГБ · {b['zone']}" for b in kept]
+        body = ui.joined(
+            ui.title("Эталонные снимки", "💾"),
+            ui.block(rows) if rows else ui.note("снимков нет"),
+            ui.table([
+                ("снимок перед ротацией", "да" if auto else "нет"),
+                ("хранить снимков", keep),
+            ]),
+            ui.esc("Снимок дешевле образа и переживает удаление сервера. Развернуть "
+                   "из него сервер напрямую нельзя — он нужен, чтобы вернуть диск к "
+                   "прежнему состоянию, если новый сервер окажется сломанным."),
+        )
+        keyboard = [[{"text": "📷 Снять снимок сейчас", "callback_data": "srv:go:backup-now"}]]
+        if kept:
+            keyboard.append([{"text": "↩️ Восстановить диск из снимка", "callback_data": "srv:restore"}])
+            keyboard.append([{"text": "🗑 Удалить все снимки", "callback_data": "srv:ask:backup-del"}])
+        keyboard.append([{"text": "◀️ Назад", "callback_data": "srv:menu"}])
+        self.send(body, keyboard)
+
+    def restore_menu(self) -> None:
+        kept = self.engine.state["backups"]
+        if not kept:
+            return self.backups_menu()
+        rows = [[{"text": f"{time.strftime('%d.%m %H:%M', time.localtime(b['created']))} · "
+                          f"{b.get('size', '?')} ГБ",
+                  "callback_data": f"srv:ask:restore:{b['uuid']}"}] for b in kept[:8]]
+        rows.append([{"text": "◀️ Назад", "callback_data": "srv:backups"}])
+        self.send(ui.joined(
+            ui.title("Восстановить диск из снимка", "↩️"),
+            ui.esc("Данные снимка будут записаны ПОВЕРХ текущего диска сервера. "
+                   "Всё, что появилось после снятия снимка — новые клиенты, правки "
+                   "настроек — пропадёт. Сервер будет остановлен и запущен обратно."),
+            ui.note("Адрес сервера при этом не меняется."),
+        ), rows)
 
     def server_new(self) -> None:
         templates = self.engine.state["templates"]
@@ -1827,6 +1923,21 @@ class Bot:
                  [{"text": "🖥 Управление сервером", "callback_data": "srv:menu"}]])
         if data == "srv:menu":
             return self.server_menu()
+        if data == "srv:backups":
+            return self.backups_menu()
+        if data == "srv:restore":
+            return self.restore_menu()
+        if data.startswith("srv:ask:restore:"):
+            backup = data.split(":", 3)[3]
+            return self.send(
+                ui.joined(ui.title("Восстановить диск из снимка", ui.WARN),
+                          ui.esc("Данные снимка будут записаны поверх текущего диска. "
+                                 "Всё, что появилось после снятия снимка, пропадёт. "
+                                 "Сервер остановится и запустится обратно, адрес не изменится.")),
+                [[{"text": "↩️ Да, восстановить", "callback_data": f"srv:go:restore:{backup}"}],
+                 [{"text": "◀️ Отмена", "callback_data": "srv:backups"}]])
+        if data.startswith("srv:go:restore:"):
+            return self.server_action("restore:" + data.split(":", 3)[3])
         if data == "srv:docker":
             return self.docker_menu()
         if data == "srv:new":

@@ -121,6 +121,22 @@ def estimate(
             monthly(price, size / units),
         ))
 
+    # Снимки тарифицируются по своей, более низкой ставке.
+    backups = [s for s in storages if s.get("type") == "backup"]
+    backup_price = _price(zone, "storage_backup")
+    if backups and not backup_price:
+        out.unknown.append("цена снимков не найдена в прайсе")
+    for storage in backups:
+        if not backup_price:
+            break
+        price, units = backup_price
+        size = float(storage.get("size") or 0)
+        out.lines.append(Line(
+            "Эталонный снимок",
+            f"{storage.get('title', '')[:28]} · {size:g} ГБ",
+            monthly(price, size / units),
+        ))
+
     # Первый публичный IPv4 входит в план, остальные — платные.
     public_v4 = [ip for ip in ip_addresses
                  if ip.get("access") == "public" and ip.get("family") == "IPv4"]

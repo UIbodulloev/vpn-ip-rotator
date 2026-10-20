@@ -23,6 +23,7 @@ EMPTY: dict[str, Any] = {
     "eth0_mac": "",
     "floating_ip": "",
     "templates": [],          # [{"uuid", "zone", "created"}] — свежий первым
+    "backups": [],            # [{"uuid", "zone", "created", "size"}] — эталоны
     "history": [],            # [{"ts", "mode", "from", "to", "zone", "reason"}]
     "last_rotation_ts": 0,
     "rotations_today": {"date": "", "count": 0},
@@ -124,4 +125,17 @@ class State:
     def drop_template(self, uuid: str) -> None:
         with self._lock:
             self.data["templates"] = [t for t in self.data.get("templates", []) if t.get("uuid") != uuid]
+        self.save()
+
+    def add_backup(self, uuid: str, zone: str, size: int = 0) -> None:
+        with self._lock:
+            self.data["backups"] = [{"uuid": uuid, "zone": zone, "size": size,
+                                     "created": int(time.time())}] + [
+                b for b in self.data.get("backups", []) if b.get("uuid") != uuid
+            ]
+        self.save()
+
+    def drop_backup(self, uuid: str) -> None:
+        with self._lock:
+            self.data["backups"] = [b for b in self.data.get("backups", []) if b.get("uuid") != uuid]
         self.save()

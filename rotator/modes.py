@@ -215,6 +215,28 @@ def recreate(
     )
 
     try:
+        # Снимок снимается на работающем сервере, до остановки: это страховка на
+        # случай, если новый сервер окажется сломанным. Разворачивать сервер из
+        # снимка напрямую нельзя, поэтому образ всё равно понадобится отдельно.
+        if ctx.cfg.get("rotation.backup_before_rotation", True) and not data.get("backup_uuid"):
+            ctx.state.set_pending(CLONE, "backing-up", **data)
+            ctx.say(f"снимаю страховочный снимок диска {data['storage_size']} ГБ…")
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            try:
+                backup = ctx.uc.create_backup(
+                    data["storage_uuid"], f"rotator-backup-{data['hostname']}-{stamp}")
+                data["backup_uuid"] = backup.get("uuid", "")
+                ctx.state.add_backup(data["backup_uuid"], data["src_zone"],
+                                     int(data["storage_size"] or 0))
+                ctx.state.set_pending(CLONE, "backing-up", **data)
+                ctx.uc.wait_storage_online(
+                    data["backup_uuid"], int(ctx.cfg.get("rotation.wait_storage_sec", 3600)),
+                    on_tick=lambda st, left: ctx.say(f"снимок готовится… ({st})"))
+                ctx.say("снимок готов")
+            except UpCloudError as exc:
+                # Страховка важна, но её отсутствие не повод не менять адрес.
+                ctx.say(f"{'⚠️'} снимок не удался ({exc}) — продолжаю без него")
+
         if not data.get("stopped"):
             ctx.state.set_pending(CLONE, "stopping", **data)
             _stop_and_wait(ctx, old_uuid)
@@ -325,7 +347,11 @@ def recreate(
     # Точка невозврата пройдена — старый сервер больше не нужен.
     ctx.state.set_pending(CLONE, "deleting-old", **data)
     try:
-        ctx.uc.delete_server(old_uuid, storages=True, backups="delete")
+        # backups=keep обязателен, когда эталон хранится: иначе снимок удалится
+        # вместе с диском, от которого он снят.
+        keep_backups = int(ctx.cfg.get("rotation.keep_backups", 1))
+        ctx.uc.delete_server(old_uuid, storages=True,
+                             backups="keep" if keep_backups > 0 else "delete")
         ctx.say(f"старый сервер удалён, адрес {data['old_ip']} освобождён")
     except UpCloudError as exc:
         ctx.say(f"старый сервер удалить не удалось ({exc}) — удалите вручную, он тарифицируется")
@@ -333,6 +359,7 @@ def recreate(
     # force: отметка снимается чуть позже, в _finish, но здесь мы уже на успешном
     # пути — новый сервер поднят и DNS переписан, доигрывать нечего.
     cleanup_templates(ctx, extra=[data.get("clone_uuid", "")], force=True)
+    cleanup_backups(ctx, force=True)
     mode_name = CLONE if same_zone else MOVE
     return _finish(ctx, mode_name, data["old_ip"], data["new_ip"], target_zone, reason, dns)
 
@@ -454,6 +481,35 @@ def cleanup_templates(ctx: Ctx, *, keep: int | None = None, extra: list[str] | N
             else:
                 logger.warning("образ %s не удалён: %s", entry["uuid"], exc)
     return removed
+
+
+def cleanup_backups(ctx: Ctx, *, keep: int | None = None, force: bool = False) -> list[str]:
+    """Оставить N свежих эталонных снимков, остальные удалить."""
+    if keep is None:
+        keep = int(ctx.cfg.get("rotation.keep_backups", 1))
+    if ctx.state["pending"] and not force:
+        return []
+    removed: list[str] = []
+    for entry in list(ctx.state["backups"])[max(keep, 0):]:
+        try:
+            ctx.uc.delete_storage(entry["uuid"])
+            ctx.state.drop_backup(entry["uuid"])
+            removed.append(entry["uuid"])
+            logger.info("удалён снимок %s", entry["uuid"])
+        except UpCloudError as exc:
+            if exc.status == 404:
+                ctx.state.drop_backup(entry["uuid"])
+            else:
+                logger.warning("снимок %s не удалён: %s", entry["uuid"], exc)
+    return removed
+
+
+def orphan_backups(ctx: Ctx) -> list[dict[str, Any]]:
+    """Снимки ротатора, про которые state не знает."""
+    known = {entry["uuid"] for entry in ctx.state["backups"]}
+    return [s for s in ctx.uc.backups()
+            if s.get("uuid") not in known
+            and str(s.get("title") or "").startswith("rotator-backup-")]
 
 
 def orphan_templates(ctx: Ctx) -> list[dict[str, Any]]:

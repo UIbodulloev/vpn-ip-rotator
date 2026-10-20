@@ -174,6 +174,22 @@ class UpCloud:
     def storage(self, uuid: str) -> dict[str, Any]:
         return self._call("GET", f"/1.3/storage/{uuid}").get("storage", {})
 
+    def create_backup(self, storage_uuid: str, title: str) -> dict[str, Any]:
+        """Снимок диска. В отличие от образа, разворачивать сервер из него
+        напрямую нельзя — только клонировать в обычный диск."""
+        return self._call(
+            "POST", f"/1.3/storage/{storage_uuid}/backup", {"storage": {"title": title[:255]}},
+            timeout=120,
+        ).get("storage", {})
+
+    def backups(self, timeout: float | None = None) -> list[dict[str, Any]]:
+        return self._call("GET", "/1.3/storage/backup", timeout=timeout).get(
+            "storages", {}).get("storage", [])
+
+    def restore_backup(self, backup_uuid: str) -> None:
+        """Пишет данные бэкапа обратно в исходный диск. Сервер должен быть остановлен."""
+        self._call("POST", f"/1.3/storage/{backup_uuid}/restore", {}, timeout=120)
+
     def templatize(self, storage_uuid: str, title: str) -> dict[str, Any]:
         return self._call(
             "POST", f"/1.3/storage/{storage_uuid}/templatize", {"storage": {"title": title[:255]}}, timeout=120
