@@ -115,6 +115,10 @@ class FakeCloud:
 
     # --- маршрутизация ------------------------------------------------------
 
+    def health(self) -> dict[str, str]:
+        """Фейк притворяется и релеем — так /check проходит целиком."""
+        return {"https://relay.test": "ok"}
+
     def request(self, upstream: str, method: str, path: str, *, json=None, headers=None,
                 params=None, timeout=None) -> FakeResponse:
         self.calls.append((method.upper(), path))

@@ -219,6 +219,24 @@ class SetupWizardTest(unittest.TestCase):
         self.assertTrue(self.h.tg.deleted, "сообщение с токеном не удалено")
         self.assertNotIn(GOOD_UC, self.h.tg.all_visible(), "секрет утёк в ответ")
 
+    def test_в_справке_нет_дублирующихся_определений(self):
+        """Дубликат NAME = \"\"\"…\"\"\" тихо затирает первый, и правки уходят в мёртвый код."""
+        import re
+        from pathlib import Path as _P
+        src = _P(__file__).resolve().parents[1].joinpath("rotator/guide.py").read_text()
+        names = re.findall(r'^([A-Z_]+) = """', src, re.M)
+        duplicates = {n for n in names if names.count(n) > 1}
+        self.assertEqual(duplicates, set(), f"определены дважды: {duplicates}")
+
+    def test_в_справке_нет_разнобоя_в_названиях(self):
+        """Договорились на двух названиях: Storage Template и Backup."""
+        from rotator import guide
+        banned = ("образ", "снимок", "снимк", "эталон")
+        for page, (_heading, body) in guide.PAGES.items():
+            lowered = body.lower()
+            found = [w for w in banned if w in lowered]
+            self.assertEqual(found, [], f"страница {page}: синонимы {found}")
+
     def test_справка_открывается_и_влезает_в_лимит(self):
         from rotator import guide
         for page in guide.PAGES:
@@ -334,8 +352,47 @@ class SetupWizardTest(unittest.TestCase):
         self.h.tg.user_says("/menu")
         self.h.pump()
         buttons = [d for _, d in self.h.tg.buttons()]
-        for target in ("cmd:status", "cmd:rotate", "srv:menu", "wiz:board", "guide:menu"):
+        for target in ("cmd:status", "cmd:rotate", "srv:menu", "cmd:costs",
+                       "cmd:settings", "guide:menu"):
             self.assertIn(target, buttons, f"из меню не попасть в {target}")
+
+    def test_настройки_собирают_всё_в_одном_месте(self):
+        self.h.secrets.set("UPCLOUD_TOKEN", GOOD_UC)
+        self.h.secrets.set("SERVER_UUID", self.h.server_uuid)
+        self.h.tg.user_taps("cmd:settings")
+        self.h.pump()
+        buttons = [d for _, d in self.h.tg.buttons()]
+        for target in ("set:auto", "srv:storage", "wiz:board", "wiz:check", "cmd:diag"):
+            self.assertIn(target, buttons, f"в настройках нет {target}")
+
+    def test_ни_одна_кнопка_не_ведёт_в_никуда(self):
+        """Обход всех экранов: каждая кнопка должна что-то открывать."""
+        self.h.secrets.set("UPCLOUD_TOKEN", GOOD_UC)
+        self.h.secrets.set("SERVER_UUID", self.h.server_uuid)
+        self.h.secrets.set("CF_TOKEN", GOOD_CF)
+        self.h.secrets.set("CF_ZONE_ID", "zone1")
+        self.h.secrets.set("CF_A_RECORD_ID", "rec-a")
+
+        seen: set[str] = set()
+        queue = ["cmd:menu"]
+        # Эти кнопки что-то реально меняют — по ним не ходим.
+        destructive = ("srv:go:", "go:", "wiz:unstick", "auto:toggle", "policy:",
+                       "costs:prune", "addchat:", "ssh:gen", "mode:", "cmd:rotate")
+        while queue:
+            data = queue.pop()
+            if data in seen:
+                continue
+            seen.add(data)
+            self.h.tg.timeline.clear()
+            self.h.tg.sent.clear()
+            self.h.tg.user_taps(data)
+            self.h.pump()
+            self.assertTrue(self.h.tg.timeline, f"кнопка {data} ничего не открыла")
+            for _text, target in self.h.tg.buttons():
+                if target and not target.startswith(destructive):
+                    queue.append(target)
+        # Для осмысленности обхода: экранов должно быть много, а не три.
+        self.assertGreater(len(seen), 12, f"обошли слишком мало экранов: {sorted(seen)}")
 
     def test_меню_сервера_показывает_состояние_и_действия(self):
         self.h.secrets.set("UPCLOUD_TOKEN", GOOD_UC)

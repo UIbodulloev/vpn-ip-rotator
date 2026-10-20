@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from . import costs, guide, log, modes, probes, remote, sshkeys, ui
-from .config import Secrets, domain_of, masked
+from .config import Secrets, domain_of, masked, set_tuned, tuned
 from .engine import Engine
 from .relay import Relay
 
@@ -38,6 +38,23 @@ REQUIRED_STEPS = [
     ("CF_A_RECORD_ID", "Домен и DNS-запись"),
 ]
 
+# Что остаётся между ротациями. Storage Template обязателен во время операции,
+# вопрос только в том, удалять его после или держать.
+STORAGE_POLICIES = [
+    ("none", "Ничего не хранить", 0, 0,
+     "Storage Template делается на время ротации и удаляется после. Между ротациями "
+     "платить не за что, но и восстановить сервер будет нечем."),
+    ("bkp", "Только Backup", 1, 0,
+     "Самый свежий Backup хранится как страховка: дешевле Storage Template и "
+     "переживает удаление сервера. Развернуть из него сервер напрямую нельзя."),
+    ("tpl", "Только Storage Template", 0, 1,
+     "Storage Template не удаляется после ротации — из него можно поднять сервер "
+     "заново через /rollback. Дороже Backup."),
+    ("both", "Backup и Storage Template", 1, 1,
+     "И страховка, и точка отката. Самый дорогой вариант."),
+]
+
+
 OPTIONAL_KEYS = [
     ("UPCLOUD_ADMIN_TOKEN", "Админ-токен UpCloud", "чтобы recreate работал под субаккаунтом"),
     ("UPCLOUD_SUBACCOUNT", "Логин субаккаунта", "в паре с админ-токеном"),
@@ -50,7 +67,8 @@ OPTIONAL_KEYS = [
 # Telegram (setMyCommands), чтобы они не разъезжались.
 COMMANDS = [
     ("menu", "единое меню: всё управление в одном месте"),
-    ("server", "управление сервером: стоп, старт, шаблон, контейнеры"),
+    ("server", "управление сервером: питание, хранение, контейнеры"),
+    ("settings", "настройки: автоматика, хранение, доступы"),
     ("status", "адрес, состояние сервера, последние пробы"),
     ("probe", "проверить доступность VPN прямо сейчас"),
     ("ip", "что у сервера и что стоит в DNS"),
@@ -68,7 +86,7 @@ COMMANDS = [
     ("guide", "справка: как работает, режимы, ключи, проверки"),
     ("zones", "зоны UpCloud"),
     ("plans", "планы UpCloud"),
-    ("rollback", "пересоздать сервер из последнего шаблона"),
+    ("rollback", "пересоздать сервер из последнего Storage Template"),
 ]
 
 def _help_text() -> str:
@@ -82,7 +100,7 @@ def _help_text() -> str:
 
 
 HELP_GROUPS = [
-    ('Главное', ['menu', 'server']),
+    ('Главное', ['menu', 'server', 'settings']),
     ('Наблюдение', ['status', 'probe', 'ip', 'log']),
     ('Проверка вхолостую', ['simulate', 'plan', 'costs']),
     ('Управление', ['rotate', 'mode', 'pause', 'resume', 'rollback']),
@@ -429,6 +447,8 @@ class Bot:
             self.main_menu()
         elif command == "/server":
             self.server_menu()
+        elif command == "/settings":
+            self.settings_menu()
         elif command == "/status":
             self.send(self.status_text(), MAIN_KEYBOARD)
         elif command == "/probe":
@@ -617,32 +637,31 @@ class Bot:
             same = target == info["zone"]
             steps_list = []
             if self.cfg.get("rotation.backup_before_rotation", True):
-                steps_list.append(("Снять страховочный снимок",
-                                   "на работающем сервере, до остановки"))
+                steps_list.append(("Сделать Backup",
+                                   "на работающем сервере, до остановки — страховка"))
             plan = ui.steps(steps_list + [
-                ("Остановить сервер", "образ снимается только с остановленного"),
-                (f"Снять шаблон диска {info['storage_size']} ГБ",
+                ("Остановить сервер", "Storage Template делается только с остановленного"),
+                (f"Сделать Storage Template, {info['storage_size']} ГБ",
                  "внутри всё: ключи, клиенты, swap, authorized_keys"),
             ] + ([] if same else [(f"Скопировать диск в {target}", "самый долгий шаг, до получаса")]) + [
-                (f"Создать сервер {info['plan']} в {target}", "из шаблона, адрес выдаётся бесплатно"),
+                (f"Создать сервер {info['plan']} в {target}", "из Storage Template, адрес бесплатный"),
                 (f"Переписать A и AAAA {domain}", "старые конфиги клиентов остаются рабочими"),
                 ("Удалить старый сервер", f"адрес {info['ipv4']} освобождается автоматически"),
-                ("Удалить образ диска",
+                ("Удалить Storage Template",
                  "сразу после успеха — он тарифицируется, пока существует"
                  if int(self.cfg.get("rotation.keep_templates", 0)) == 0
                  else f"оставляем {self.cfg.get('rotation.keep_templates')} как точку отката, "
                       "за ежемесячную плату"),
-            ] + ([("Оставить снимок как эталон",
-                   f"хранится {self.cfg.get('rotation.keep_backups')}, "
+            ] + ([("Оставить Backup",
                    "переживает удаление старого сервера")]
-                 if int(self.cfg.get("rotation.keep_backups", 1)) > 0 else []))
+                 if int(tuned(self.cfg, self.engine.state, "keep_backups", 1)) > 0 else []))
             cost = [
                 "даунтайм ~5–10 минут" + ("" if same else " плюс копирование диска"),
                 "адрес бесплатный, остаток за старый сервер возвращается на счёт",
-                (f"образ {info['storage_size']} ГБ живёт только во время операции"
-                 if int(self.cfg.get("rotation.keep_templates", 0)) == 0
-                 else f"образ {info['storage_size']} ГБ остаётся и тарифицируется ежемесячно"),
-                "конфиги клиентов не меняются: ключи внутри шаблона",
+                (f"Storage Template {info['storage_size']} ГБ живёт только во время операции"
+                 if int(tuned(self.cfg, self.engine.state, "keep_templates", 0)) == 0
+                 else f"Storage Template {info['storage_size']} ГБ остаётся и тарифицируется"),
+                "конфиги клиентов не меняются: ключи внутри Storage Template",
             ]
 
         else:
@@ -721,12 +740,12 @@ class Bot:
         ]
         rows = [[{"text": "📖 Подробнее про деньги", "callback_data": "guide:money"}]]
         if any(line.what == "Шаблон диска" for line in result.lines):
-            rows.insert(0, [{"text": "🧹 Убрать лишние шаблоны", "callback_data": "costs:prune"}])
+            rows.insert(0, [{"text": "🧹 Убрать лишнее", "callback_data": "costs:prune"}])
         self.edit(message_id, ui.joined(*blocks), rows)
 
     def prune_templates(self) -> None:
-        """Убрать образы диска — и те, что в state, и осиротевшие от прошлых сбоев."""
-        message_id = self.send(f"{ui.WAIT} Убираю образы…")
+        """Убрать Storage Template — и те, что в state, и осиротевшие от прошлых сбоев."""
+        message_id = self.send(f"{ui.WAIT} Убираю Storage Template…")
         ctx = self.engine.ctx(lambda _t: None)
         lines: list[str] = []
 
@@ -747,13 +766,13 @@ class Bot:
                 lines.append(f"{storage.get('title', '')[:30]} — не удалён: {exc}")
 
         keep = int(self.cfg.get("rotation.keep_templates", 0))
-        tail = (ui.note("keep_templates = 0: образ живёт только во время ротации — "
-                        "ежемесячной платы за него нет")
+        tail = (ui.note("Storage Template не хранится: живёт только во время ротации, "
+                        "ежемесячной платы нет")
                 if keep == 0 else
-                ui.note(f"keep_templates = {keep}: последний образ оставлен как точка "
-                        "отката для /rollback и продолжает тарифицироваться"))
+                ui.note(f"Хранится Storage Template ({keep}) — точка отката для /rollback, "
+                        "тарифицируется ежемесячно"))
         self.edit(message_id, ui.joined(
-            ui.title("Уборка образов", ui.YES), ui.block(lines), tail,
+            ui.title("Уборка", ui.YES), ui.block(lines), tail,
         ), [[{"text": "💶 Пересчитать расходы", "callback_data": "cmd:costs"}]])
 
     def cmd_simulate(self) -> None:
@@ -845,9 +864,7 @@ class Bot:
         if argument in choices:
             self.engine.state["mode"] = "" if argument == "auto" else argument
             return self.send(f"Режим автоматики: {argument}")
-        keyboard = [[{"text": c, "callback_data": f"mode:{c}"}] for c in choices]
-        keyboard.append([{"text": "❓ чем они отличаются", "callback_data": "guide:modes"}])
-        self.send("Какой режим использовать автоматике?", keyboard)
+        return self.automation_menu()
 
     def cmd_zones(self) -> None:
         try:
@@ -876,31 +893,77 @@ class Bot:
 
     def main_menu(self) -> None:
         state = self.engine.state
-        verdict = state["last_verdict"]
         head = ui.joined(
             ui.title("vpn-ip-rotator", "🤖"),
             ui.table([
                 ("сервер", state["ipv4"] or "не выбран"),
                 ("локация", state["zone"] or "—"),
                 ("домен", domain_of(self.cfg, self.secrets) or "—"),
-                ("состояние", probes.VERDICT_TEXT.get(verdict, "проверок ещё не было")),
+                ("состояние", probes.VERDICT_TEXT.get(state["last_verdict"],
+                                                      "проверок ещё не было")),
             ]),
-            ui.note("dry_run включён — ротации только имитируются" if self.cfg.get("dry_run")
-                    else "боевой режим"),
+            ui.note("dry_run включён — ротации только имитируются"
+                    if self.cfg.get("dry_run") else "боевой режим"),
         )
         self.send(head, [
             [{"text": "📊 Состояние", "callback_data": "cmd:status"},
              {"text": "🔍 Проверить", "callback_data": "cmd:probe"}],
             [{"text": "🔄 Сменить адрес", "callback_data": "cmd:rotate"}],
-            [{"text": "🖥 Управление сервером", "callback_data": "srv:menu"}],
-            [{"text": "🧪 Вхолостую", "callback_data": "cmd:simulate"},
-             {"text": "📋 Что произойдёт", "callback_data": "cmd:plan"}],
-            [{"text": "💶 Расходы", "callback_data": "cmd:costs"}],
-            [{"text": "⚙️ Настройка", "callback_data": "wiz:board"},
+            [{"text": "🖥 Сервер", "callback_data": "srv:menu"},
+             {"text": "💶 Расходы", "callback_data": "cmd:costs"}],
+            [{"text": "⚙️ Настройки", "callback_data": "cmd:settings"},
              {"text": "📖 Инструкция", "callback_data": "guide:menu"}],
         ])
 
-    # --- ручное управление сервером ------------------------------------------
+    # --- настройки -----------------------------------------------------------
+
+    def settings_menu(self) -> None:
+        state = self.engine.state
+        mode = state["mode"] or self.cfg.get("rotation.mode", "auto")
+        done = sum(1 for key, _ in REQUIRED_STEPS if self.secrets.get(key))
+        head = ui.joined(
+            ui.title("Настройки", "⚙️"),
+            ui.table([
+                ("автоматика", f"{mode}" + ("  ⏸ пауза" if state["paused"] else "")),
+                ("хранение", self.policy_title()),
+                ("доступы", f"{done} из {len(REQUIRED_STEPS)}"),
+            ]),
+        )
+        self.send(head, [
+            [{"text": "🤖 Автоматика", "callback_data": "set:auto"},
+             {"text": "💾 Хранение", "callback_data": "srv:storage"}],
+            [{"text": "🔑 Доступы", "callback_data": "wiz:board"},
+             {"text": "✅ Проверка", "callback_data": "wiz:check"}],
+            [{"text": "🩺 Диагностика", "callback_data": "cmd:diag"}],
+            [{"text": "◀️ Меню", "callback_data": "cmd:menu"}],
+        ])
+
+    def automation_menu(self) -> None:
+        state = self.engine.state
+        current = state["mode"] or self.cfg.get("rotation.mode", "auto")
+        human = {"auto": "auto — выбирать самому", **{
+            m: modes.MODE_TITLES[m] for m in modes.ALL_MODES}}
+        rows = [[{"text": ("▸ " if c == current else "") + human[c],
+                  "callback_data": f"mode:{c}"}]
+                for c in ("auto",) + modes.ALL_MODES]
+        rows.append([{"text": "▶️ Включить" if state["paused"] else "⏸ Поставить на паузу",
+                      "callback_data": "auto:toggle"}])
+        rows.append([{"text": "❓ Чем режимы отличаются", "callback_data": "guide:modes"}])
+        rows.append([{"text": "◀️ Настройки", "callback_data": "cmd:settings"}])
+        self.send(ui.joined(
+            ui.title("Автоматика", "🤖"),
+            ui.table([
+                ("режим", current),
+                ("состояние", "на паузе" if state["paused"] else "работает"),
+                ("проверка каждые", f"{self.cfg.get('detector.interval_sec')} с"),
+                ("порог", f"{self.cfg.get('detector.fail_threshold')} неудач подряд"),
+                ("не чаще", f"{self.cfg.get('rotation.max_per_day')} раз в сутки"),
+            ]),
+            ui.esc("auto сам выбирает: сначала копия в той же локации, потом переезд "
+                   "в другую, потом останавливается и зовёт вас."),
+        ), rows)
+
+    # --- ручное управление сервером ---    # --- ручное управление сервером ------------------------------------------
 
     def server_menu(self) -> None:
         try:
@@ -920,8 +983,8 @@ class Bot:
                 ("адрес", info["ipv4"]),
                 ("локация", f"{info['zone']} · {info['plan']}"),
                 ("диск", f"{info['storage_size']} ГБ, {info['storage_tier'] or 'standard'}"),
-                ("образов", len(templates)),
-                ("снимков", len(self.engine.state["backups"])),
+                ("Storage Template", len(templates)),
+                ("Backup", len(self.engine.state["backups"])),
             ]),
             ui.note("Действия ниже выполняются вручную и не трогают DNS, "
                     "если не сказано иное."),
@@ -930,9 +993,9 @@ class Bot:
                  if running else [{"text": "▶️ Запустить", "callback_data": "srv:go:start"}])
         self.send(head, [
             power + [{"text": "🔁 Перезагрузить", "callback_data": "srv:ask:reboot"}],
-            [{"text": "📸 Снять образ (дамп)", "callback_data": "srv:ask:template"}],
-            [{"text": "💾 Эталонные снимки", "callback_data": "srv:backups"}],
-            [{"text": "🆕 Поднять сервер из шаблона", "callback_data": "srv:new"}],
+            [{"text": "📸 Сделать Storage Template", "callback_data": "srv:ask:template"}],
+            [{"text": "💾 Хранение: Backup и Template", "callback_data": "srv:storage"}],
+            [{"text": "🆕 Поднять сервер из Storage Template", "callback_data": "srv:new"}],
             [{"text": "🐳 Контейнеры", "callback_data": "srv:docker"},
              {"text": "🔍 Протоколы", "callback_data": "srv:go:protocols"}],
             [{"text": "🗑 Удалить сервер", "callback_data": "srv:ask:delete"}],
@@ -946,16 +1009,19 @@ class Bot:
         "reboot": ("Перезагрузить сервер",
                    "Мягкая остановка и запуск. VPN недоступен около минуты. "
                    "Адрес не меняется.", "🔁 Да, перезагрузить"),
-        "template": ("Снять шаблон диска",
+        "template": ("Сделать Storage Template",
                      "Сервер будет остановлен на время снятия, потом запущен обратно. "
                      "Шаблон — это дамп: ключи, клиенты, настройки. "
                      "Он тарифицируется как дополнительное хранилище.", "📸 Да, снять"),
-        "backup-del": ("Удалить все снимки",
-                       "Эталонные снимки будут удалены безвозвратно. Платы за них не станет, "
-                       "но и вернуть диск к прежнему состоянию будет нечем.", "🗑 Да, удалить"),
+        "storage-del": ("Удалить всё хранящееся",
+                        "Все Backup и Storage Template будут удалены безвозвратно. Платы за "
+                        "них не станет, но восстановить сервер будет нечем.", "🧹 Да, удалить"),
+        "backup-del": ("Удалить все Backup",
+                       "Backup будут удалены безвозвратно. Платы за них не станет, но и "
+                       "вернуть диск к прежнему состоянию будет нечем.", "🗑 Да, удалить"),
         "delete": ("Удалить сервер",
                    "СЕРВЕР И ЕГО ДИСК БУДУТ УДАЛЕНЫ БЕЗВОЗВРАТНО, адрес освободится. "
-                   "Если шаблона нет — восстановить будет нечем. "
+                   "Если нет ни Backup, ни Storage Template — восстановить будет нечем. "
                    "Обычно вместо этого нужен «Сменить адрес».", "🗑 Да, удалить навсегда"),
     }
 
@@ -1019,13 +1085,13 @@ class Bot:
             was_running = info["state"] == "started"
             if was_running:
                 modes._stop_and_wait(ctx, uuid)
-            say(f"снимаю шаблон диска {info['storage_size']} ГБ…")
+            say(f"делаю Storage Template, {info['storage_size']} ГБ…")
             stamp = time.strftime("%Y%m%d-%H%M%S")
             template = uc.templatize(info["storage_uuid"], f"manual-{info['hostname']}-{stamp}")
             uc.wait_storage_online(template["uuid"], int(self.cfg.get("rotation.wait_storage_sec", 3600)),
                                    on_tick=lambda st, left: say(f"готовится… ({st})"))
             self.engine.state.add_template(template["uuid"], info["zone"])
-            say(f"{ui.YES} шаблон {template['uuid'][:8]}… готов")
+            say(f"{ui.YES} Storage Template {template['uuid'][:8]}… готов")
             if was_running:
                 modes._start_and_wait(ctx, uuid)
                 say("сервер запущен обратно")
@@ -1044,7 +1110,7 @@ class Bot:
 
         if action == "backup-now":
             info = self.engine.refresh()
-            say(f"снимаю снимок диска {info['storage_size']} ГБ…")
+            say(f"делаю Backup, {info['storage_size']} ГБ…")
             stamp = time.strftime("%Y%m%d-%H%M%S")
             backup = uc.create_backup(info["storage_uuid"],
                                       f"rotator-backup-{info['hostname']}-{stamp}")
@@ -1055,18 +1121,26 @@ class Bot:
                                    on_tick=lambda st, left: say(f"готовится… ({st})"))
             removed = modes.cleanup_backups(ctx, force=True)
             if removed:
-                say(f"убрано старых снимков: {len(removed)}")
-            return say(f"{ui.YES} снимок готов")
+                say(f"убрано старых Backup: {len(removed)}")
+            return say(f"{ui.YES} Backup готов")
 
-        if action == "backup-del":
+        if action in ("backup-del", "storage-del"):
             removed = modes.cleanup_backups(ctx, keep=0, force=True)
+            if action == "storage-del":
+                removed += modes.cleanup_templates(ctx, keep=0, force=True)
+                for storage in modes.orphan_templates(ctx):
+                    try:
+                        uc.delete_storage(storage["uuid"])
+                        removed.append(storage["uuid"])
+                    except Exception as exc:                   # noqa: BLE001
+                        say(f"{storage.get('title', '')[:30]} — не удалён: {exc}")
             for storage in modes.orphan_backups(ctx):
                 try:
                     uc.delete_storage(storage["uuid"])
                     removed.append(storage["uuid"])
                 except Exception as exc:                       # noqa: BLE001
                     say(f"{storage.get('title', '')[:30]} — не удалён: {exc}")
-            return say(f"{ui.YES} удалено снимков: {len(removed)}. Платы за них больше нет.")
+            return say(f"{ui.YES} удалено: {len(removed)}. Платы за это больше нет.")
 
         if action.startswith("restore:"):
             backup_uuid = action.split(":", 1)[1]
@@ -1074,7 +1148,7 @@ class Bot:
             was_running = info["state"] == "started"
             if was_running:
                 modes._stop_and_wait(ctx, uuid)
-            say("записываю снимок обратно на диск…")
+            say("записываю Backup обратно на диск…")
             uc.restore_backup(backup_uuid)
             uc.wait_storage_online(info["storage_uuid"],
                                    int(self.cfg.get("rotation.wait_storage_sec", 3600)),
@@ -1115,7 +1189,7 @@ class Bot:
         templates = self.engine.state["templates"]
         entry = next((x for x in templates if x["uuid"] == template_uuid), None)
         if not entry:
-            return say(f"{ui.NO} шаблон не найден — снимите новый")
+            return say(f"{ui.NO} Storage Template не найден — сделайте новый")
         state = self.engine.state
         spec = {
             "zone": entry["zone"],
@@ -1138,8 +1212,8 @@ class Bot:
             spec["login_user"] = {"username": "root", "ssh_keys": {"ssh_key": [pubkey]}}
         else:
             say(f"{ui.WARN} публичный SSH-ключ не задан — доступ будет только тем, "
-                "что запечён в шаблоне")
-        say(f"создаю сервер в {entry['zone']} из шаблона {entry['uuid'][:8]}…")
+                "что запечён в Storage Template")
+        say(f"создаю сервер в {entry['zone']} из Storage Template {entry['uuid'][:8]}…")
         created = self.engine.uc.create_server(spec)
         new_uuid = created.get("uuid", "")
         server = self.engine.uc.wait_server_state(
@@ -1171,41 +1245,113 @@ class Bot:
         ]
         self.send(body, rows)
 
-    def backups_menu(self) -> None:
-        """Снимок — страховка: из него нельзя поднять сервер напрямую, но можно
-        вернуть диск к прежнему состоянию."""
-        kept = self.engine.state["backups"]
-        keep = int(self.cfg.get("rotation.keep_backups", 1))
-        auto = self.cfg.get("rotation.backup_before_rotation", True)
+    def policy_key(self) -> str:
+        backups = int(tuned(self.cfg, self.engine.state, "keep_backups", 1))
+        templates = int(tuned(self.cfg, self.engine.state, "keep_templates", 0))
+        for key, _title, kb, kt, _why in STORAGE_POLICIES:
+            if (kb > 0) == (backups > 0) and (kt > 0) == (templates > 0):
+                return key
+        return "none"
 
-        rows = [f"{time.strftime('%d.%m %H:%M', time.localtime(b['created']))} · "
-                f"{b.get('size', '?')} ГБ · {b['zone']}" for b in kept]
-        body = ui.joined(
-            ui.title("Эталонные снимки", "💾"),
-            ui.block(rows) if rows else ui.note("снимков нет"),
-            ui.table([
-                ("снимок перед ротацией", "да" if auto else "нет"),
-                ("хранить снимков", keep),
-            ]),
-            ui.esc("Снимок дешевле образа и переживает удаление сервера. Развернуть "
-                   "из него сервер напрямую нельзя — он нужен, чтобы вернуть диск к "
-                   "прежнему состоянию, если новый сервер окажется сломанным."),
-        )
-        keyboard = [[{"text": "📷 Снять снимок сейчас", "callback_data": "srv:go:backup-now"}]]
-        if kept:
-            keyboard.append([{"text": "↩️ Восстановить диск из снимка", "callback_data": "srv:restore"}])
-            keyboard.append([{"text": "🗑 Удалить все снимки", "callback_data": "srv:ask:backup-del"}])
-        keyboard.append([{"text": "◀️ Назад", "callback_data": "srv:menu"}])
-        self.send(body, keyboard)
+    def policy_title(self) -> str:
+        key = self.policy_key()
+        return next(title for k, title, _kb, _kt, _why in STORAGE_POLICIES if k == key)
+
+    def _storage_prices(self) -> dict[str, float]:
+        """Сколько в месяц стоит хранить Backup и Storage Template этого диска."""
+        state = self.engine.state
+        size = 0
+        try:
+            info = self.engine.refresh()
+            size = float(info["storage_size"] or 0)
+            tier = info["storage_tier"] or "standard"
+            zone = costs.zone_prices(self.engine.uc.prices(timeout=UI_TIMEOUT), info["zone"])
+        except Exception as exc:                               # noqa: BLE001
+            logger.info("цены хранения не получены: %s", exc)
+            return {}
+        out: dict[str, float] = {}
+        for name, keys in (("bkp", ("storage_backup",)),
+                           ("tpl", (f"storage_{tier}", "storage_maxiops", "storage_standard"))):
+            for key in keys:
+                entry = zone.get(key)
+                if isinstance(entry, dict) and "price" in entry:
+                    out[name] = costs.monthly(float(entry["price"]),
+                                              size / float(entry.get("amount") or 1))
+                    break
+        return out
+
+    def storage_menu(self) -> None:
+        """Единый экран: что хранится, во что это обходится и чем управлять."""
+        state = self.engine.state
+        backups, templates = state["backups"], state["templates"]
+        auto = tuned(self.cfg, state, "backup_before_rotation", True)
+        current = self.policy_key()
+        prices = self._storage_prices()
+
+        def cost_of(kb: int, kt: int) -> str:
+            if not prices:
+                return ""
+            total = kb * prices.get("bkp", 0) + kt * prices.get("tpl", 0)
+            return f"  ~{total:.2f}/мес"
+
+        rows = [[{"text": ("▸ " if key == current else "   ") + title + cost_of(kb, kt),
+                  "callback_data": f"policy:{key}"}]
+                for key, title, kb, kt, _why in STORAGE_POLICIES]
+        rows.append([{"text": f"{'🔴 Выключить' if auto else '🟢 Включить'} Backup перед ротацией",
+                      "callback_data": "policy:toggle-backup"}])
+        rows.append([{"text": "📷 Сделать Backup сейчас", "callback_data": "srv:go:backup-now"}])
+        if backups:
+            rows.append([{"text": "↩️ Восстановить диск из Backup", "callback_data": "srv:restore"}])
+        if backups or templates:
+            rows.append([{"text": "🧹 Удалить всё хранящееся", "callback_data": "srv:ask:storage-del"}])
+        rows.append([{"text": "❓ Чем Backup отличается от Template",
+                      "callback_data": "guide:money"}])
+        rows.append([{"text": "◀️ Настройки", "callback_data": "cmd:settings"}])
+
+        stored = []
+        for entry in backups:
+            stored.append(f"Backup · {time.strftime('%d.%m %H:%M', time.localtime(entry['created']))}"
+                          f" · {entry.get('size', '?')} ГБ")
+        for entry in templates:
+            stored.append(f"Storage Template · "
+                          f"{time.strftime('%d.%m %H:%M', time.localtime(entry['created']))}"
+                          f" · {entry['zone']}")
+
+        why = next(w for k, _t, _kb, _kt, w in STORAGE_POLICIES if k == current)
+        self.send(ui.joined(
+            ui.title("Хранение", "💾"),
+            ui.table([("режим", self.policy_title()),
+                      ("Backup перед ротацией", "да" if auto else "нет")]),
+            ui.note(why),
+            ui.title("Сейчас хранится"),
+            ui.block(stored) if stored else ui.note("ничего"),
+        ), rows)
+
+    def apply_policy(self, key: str) -> None:
+        if key == "toggle-backup":
+            now = bool(tuned(self.cfg, self.engine.state, "backup_before_rotation", True))
+            set_tuned(self.engine.state, "backup_before_rotation", not now)
+            return self.storage_menu()
+        found = next((p for p in STORAGE_POLICIES if p[0] == key), None)
+        if not found:
+            return self.storage_menu()
+        _key, title, keep_backups, keep_templates, _why = found
+        set_tuned(self.engine.state, "keep_backups", keep_backups)
+        set_tuned(self.engine.state, "keep_templates", keep_templates)
+        self.send(ui.joined(
+            ui.title(f"Режим хранения: {title}", ui.YES),
+            ui.esc("Применится при следующей ротации. Уже лежащее можно убрать "
+                   "кнопкой «Удалить всё хранящееся»."),
+        ), [[{"text": "💾 К хранению", "callback_data": "srv:storage"}]])
 
     def restore_menu(self) -> None:
         kept = self.engine.state["backups"]
         if not kept:
-            return self.backups_menu()
+            return self.storage_menu()
         rows = [[{"text": f"{time.strftime('%d.%m %H:%M', time.localtime(b['created']))} · "
                           f"{b.get('size', '?')} ГБ",
                   "callback_data": f"srv:ask:restore:{b['uuid']}"}] for b in kept[:8]]
-        rows.append([{"text": "◀️ Назад", "callback_data": "srv:backups"}])
+        rows.append([{"text": "◀️ Назад", "callback_data": "srv:storage"}])
         self.send(ui.joined(
             ui.title("Восстановить диск из снимка", "↩️"),
             ui.esc("Данные снимка будут записаны ПОВЕРХ текущего диска сервера. "
@@ -1923,8 +2069,17 @@ class Bot:
                  [{"text": "🖥 Управление сервером", "callback_data": "srv:menu"}]])
         if data == "srv:menu":
             return self.server_menu()
-        if data == "srv:backups":
-            return self.backups_menu()
+        if data in ("srv:storage", "srv:backups"):
+            return self.storage_menu()
+        if data == "cmd:settings":
+            return self.settings_menu()
+        if data == "set:auto":
+            return self.automation_menu()
+        if data == "auto:toggle":
+            self.engine.state["paused"] = not self.engine.state["paused"]
+            return self.automation_menu()
+        if data.startswith("policy:"):
+            return self.apply_policy(data.split(":", 1)[1])
         if data == "srv:restore":
             return self.restore_menu()
         if data.startswith("srv:ask:restore:"):
@@ -1935,7 +2090,7 @@ class Bot:
                                  "Всё, что появилось после снятия снимка, пропадёт. "
                                  "Сервер остановится и запустится обратно, адрес не изменится.")),
                 [[{"text": "↩️ Да, восстановить", "callback_data": f"srv:go:restore:{backup}"}],
-                 [{"text": "◀️ Отмена", "callback_data": "srv:backups"}]])
+                 [{"text": "◀️ Отмена", "callback_data": "srv:storage"}]])
         if data.startswith("srv:go:restore:"):
             return self.server_action("restore:" + data.split(":", 3)[3])
         if data == "srv:docker":

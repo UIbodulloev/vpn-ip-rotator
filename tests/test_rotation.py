@@ -392,7 +392,7 @@ class BackupTest(unittest.TestCase):
         self.h.engine.notify = said.append
         result = self.h.engine.rotate(modes.CLONE, force=True)
         self.assertTrue(result["new_ip"], "ротация не прошла из-за неудачного снимка")
-        self.assertTrue(any("снимок не удался" in s for s in said))
+        self.assertTrue(any("Backup не удался" in s for s in said))
 
     def test_осиротевшие_снимки_находятся(self):
         self.h.cloud.storages["lost"] = {"uuid": "lost", "state": "online", "size": 10,

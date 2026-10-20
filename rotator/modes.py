@@ -15,7 +15,7 @@ from typing import Any, Callable
 
 from . import log, upcloud
 from .clouddns import Cloudflare
-from .config import Config, Secrets, domain_of
+from .config import Config, Secrets, domain_of, tuned
 from .probes import tcp_open
 from .state import State
 from .upcloud import UpCloud, UpCloudError
@@ -215,12 +215,11 @@ def recreate(
     )
 
     try:
-        # Снимок снимается на работающем сервере, до остановки: это страховка на
-        # случай, если новый сервер окажется сломанным. Разворачивать сервер из
-        # снимка напрямую нельзя, поэтому образ всё равно понадобится отдельно.
-        if ctx.cfg.get("rotation.backup_before_rotation", True) and not data.get("backup_uuid"):
+        # Backup делается на работающем сервере, до остановки. Развернуть сервер
+        # из него напрямую нельзя, поэтому Storage Template нужен отдельно.
+        if tuned(ctx.cfg, ctx.state, "backup_before_rotation", True) and not data.get("backup_uuid"):
             ctx.state.set_pending(CLONE, "backing-up", **data)
-            ctx.say(f"снимаю страховочный снимок диска {data['storage_size']} ГБ…")
+            ctx.say(f"делаю Backup диска {data['storage_size']} ГБ — на случай, если новый сервер окажется сломанным…")
             stamp = time.strftime("%Y%m%d-%H%M%S")
             try:
                 backup = ctx.uc.create_backup(
@@ -231,11 +230,11 @@ def recreate(
                 ctx.state.set_pending(CLONE, "backing-up", **data)
                 ctx.uc.wait_storage_online(
                     data["backup_uuid"], int(ctx.cfg.get("rotation.wait_storage_sec", 3600)),
-                    on_tick=lambda st, left: ctx.say(f"снимок готовится… ({st})"))
-                ctx.say("снимок готов")
+                    on_tick=lambda st, left: ctx.say(f"Backup готовится… ({st})"))
+                ctx.say("Backup готов")
             except UpCloudError as exc:
                 # Страховка важна, но её отсутствие не повод не менять адрес.
-                ctx.say(f"{'⚠️'} снимок не удался ({exc}) — продолжаю без него")
+                ctx.say(f"{'⚠️'} Backup не удался ({exc}) — продолжаю без него")
 
         if not data.get("stopped"):
             ctx.state.set_pending(CLONE, "stopping", **data)
@@ -264,7 +263,7 @@ def recreate(
                 int(ctx.cfg.get("rotation.wait_storage_sec", 3600)),
                 on_tick=lambda st, left: ctx.say(f"копирование… ({st}, осталось ≤{left} с)"),
             )
-            ctx.say(f"диск скопирован в {target_zone}, снимаю с него шаблон…")
+            ctx.say(f"диск скопирован в {target_zone}, делаю с него Storage Template…")
             zone_template = ctx.uc.templatize(
                 data["clone_uuid"], f"rotator-{target_zone}-{int(time.time())}")
             data["zone_template_uuid"] = zone_template.get("uuid", "")
@@ -272,13 +271,13 @@ def recreate(
             ctx.uc.wait_storage_online(
                 data["zone_template_uuid"], int(ctx.cfg.get("rotation.wait_storage_sec", 3600)))
             ctx.state.add_template(data["zone_template_uuid"], target_zone)
-            ctx.say(f"шаблон в {target_zone} готов")
+            ctx.say(f"Storage Template в {target_zone} готов")
 
         # Локальный шаблон нужен только копии в своей зоне: при переезде он
         # бесполезен и стоил бы лишнего хранилища.
         if same_zone and not data.get("template_uuid"):
             ctx.state.set_pending(CLONE, "templatizing", **data)
-            ctx.say("снимаю шаблон системного диска (ключи, клиенты, swap — всё внутри)…")
+            ctx.say("делаю Storage Template системного диска (ключи, клиенты, swap — всё внутри)…")
             stamp = time.strftime("%Y%m%d-%H%M%S")
             template = ctx.uc.templatize(data["storage_uuid"], f"rotator-{data['hostname']}-{stamp}")
             data["template_uuid"] = template.get("uuid", "")
@@ -288,14 +287,14 @@ def recreate(
             ctx.uc.wait_storage_online(
                 data["template_uuid"],
                 int(ctx.cfg.get("rotation.wait_storage_sec", 3600)),
-                on_tick=lambda st, left: ctx.say(f"шаблон готовится… ({st}, осталось ≤{left} с)"),
+                on_tick=lambda st, left: ctx.say(f"Storage Template готовится… ({st}, осталось ≤{left} с)"),
             )
             ctx.state.add_template(data["template_uuid"], data["src_zone"])
-            ctx.say("шаблон готов")
+            ctx.say("Storage Template готов")
 
         source_template = data.get("zone_template_uuid") or data.get("template_uuid", "")
         if not source_template:
-            raise RotationError("нечего разворачивать: шаблон не создан")
+            raise RotationError("нечего разворачивать: Storage Template не создан")
 
         if not data.get("new_uuid"):
             ctx.state.set_pending(CLONE, "creating", **data)
@@ -347,9 +346,9 @@ def recreate(
     # Точка невозврата пройдена — старый сервер больше не нужен.
     ctx.state.set_pending(CLONE, "deleting-old", **data)
     try:
-        # backups=keep обязателен, когда эталон хранится: иначе снимок удалится
-        # вместе с диском, от которого он снят.
-        keep_backups = int(ctx.cfg.get("rotation.keep_backups", 1))
+        # backups=keep обязателен, когда Backup хранится: иначе он удалится
+        # вместе с диском, от которого снят.
+        keep_backups = int(tuned(ctx.cfg, ctx.state, "keep_backups", 1))
         ctx.uc.delete_server(old_uuid, storages=True,
                              backups="keep" if keep_backups > 0 else "delete")
         ctx.say(f"старый сервер удалён, адрес {data['old_ip']} освобождён")
@@ -444,17 +443,17 @@ def _grant_permission(ctx: Ctx, new_uuid: str) -> None:
 
 def cleanup_templates(ctx: Ctx, *, keep: int | None = None, extra: list[str] | None = None,
                       force: bool = False) -> list[str]:
-    """Удалить образы диска, которые больше не нужны.
+    """Удалить Storage Template, которые больше не нужны.
 
-    Образ тарифицируется как отдельное хранилище всё время, пока существует, —
-    на 10 ГБ это сопоставимо со стоимостью самого сервера. Поэтому по умолчанию
-    он живёт только те минуты, пока разворачивается новый сервер.
+    Storage Template тарифицируется как отдельное хранилище всё время, пока
+    существует — на 10 ГБ сопоставимо со стоимостью самого сервера. Поэтому по
+    умолчанию он живёт только те минуты, пока разворачивается новый сервер.
 
-    Пока висит незавершённая ротация, образ может понадобиться для доигрывания,
-    поэтому без force он не трогается.
+    Пока висит незавершённая ротация, он может понадобиться для доигрывания,
+    поэтому без force не трогается.
     """
     if keep is None:
-        keep = int(ctx.cfg.get("rotation.keep_templates", 0))
+        keep = int(tuned(ctx.cfg, ctx.state, "keep_templates", 0))
     removed: list[str] = []
 
     for uuid in [u for u in (extra or []) if u]:
@@ -466,7 +465,7 @@ def cleanup_templates(ctx: Ctx, *, keep: int | None = None, extra: list[str] | N
             logger.warning("промежуточный диск %s не удалён: %s", uuid, exc)
 
     if ctx.state["pending"] and not force:
-        logger.info("образы оставлены: есть незавершённая ротация, они могут понадобиться")
+        logger.info("Storage Template оставлен: есть незавершённая ротация")
         return removed
 
     for entry in list(ctx.state["templates"])[max(keep, 0):]:
@@ -474,19 +473,19 @@ def cleanup_templates(ctx: Ctx, *, keep: int | None = None, extra: list[str] | N
             ctx.uc.delete_storage(entry["uuid"])
             ctx.state.drop_template(entry["uuid"])
             removed.append(entry["uuid"])
-            logger.info("удалён образ диска %s", entry["uuid"])
+            logger.info("удалён Storage Template %s", entry["uuid"])
         except UpCloudError as exc:
             if exc.status == 404:
                 ctx.state.drop_template(entry["uuid"])   # уже исчез вместе с сервером
             else:
-                logger.warning("образ %s не удалён: %s", entry["uuid"], exc)
+                logger.warning("Storage Template %s не удалён: %s", entry["uuid"], exc)
     return removed
 
 
 def cleanup_backups(ctx: Ctx, *, keep: int | None = None, force: bool = False) -> list[str]:
-    """Оставить N свежих эталонных снимков, остальные удалить."""
+    """Оставить N свежих Backup, остальные удалить."""
     if keep is None:
-        keep = int(ctx.cfg.get("rotation.keep_backups", 1))
+        keep = int(tuned(ctx.cfg, ctx.state, "keep_backups", 1))
     if ctx.state["pending"] and not force:
         return []
     removed: list[str] = []
@@ -495,17 +494,17 @@ def cleanup_backups(ctx: Ctx, *, keep: int | None = None, force: bool = False) -
             ctx.uc.delete_storage(entry["uuid"])
             ctx.state.drop_backup(entry["uuid"])
             removed.append(entry["uuid"])
-            logger.info("удалён снимок %s", entry["uuid"])
+            logger.info("удалён Backup %s", entry["uuid"])
         except UpCloudError as exc:
             if exc.status == 404:
                 ctx.state.drop_backup(entry["uuid"])
             else:
-                logger.warning("снимок %s не удалён: %s", entry["uuid"], exc)
+                logger.warning("Backup %s не удалён: %s", entry["uuid"], exc)
     return removed
 
 
 def orphan_backups(ctx: Ctx) -> list[dict[str, Any]]:
-    """Снимки ротатора, про которые state не знает."""
+    """Backup ротатора, про которые state не знает."""
     known = {entry["uuid"] for entry in ctx.state["backups"]}
     return [s for s in ctx.uc.backups()
             if s.get("uuid") not in known
@@ -513,7 +512,7 @@ def orphan_backups(ctx: Ctx) -> list[dict[str, Any]]:
 
 
 def orphan_templates(ctx: Ctx) -> list[dict[str, Any]]:
-    """Образы ротатора, про которые state не знает — остатки прошлых сбоев."""
+    """Storage Template ротатора, про которые state не знает — остатки прошлых сбоев."""
     known = {entry["uuid"] for entry in ctx.state["templates"]}
     found = []
     for storage in ctx.uc.storages():

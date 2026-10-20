@@ -177,6 +177,24 @@ class Secrets:
         os.chmod(self.path, stat.S_IRUSR | stat.S_IWUSR)
 
 
+def tuned(cfg: "Config", state: Any, key: str, default: Any) -> Any:
+    """Значение настройки: выставленное кнопками в чате важнее config.toml.
+
+    Так пользователю не нужно лезть в файл на сервере, чтобы поменять политику
+    хранения, а заданное в конфиге остаётся значением по умолчанию.
+    """
+    stored = (state.data.get("tuning") or {}).get(key)
+    if stored is not None:
+        return stored
+    return cfg.get(f"rotation.{key}", default)
+
+
+def set_tuned(state: Any, key: str, value: Any) -> None:
+    tuning = dict(state.data.get("tuning") or {})
+    tuning[key] = value
+    state["tuning"] = tuning
+
+
 def domain_of(cfg: "Config", secrets: "Secrets") -> str:
     """Домен из мастера имеет приоритет над config.toml: его правят из чата."""
     return secrets.get("VPN_DOMAIN") or str(cfg.get("vpn.domain", ""))

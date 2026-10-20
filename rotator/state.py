@@ -35,6 +35,7 @@ EMPTY: dict[str, Any] = {
     "last_probe": {},
     "last_probe_ts": 0,
     "awaiting": "",           # поле, значение которого мастер ждёт от пользователя
+    "tuning": {},             # настройки, выставленные кнопками: важнее config.toml
 }
 
 
