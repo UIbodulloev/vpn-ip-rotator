@@ -119,8 +119,13 @@ class FakeCloud:
         """Фейк притворяется и релеем — так /check проходит целиком."""
         return {"https://relay.test": "ok"}
 
-    def request(self, upstream: str, method: str, path: str, *, json=None, headers=None,
-                params=None, timeout=None) -> FakeResponse:
+    def request(self, upstream: str, method: str, path: str, *, json=None, data=None,
+                files=None, headers=None, params=None, timeout=None) -> FakeResponse:
+        if files and self.telegram is not None and path.endswith("/sendDocument"):
+            name, content, _ctype = files["document"]
+            return self.telegram.send_document(
+                name, content.decode("utf-8") if isinstance(content, bytes) else content,
+                (data or {}).get("caption", ""))
         self.calls.append((method.upper(), path))
         key = f"{method.upper()} {path}"
         if self.fail_on.get(key, 0) > 0:

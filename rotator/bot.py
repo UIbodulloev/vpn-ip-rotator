@@ -69,6 +69,7 @@ COMMANDS = [
     ("menu", "единое меню: всё управление в одном месте"),
     ("server", "управление сервером: питание, хранение, контейнеры"),
     ("settings", "настройки: автоматика, хранение, доступы"),
+    ("awg", "AmneziaWG 3.1: выпустить или отозвать конфиг"),
     ("status", "адрес, состояние сервера, последние пробы"),
     ("probe", "проверить доступность VPN прямо сейчас"),
     ("ip", "что у сервера и что стоит в DNS"),
@@ -100,7 +101,7 @@ def _help_text() -> str:
 
 
 HELP_GROUPS = [
-    ('Главное', ['menu', 'server', 'settings']),
+    ('Главное', ['menu', 'server', 'settings', 'awg']),
     ('Наблюдение', ['status', 'probe', 'ip', 'log']),
     ('Проверка вхолостую', ['simulate', 'plan', 'costs']),
     ('Управление', ['rotate', 'mode', 'pause', 'resume', 'rollback']),
@@ -209,6 +210,13 @@ def _check_keypath(v: str) -> str:
     return ""
 
 
+def _check_client_name(v: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,32}", v):
+        return ""
+    return ("Имя пойдёт в команду на сервере, поэтому только латиница, цифры, дефис и "
+            "подчёркивание, до 32 символов.\n\nНапример: keenetic-home, iphone-oleg")
+
+
 def _check_domain(v: str) -> str:
     return "" if "." in v and " " not in v else "Домен выглядит как vpn.example.com"
 
@@ -228,6 +236,7 @@ VALIDATORS = {
     "CF_AAAA_RECORD_ID": _check_hex32,
     "SSH_KEY_PATH": _check_keypath,
     "SSH_PRIVATE_KEY": sshkeys.looks_like_private,
+    "AWG_CLIENT_NAME": _check_client_name,
     "SSH_PUBKEY": _check_pubkey,
     "VPN_DOMAIN": _check_domain,
 }
@@ -334,6 +343,22 @@ class Bot:
             payload["text"] = ui.strip_tags(text)[:4000]
             payload.pop("parse_mode", None)
             self.api("editMessageText", payload)
+
+    def send_document(self, filename: str, content: str, caption: str = "") -> bool:
+        """Отправить файл в чат. Нужно для конфигов: приложения импортируют их файлом."""
+        response = self.relay.request(
+            "tg", "POST", f"/bot{self.token}/sendDocument",
+            data={"chat_id": self.admin, "caption": caption[:1000], "parse_mode": "HTML"},
+            files={"document": (filename, content.encode("utf-8"), "text/plain")},
+            timeout=60,
+        )
+        try:
+            ok = bool(response.json().get("ok"))
+        except ValueError:
+            ok = False
+        if not ok:
+            logger.warning("не удалось отправить файл %s: HTTP %s", filename, response.status_code)
+        return ok
 
     def delete(self, chat_id: Any, message_id: int) -> None:
         self.api("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
@@ -449,6 +474,8 @@ class Bot:
             self.server_menu()
         elif command == "/settings":
             self.settings_menu()
+        elif command == "/awg":
+            self.awg_menu()
         elif command == "/status":
             self.send(self.status_text(), MAIN_KEYBOARD)
         elif command == "/probe":
@@ -1360,6 +1387,127 @@ class Bot:
             ui.note("Адрес сервера при этом не меняется."),
         ), rows)
 
+    # --- AmneziaWG 3.1: выпуск ключей ----------------------------------------
+
+    AWG_DIR = "/opt/awg31"
+
+    def _awg(self, command: str, timeout: int = 90) -> remote.Result:
+        """Команда на VPN-сервере. Ключи AmneziaWG живут там, а не в боте."""
+        key = self.secrets.get("SSH_KEY_PATH")
+        if not key:
+            raise remote.RemoteError(
+                "нужен SSH-ключ агента: ⚙️ Настройки → 🔑 Доступы → "
+                "Необязательное → SSH-ключ агента")
+        host = self.engine.state["ipv4"]
+        port = int(self.cfg.get("vpn.control_port", 22)) or 22
+        return remote.run(host, command, key_path=key, port=port, timeout=timeout)
+
+    def awg_menu(self) -> None:
+        try:
+            listing = self._awg(f"{self.AWG_DIR}/list-clients.sh")
+        except remote.RemoteError as exc:
+            return self.send(
+                ui.joined(ui.title("AmneziaWG 3.1", ui.WARN), ui.esc(str(exc))),
+                [[{"text": "🔑 Задать SSH-ключ", "callback_data": "set:SSH_KEY_PATH"}],
+                 [{"text": "◀️ Сервер", "callback_data": "srv:menu"}]])
+
+        rows, names = [], []
+        for line in listing.out.strip().splitlines():
+            parts = line.split("\t")
+            if len(parts) == 3:
+                names.append(parts[0])
+                rows.append(f"{parts[0]:<18} {parts[1]:<11} {parts[2]}")
+            elif line.strip():
+                rows.append(line.strip())
+
+        keyboard = [[{"text": "➕ Выпустить конфиг", "callback_data": "awg:new"}]]
+        if names:
+            keyboard.append([{"text": "📤 Прислать существующий", "callback_data": "awg:send"}])
+            keyboard.append([{"text": "🗑 Отозвать", "callback_data": "awg:revoke"}])
+        keyboard.append([{"text": "◀️ Сервер", "callback_data": "srv:menu"}])
+
+        self.send(ui.joined(
+            ui.title("AmneziaWG 3.1", "🔐"),
+            ui.esc("Отдельный интерфейс рядом с 2.0: свой порт, своя подсеть, свои ключи. "
+                   "Существующие клиенты 2.0 он не затрагивает."),
+            ui.title("Выпущенные конфиги"),
+            ui.block(rows) if rows else ui.note("пока ни одного"),
+            ui.note("Конфиг приходит файлом — откройте его в приложении AmneziaWG. "
+                    "НЕ добавляйте сервер в приложение Amnezia: оно пересоздаст "
+                    "контейнер 2.0 и отключит текущих пользователей."),
+        ), keyboard)
+
+    def awg_pick(self, action: str) -> None:
+        """Список имён кнопками: для отправки или отзыва."""
+        try:
+            listing = self._awg(f"{self.AWG_DIR}/list-clients.sh")
+        except remote.RemoteError as exc:
+            return self.send(f"{ui.NO} {ui.esc(str(exc))}")
+        names = [l.split("\t")[0] for l in listing.out.strip().splitlines() if "\t" in l]
+        if not names:
+            return self.awg_menu()
+        verb = "Отозвать" if action == "revoke" else "Прислать"
+        rows = [[{"text": n, "callback_data": f"awg:{action}:{n}"}] for n in names[:20]]
+        rows.append([{"text": "◀️ Назад", "callback_data": "awg:menu"}])
+        self.send(ui.joined(
+            ui.title(f"{verb} конфиг", "🗑" if action == "revoke" else "📤"),
+            ui.esc("Отзыв необратим: ключ перестанет работать сразу."
+                   if action == "revoke" else "Файл придёт в этот чат."),
+        ), rows)
+
+    def awg_issue(self, name: str) -> None:
+        header = ui.title(f"Выпуск конфига {name}", "🔐")
+        message_id = self.send(ui.joined(header, ui.note("создаю ключи на сервере…")))
+
+        def worker() -> None:
+            try:
+                made = self._awg(f"{self.AWG_DIR}/add-client.sh {name}")
+                if not made.ok:
+                    return self.edit(message_id, ui.joined(
+                        ui.title("Не вышло", ui.NO), ui.block([made.text(600)])))
+                conf = self._awg(f"cat {self.AWG_DIR}/clients/{name}.conf")
+                if not conf.ok or "[Interface]" not in conf.out:
+                    return self.edit(message_id, ui.joined(
+                        ui.title("Конфиг не прочитался", ui.NO), ui.block([conf.text(400)])))
+                self.edit(message_id, ui.joined(header, ui.block([made.out.strip()])))
+                sent = self.send_document(
+                    f"{name}.conf", conf.out,
+                    caption=f"<b>AmneziaWG 3.1 · {ui.esc(name)}</b>\n\n"
+                            "Откройте файл в приложении AmneziaWG (не в Amnezia).\n"
+                            "Файл содержит приватный ключ — не пересылайте его дальше.",
+                )
+                if not sent:
+                    self.send(ui.joined(
+                        ui.title("Файл не ушёл", ui.WARN),
+                        ui.esc(f"Конфиг создан на сервере: {self.AWG_DIR}/clients/{name}.conf — "
+                               "заберите его через scp.")))
+            except Exception as exc:                           # noqa: BLE001
+                logger.exception("выпуск конфига не удался")
+                self.edit(message_id, ui.joined(ui.title("Ошибка", ui.NO), ui.block([str(exc)])))
+
+        threading.Thread(target=worker, name="awg-issue", daemon=True).start()
+
+    def awg_send(self, name: str) -> None:
+        try:
+            conf = self._awg(f"cat {self.AWG_DIR}/clients/{name}.conf")
+        except remote.RemoteError as exc:
+            return self.send(f"{ui.NO} {ui.esc(str(exc))}")
+        if not conf.ok or "[Interface]" not in conf.out:
+            return self.send(f"{ui.NO} конфиг {ui.esc(name)} не найден")
+        self.send_document(f"{name}.conf", conf.out,
+                           caption=f"<b>AmneziaWG 3.1 · {ui.esc(name)}</b>\n\n"
+                                   "Файл содержит приватный ключ — не пересылайте его дальше.")
+
+    def awg_revoke(self, name: str) -> None:
+        try:
+            done = self._awg(f"{self.AWG_DIR}/revoke-client.sh {name}")
+        except remote.RemoteError as exc:
+            return self.send(f"{ui.NO} {ui.esc(str(exc))}")
+        self.send(ui.joined(
+            ui.title("Отозван" if done.ok else "Не вышло", ui.YES if done.ok else ui.NO),
+            ui.block([done.text(400)]),
+        ), [[{"text": "🔐 К списку", "callback_data": "awg:menu"}]])
+
     def server_new(self) -> None:
         templates = self.engine.state["templates"]
         if not templates:
@@ -1745,6 +1893,9 @@ class Bot:
             self.delete(message["chat"]["id"], message["message_id"])
         if key == "SSH_PRIVATE_KEY":
             return self.install_private_key(value, receipt)
+        if key == "AWG_CLIENT_NAME":
+            self.edit(receipt, ui.joined(ui.title("Принято", ui.YES), ui.esc(value)))
+            return self.awg_issue(value)
         self.secrets.set(key, value)
         shown = masked(value) if is_secret(key) else value
         self.edit(receipt, f"✅ {key.replace('_', ' ').lower()}: {shown}")
@@ -2093,6 +2244,22 @@ class Bot:
                  [{"text": "◀️ Отмена", "callback_data": "srv:storage"}]])
         if data.startswith("srv:go:restore:"):
             return self.server_action("restore:" + data.split(":", 3)[3])
+        if data == "awg:menu":
+            return self.awg_menu()
+        if data == "awg:new":
+            self.awaiting = "AWG_CLIENT_NAME"
+            return self.send(ui.joined(
+                ui.title("Имя для нового конфига", "🔐"),
+                ui.esc("Пришлите короткое имя — оно попадёт в название файла и в список.\n\n"
+                       "Например: keenetic-home, keenetic-office, iphone-oleg"),
+                ui.esc("/cancel — выйти"),
+            ))
+        if data in ("awg:revoke", "awg:send"):
+            return self.awg_pick(data.split(":", 1)[1])
+        if data.startswith("awg:revoke:"):
+            return self.awg_revoke(data.split(":", 2)[2])
+        if data.startswith("awg:send:"):
+            return self.awg_send(data.split(":", 2)[2])
         if data == "srv:docker":
             return self.docker_menu()
         if data == "srv:new":

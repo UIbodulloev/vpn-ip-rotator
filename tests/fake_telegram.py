@@ -19,6 +19,7 @@ class FakeTelegram:
         self.answered: list[str] = []      # answerCallbackQuery
         self.calls: list[str] = []
         self.timeline: list[str] = []      # всё, что увидел пользователь, по порядку
+        self.documents: list[dict] = []    # отправленные файлы
         self._update_id = 100
         self._message_id = 1000
 
@@ -77,6 +78,11 @@ class FakeTelegram:
         return [(b["text"], b.get("callback_data", "")) for row in self.last_keyboard() for b in row]
 
     # --- маршрутизация ------------------------------------------------------
+
+    def send_document(self, filename: str, content: str, caption: str) -> FakeResponse:
+        self.documents.append({"filename": filename, "content": content, "caption": caption})
+        self.timeline.append(f"[файл {filename}] {caption}")
+        return FakeResponse(200, {"ok": True, "result": {"message_id": 1}})
 
     def request(self, method: str, path: str, payload: dict) -> FakeResponse:
         api_method = path.rsplit("/", 1)[-1]

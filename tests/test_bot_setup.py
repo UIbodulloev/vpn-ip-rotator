@@ -490,6 +490,80 @@ class SetupWizardTest(unittest.TestCase):
         self.assertIn("Шаблонов нет", self.h.tg.all_visible())
         self.assertIn("srv:ask:template", [d for _, d in self.h.tg.buttons()])
 
+    def test_awg_без_ssh_ключа_предлагает_его_задать(self):
+        self.h.tg.user_says("/awg")
+        self.h.pump()
+        self.assertIn("SSH-ключ", self.h.tg.all_visible())
+        self.assertIn("set:SSH_KEY_PATH", [d for _, d in self.h.tg.buttons()])
+
+    def _fake_ssh(self, replies):
+        """Подменяет SSH: ключ -> что вернуть. Сами скрипты живут на VPN-сервере."""
+        from rotator import bot as botmod, remote
+
+        calls = []
+
+        def fake_run(host, command, **kw):
+            calls.append(command)
+            for needle, out in replies.items():
+                if needle in command:
+                    return remote.Result(0, out, "")
+            return remote.Result(1, "", "не подготовлен ответ")
+
+        self.h.secrets.set("SSH_KEY_PATH", str(TMP / "fake-key"))
+        (TMP / "fake-key").write_text("x")
+        self.h.state.update(ipv4="203.0.113.11")
+        original, botmod.remote.run = botmod.remote.run, fake_run
+        self.addCleanup(lambda: setattr(botmod.remote, "run", original))
+        return calls
+
+    def test_awg_показывает_выпущенные_конфиги(self):
+        self._fake_ssh({"list-clients.sh": "keenetic-home\t10.9.1.2\t12s назад\n"
+                                           "iphone-oleg\t10.9.1.3\tне подключался\n"})
+        self.h.tg.user_says("/awg")
+        self.h.pump()
+        card = self.h.tg.all_visible()
+        self.assertIn("keenetic-home", card)
+        self.assertIn("iphone-oleg", card)
+        self.assertIn("НЕ добавляйте сервер в приложение Amnezia", card,
+                      "нет предупреждения про затирание 2.0")
+        buttons = [d for _, d in self.h.tg.buttons()]
+        for target in ("awg:new", "awg:send", "awg:revoke"):
+            self.assertIn(target, buttons)
+
+    def test_выпуск_конфига_присылает_файл(self):
+        conf = ("[Interface]\nPrivateKey = test\nAddress = 10.9.1.4/32\n\n"
+                "[Peer]\nEndpoint = vpn.example.com:51260\n")
+        calls = self._fake_ssh({"add-client.sh": "готово: /opt/awg31/clients/nokia.conf",
+                                "cat /opt/awg31/clients/nokia.conf": conf})
+        self.h.tg.user_taps("awg:new")
+        self.h.pump()
+        self.assertEqual(self.h.bot.awaiting, "AWG_CLIENT_NAME")
+
+        self.h.tg.user_says("nokia")
+        self.h.pump()
+        import time as _t
+        for _ in range(50):          # выпуск уходит в отдельный поток
+            if self.h.tg.documents:
+                break
+            _t.sleep(0.02)
+        self.assertTrue(self.h.tg.documents, "файл конфига не отправлен")
+        doc = self.h.tg.documents[-1]
+        self.assertEqual(doc["filename"], "nokia.conf")
+        self.assertIn("[Interface]", doc["content"])
+        self.assertTrue(any("add-client.sh nokia" in c for c in calls))
+
+    def test_имя_с_опасными_символами_отвергается(self):
+        """Имя уходит в команду на сервере — инъекция недопустима."""
+        self._fake_ssh({})
+        self.h.tg.user_taps("awg:new")
+        self.h.pump()
+        for bad in ("a; rm -rf /", "$(id)", "../../etc/passwd", "`whoami`"):
+            self.h.tg.timeline.clear()
+            self.h.bot.awaiting = "AWG_CLIENT_NAME"
+            self.h.tg.user_says(bad)
+            self.h.pump()
+            self.assertIn("Не принял", self.h.tg.all_visible(), f"принято опасное имя: {bad}")
+
     def test_кнопка_инструкции_есть_в_главном_меню(self):
         self.h.tg.user_says("/help")
         self.h.pump()
