@@ -1432,18 +1432,29 @@ class Bot:
                                        ui.block([listing.text(400)])),
                              [[{"text": "◀️ Сервер", "callback_data": "srv:menu"}]])
 
-        rows, names = [], []
+        rows, names, stale = [], [], []
         for line in listing.out.strip().splitlines():
             parts = line.split("\t")
             if len(parts) == 4:
                 name, _uuid, traffic, state = parts
                 names.append(name)
-                mark = "" if state == "вкл" else " ⏸"
+                # «НЕ В ЯДРЕ» — ключ есть в панели, но запущенное ядро его не
+                # знает. Снаружи это выглядит как timeout на телефоне, поэтому
+                # метку видно отдельно от обычного «выключен».
+                if "НЕ В ЯДРЕ" in state:
+                    mark = " ⚠️"
+                    stale.append(name)
+                elif state != "вкл":
+                    mark = " ⏸"
+                else:
+                    mark = ""
                 rows.append(f"{name:<14} {traffic:>8}{mark}")
             elif line.strip():
                 rows.append(line.strip())
 
         keyboard = [[{"text": "➕ Выпустить ссылку", "callback_data": "vless:new"}]]
+        if stale:
+            keyboard.append([{"text": "🔄 Применить конфиг к ядру", "callback_data": "vless:sync"}])
         if names:
             keyboard.append([{"text": "📲 Подписка с белыми списками", "callback_data": "vless:sub"}])
             keyboard.append([{"text": "🔗 Простая ссылка", "callback_data": "vless:link"}])
@@ -1457,7 +1468,30 @@ class Bot:
                    "или sing-box из буфера обмена — файл не нужен."),
             ui.title("Клиенты"),
             ui.block(rows) if rows else ui.note("пока ни одного"),
+            ui.note(f"{ui.WARN} у {len(stale)} ключ(ей) настройки не доехали до ядра — "
+                    "на устройстве будет timeout. Нажмите «Применить конфиг к ядру».")
+            if stale else "",
         ), keyboard)
+
+    def vless_sync(self) -> None:
+        """Пересобрать конфиг ядра из базы панели — лечит метку «НЕ В ЯДРЕ»."""
+        message_id = self.send(ui.joined(ui.title("Применяю конфиг", "🔄"),
+                                         ui.note("перечитываю клиентов в ядре…")))
+
+        def worker() -> None:
+            try:
+                done = self._panel("sync")
+                if done.ok:
+                    self.edit(message_id, ui.joined(ui.title("Готово", ui.YES),
+                                                    ui.block([done.text(300)])))
+                else:
+                    self.edit(message_id, ui.joined(ui.title("Не вышло", ui.NO),
+                                                    ui.block([done.text(500)])))
+            except Exception as exc:                           # noqa: BLE001
+                logger.exception("пересборка конфига ядра не удалась")
+                self.edit(message_id, ui.joined(ui.title("Ошибка", ui.NO), ui.block([str(exc)])))
+
+        threading.Thread(target=worker, name="vless-sync", daemon=True).start()
 
     def vless_pick(self, action: str) -> None:
         try:
@@ -2423,6 +2457,8 @@ class Bot:
             return self.server_action("restore:" + data.split(":", 3)[3])
         if data == "vless:menu":
             return self.vless_menu()
+        if data == "vless:sync":
+            return self.vless_sync()
         if data == "vless:new":
             self.awaiting = "VLESS_CLIENT_NAME"
             return self.send(ui.joined(

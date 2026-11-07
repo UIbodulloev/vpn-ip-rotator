@@ -597,6 +597,41 @@ class SetupWizardTest(unittest.TestCase):
         self.assertIn("Hiddify", visible, "не сказано, куда её вставлять")
         self.assertTrue(any("client.py add oleg" in c for c in calls))
 
+    def test_ключ_не_доехавший_до_ядра_виден_и_лечится(self):
+        """Клиент есть в панели, но ядро его не знает — снаружи это timeout.
+
+        Именно так сломался первый выданный ключ: панель применяет добавление
+        через core API, а следующий перезапуск ядра читает старый config.json.
+        """
+        calls = self._fake_ssh({"client.py list":
+                                "amnezia-1\tuuid-1\t1.2ГБ\tвкл\n"
+                                "oleg-iphone\tuuid-2\t0Б\tвкл / НЕ В ЯДРЕ\n",
+                                "client.py sync": "ядро знает все ключи: 2"})
+        self.h.tg.user_says("/vless")
+        self.h.pump()
+        card = self.h.tg.all_visible()
+        self.assertIn("timeout", card, "не объяснено, что человек увидит timeout")
+        buttons = [d for _, d in self.h.tg.buttons()]
+        self.assertIn("vless:sync", buttons, "нет кнопки починки")
+
+        self.h.tg.timeline.clear()
+        self.h.tg.user_taps("vless:sync")
+        self.h.pump()
+        import time as _t
+        for _ in range(50):
+            if any("client.py sync" in c for c in calls):
+                break
+            _t.sleep(0.02)
+        self.assertTrue(any("client.py sync" in c for c in calls), "sync не вызван")
+
+    def test_исправный_ключ_не_помечается_предупреждением(self):
+        self._fake_ssh({"client.py list": "oleg\tuuid-1\t0Б\tвкл\n"})
+        self.h.tg.user_says("/vless")
+        self.h.pump()
+        card = self.h.tg.all_visible()
+        self.assertNotIn("timeout", card)
+        self.assertNotIn("vless:sync", [d for _, d in self.h.tg.buttons()])
+
     def test_vless_имя_с_инъекцией_отвергается(self):
         self._fake_ssh({})
         self.h.tg.user_taps("vless:new")
