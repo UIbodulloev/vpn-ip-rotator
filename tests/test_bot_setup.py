@@ -608,6 +608,44 @@ class SetupWizardTest(unittest.TestCase):
             self.h.pump()
             self.assertIn("Не принял", self.h.tg.all_visible(), f"принято: {bad}")
 
+    def test_подписка_без_настроенного_адреса_объясняет_что_нужно(self):
+        self._fake_ssh({"client.py list": "oleg\tuuid-1\t0Б\tвкл\n"})
+        self.h.tg.user_taps("vless:sub:oleg")
+        self.h.pump()
+        self.assertIn("не настроен", self.h.tg.all_visible())
+        self.assertIn("set:SUB_BASE_URL", [d for _, d in self.h.tg.buttons()])
+
+    def test_подписка_присылает_готовое_сообщение(self):
+        self.h.secrets.set("SUB_BASE_URL", "https://sub.example.com")
+        self._fake_ssh({"client.py list":
+                        "oleg\t11111111-2222-3333-4444-555555555555\t0Б\tвкл\n"})
+        self.h.tg.user_taps("vless:sub:oleg")
+        self.h.pump()
+        visible = self.h.tg.all_visible()
+        self.assertIn("https://sub.example.com/sub/11111111-2222-3333-4444-555555555555",
+                      visible, "в сообщении нет ссылки подписки")
+        self.assertIn("https://sub.example.com/", visible, "нет ссылки на инструкцию")
+        self.assertIn("Госуслуги", visible, "не сказано про белые списки")
+
+    def test_адрес_подписок_проверяется(self):
+        from rotator.bot import VALIDATORS
+        check = VALIDATORS["SUB_BASE_URL"]
+        self.assertFalse(check("https://sub.example.com"))
+        self.assertFalse(check("https://sub.example.com/"))
+        for bad in ("sub.example.com", "http://sub.example.com",
+                    "https://sub.example.com/path", "не ссылка"):
+            self.assertTrue(check(bad), f"принят мусор: {bad}")
+
+    def test_страница_инструкции_в_воркере_самодостаточна(self):
+        """Страница должна открываться там, где половина интернета недоступна."""
+        from pathlib import Path as _P
+        src = _P(__file__).resolve().parents[1].joinpath("subs/worker.js").read_text()
+        page = src[src.index("function instructionPage"):]
+        for bad in ("http://", "cdn.", "fonts.googleapis", "<script"):
+            self.assertNotIn(bad, page, f"страница тянет внешнее: {bad}")
+        for must in ("sing-box", "Profiles", "Remote", "Госуслуги"):
+            self.assertIn(must, page, f"в инструкции нет {must}")
+
     def test_оба_протокола_доступны_из_меню_сервера(self):
         self.h.secrets.set("UPCLOUD_TOKEN", GOOD_UC)
         self.h.secrets.set("SERVER_UUID", self.h.server_uuid)

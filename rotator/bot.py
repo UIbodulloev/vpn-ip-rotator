@@ -59,6 +59,7 @@ OPTIONAL_KEYS = [
     ("UPCLOUD_ADMIN_TOKEN", "Админ-токен UpCloud", "чтобы recreate работал под субаккаунтом"),
     ("UPCLOUD_SUBACCOUNT", "Логин субаккаунта", "в паре с админ-токеном"),
     ("CF_AAAA_RECORD_ID", "AAAA-запись", "обновлять заодно и IPv6"),
+    ("SUB_BASE_URL", "Генератор подписок", "белые списки для телефонов"),
     ("SSH_KEY_PATH", "SSH-ключ агента", "контейнеры, протоколы и плавающий адрес"),
     ("SSH_PUBKEY", "SSH-ключ, публичный", "прописать новому серверу при копии и переезде"),
 ]
@@ -163,6 +164,12 @@ FIELD_PROMPTS = {
         "/skip — пропустить"
     ),
     "VPN_DOMAIN": "Домен, чью DNS-запись переписывать. Например vpn.example.com",
+    "SUB_BASE_URL": (
+        "Адрес генератора подписок — он отдаёт телефонам конфиг с белыми списками, "
+        "чтобы банки и Госуслуги шли напрямую.\n\n"
+        "Разворачивается из subs/deploy.sh на Cloudflare. Укажите хост вида "
+        "https://sub.example.com — без пути и слэша на конце."
+    ),
     "SERVER_UUID": "UUID сервера в UpCloud.",
     "CF_ZONE_ID": "Zone ID зоны в Cloudflare — со страницы обзора домена.",
     "CF_A_RECORD_ID": "ID A-записи в Cloudflare.",
@@ -218,6 +225,13 @@ def _check_client_name(v: str) -> str:
             "подчёркивание, до 32 символов.\n\nНапример: keenetic-home, iphone-oleg")
 
 
+def _check_sub_base(v: str) -> str:
+    if re.fullmatch(r"https://[A-Za-z0-9.-]+[A-Za-z0-9]", v.rstrip("/")):
+        return ""
+    return ("Нужен адрес вида https://sub.example.com — без пути и без слэша на конце.\n\n"
+            "Это хост, на который развёрнут генератор подписок (subs/deploy.sh).")
+
+
 def _check_domain(v: str) -> str:
     return "" if "." in v and " " not in v else "Домен выглядит как vpn.example.com"
 
@@ -239,6 +253,7 @@ VALIDATORS = {
     "SSH_PRIVATE_KEY": sshkeys.looks_like_private,
     "AWG_CLIENT_NAME": _check_client_name,
     "VLESS_CLIENT_NAME": _check_client_name,
+    "SUB_BASE_URL": _check_sub_base,
     "SSH_PUBKEY": _check_pubkey,
     "VPN_DOMAIN": _check_domain,
 }
@@ -1430,7 +1445,8 @@ class Bot:
 
         keyboard = [[{"text": "➕ Выпустить ссылку", "callback_data": "vless:new"}]]
         if names:
-            keyboard.append([{"text": "🔗 Прислать ссылку", "callback_data": "vless:link"}])
+            keyboard.append([{"text": "📲 Подписка с белыми списками", "callback_data": "vless:sub"}])
+            keyboard.append([{"text": "🔗 Простая ссылка", "callback_data": "vless:link"}])
             keyboard.append([{"text": "🗑 Удалить", "callback_data": "vless:del"}])
         keyboard.append([{"text": "◀️ Сервер", "callback_data": "srv:menu"}])
 
@@ -1453,12 +1469,14 @@ class Bot:
             return self.vless_menu()
         rows = [[{"text": n, "callback_data": f"vless:{action}:{n}"}] for n in names[:20]]
         rows.append([{"text": "◀️ Назад", "callback_data": "vless:menu"}])
-        self.send(ui.joined(
-            ui.title("Удалить клиента" if action == "del" else "Прислать ссылку",
-                     "🗑" if action == "del" else "🔗"),
-            ui.esc("Удаление необратимо: ключ перестанет работать сразу."
-                   if action == "del" else "Ссылка придёт следующим сообщением."),
-        ), rows)
+        titles = {
+            "del": ("Удалить клиента", "🗑", "Удаление необратимо: ключ перестанет работать сразу."),
+            "link": ("Простая ссылка", "🔗", "Весь трафик пойдёт через VPN, без белых списков."),
+            "sub": ("Подписка с белыми списками", "📲",
+                    "Пришлю готовое сообщение — его можно переслать человеку как есть."),
+        }
+        heading, emoji, note = titles[action]
+        self.send(ui.joined(ui.title(heading, emoji), ui.esc(note)), rows)
 
     def vless_issue(self, name: str) -> None:
         header = ui.title(f"Выпуск ссылки {name}", "📱")
@@ -1485,6 +1503,42 @@ class Bot:
         if not got.ok or "vless://" not in got.out:
             return self.send(ui.joined(ui.title("Не нашлось", ui.NO), ui.block([got.text(300)])))
         self._show_link(self.send(ui.note("…")), name, got.out.strip())
+
+    def vless_sub(self, name: str) -> None:
+        """Готовое сообщение для пересылки: подписка плюс страница инструкции."""
+        base = self.secrets.get("SUB_BASE_URL").rstrip("/")
+        if not base:
+            return self.send(ui.joined(
+                ui.title("Генератор подписок не настроен", ui.WARN),
+                ui.esc("Разверните его (subs/deploy.sh) и укажите адрес в настройках — "
+                       "без него белые списки для телефонов не работают."),
+            ), [[{"text": "⚙️ Указать адрес", "callback_data": "set:SUB_BASE_URL"}],
+                [{"text": "◀️ Назад", "callback_data": "vless:menu"}]])
+        try:
+            listing = self._panel("list")
+        except remote.RemoteError as exc:
+            return self.send(f"{ui.NO} {ui.esc(str(exc))}")
+        uuid = next((l.split("\t")[1] for l in listing.out.splitlines()
+                     if l.split("\t")[0] == name and "\t" in l), "")
+        if not uuid:
+            return self.send(f"{ui.NO} клиента {ui.esc(name)} нет")
+
+        self.send(ui.joined(
+            ui.title(f"Подписка готова · {name}", ui.YES),
+            ui.esc("Следующее сообщение можно переслать человеку целиком — "
+                   "там и ссылка, и инструкция."),
+            ui.note("Ссылка персональная. У каждого должна быть своя."),
+        ))
+        # Отдельным сообщением и без лишнего — чтобы пересылалось как есть.
+        self.send(
+            f"<b>Ваш VPN</b>\n\n"
+            f"1. Установите приложение <b>sing-box</b>.\n"
+            f"2. Откройте инструкцию: {ui.esc(base)}/\n"
+            f"3. Ваша личная ссылка:\n\n"
+            f"<code>{ui.esc(base)}/sub/{ui.esc(uuid)}</code>\n\n"
+            f"Банки и Госуслуги работают сами — VPN отключать не нужно.\n"
+            f"Ссылку никому не передавайте."
+        )
 
     def _show_link(self, message_id: int, name: str, link: str) -> None:
         """Ссылка отдельным сообщением моноширинным блоком — чтобы копировалась
@@ -2377,12 +2431,14 @@ class Bot:
                        "профиля на телефоне.\n\nНапример: oleg-iphone, masha-android"),
                 ui.esc("/cancel — выйти"),
             ))
-        if data in ("vless:link", "vless:del"):
+        if data in ("vless:link", "vless:del", "vless:sub"):
             return self.vless_pick(data.split(":", 1)[1])
         if data.startswith("vless:link:"):
             return self.vless_link(data.split(":", 2)[2])
         if data.startswith("vless:del:"):
             return self.vless_del(data.split(":", 2)[2])
+        if data.startswith("vless:sub:"):
+            return self.vless_sub(data.split(":", 2)[2])
         if data == "awg:menu":
             return self.awg_menu()
         if data == "awg:new":

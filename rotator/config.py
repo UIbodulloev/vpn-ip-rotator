@@ -44,6 +44,7 @@ SETUP_KEYS = (
     "CF_AAAA_RECORD_ID",
     "SSH_KEY_PATH",
     "SSH_PUBKEY",
+    "SUB_BASE_URL",
 )
 
 DEFAULTS: dict[str, Any] = {
