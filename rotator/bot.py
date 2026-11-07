@@ -69,7 +69,8 @@ COMMANDS = [
     ("menu", "единое меню: всё управление в одном месте"),
     ("server", "управление сервером: питание, хранение, контейнеры"),
     ("settings", "настройки: автоматика, хранение, доступы"),
-    ("awg", "AmneziaWG 3.1: выпустить или отозвать конфиг"),
+    ("awg", "AmneziaWG 3.1: конфиги для роутеров"),
+    ("vless", "VLESS Reality: ссылки для телефонов"),
     ("status", "адрес, состояние сервера, последние пробы"),
     ("probe", "проверить доступность VPN прямо сейчас"),
     ("ip", "что у сервера и что стоит в DNS"),
@@ -101,7 +102,7 @@ def _help_text() -> str:
 
 
 HELP_GROUPS = [
-    ('Главное', ['menu', 'server', 'settings', 'awg']),
+    ('Главное', ['menu', 'server', 'settings', 'awg', 'vless']),
     ('Наблюдение', ['status', 'probe', 'ip', 'log']),
     ('Проверка вхолостую', ['simulate', 'plan', 'costs']),
     ('Управление', ['rotate', 'mode', 'pause', 'resume', 'rollback']),
@@ -237,6 +238,7 @@ VALIDATORS = {
     "SSH_KEY_PATH": _check_keypath,
     "SSH_PRIVATE_KEY": sshkeys.looks_like_private,
     "AWG_CLIENT_NAME": _check_client_name,
+    "VLESS_CLIENT_NAME": _check_client_name,
     "SSH_PUBKEY": _check_pubkey,
     "VPN_DOMAIN": _check_domain,
 }
@@ -476,6 +478,8 @@ class Bot:
             self.settings_menu()
         elif command == "/awg":
             self.awg_menu()
+        elif command == "/vless":
+            self.vless_menu()
         elif command == "/status":
             self.send(self.status_text(), MAIN_KEYBOARD)
         elif command == "/probe":
@@ -1022,6 +1026,8 @@ class Bot:
             power + [{"text": "🔁 Перезагрузить", "callback_data": "srv:ask:reboot"}],
             [{"text": "📸 Сделать Storage Template", "callback_data": "srv:ask:template"}],
             [{"text": "💾 Хранение: Backup и Template", "callback_data": "srv:storage"}],
+            [{"text": "🔐 AmneziaWG 3.1 · роутеры", "callback_data": "awg:menu"}],
+            [{"text": "📱 VLESS Reality · телефоны", "callback_data": "vless:menu"}],
             [{"text": "🆕 Поднять сервер из Storage Template", "callback_data": "srv:new"}],
             [{"text": "🐳 Контейнеры", "callback_data": "srv:docker"},
              {"text": "🔍 Протоколы", "callback_data": "srv:go:protocols"}],
@@ -1386,6 +1392,118 @@ class Bot:
                    "настроек — пропадёт. Сервер будет остановлен и запущен обратно."),
             ui.note("Адрес сервера при этом не меняется."),
         ), rows)
+
+    # --- VLESS Reality: пользователи 3X-UI -----------------------------------
+
+    PANEL_SCRIPT = "/opt/panel/client.py"
+
+    def _panel(self, args: str, timeout: int = 60) -> remote.Result:
+        """Команда управления панелью. Панель слушает только localhost на
+        VPN-сервере, поэтому ходим туда по SSH, а не открываем порт наружу."""
+        return self._awg(f"{self.PANEL_SCRIPT} {args}", timeout=timeout)
+
+    def vless_menu(self) -> None:
+        try:
+            listing = self._panel("list")
+        except remote.RemoteError as exc:
+            return self.send(
+                ui.joined(ui.title("VLESS Reality", ui.WARN), ui.esc(str(exc))),
+                [[{"text": "🔑 Задать SSH-ключ", "callback_data": "set:SSH_KEY_PATH"}],
+                 [{"text": "◀️ Сервер", "callback_data": "srv:menu"}]])
+        if not listing.ok:
+            return self.send(ui.joined(ui.title("Панель не ответила", ui.NO),
+                                       ui.block([listing.text(400)])),
+                             [[{"text": "◀️ Сервер", "callback_data": "srv:menu"}]])
+
+        rows, names = [], []
+        for line in listing.out.strip().splitlines():
+            parts = line.split("\t")
+            if len(parts) == 4:
+                name, _uuid, traffic, state = parts
+                names.append(name)
+                mark = "" if state == "вкл" else " ⏸"
+                rows.append(f"{name:<14} {traffic:>8}{mark}")
+            elif line.strip():
+                rows.append(line.strip())
+
+        keyboard = [[{"text": "➕ Выпустить ссылку", "callback_data": "vless:new"}]]
+        if names:
+            keyboard.append([{"text": "🔗 Прислать ссылку", "callback_data": "vless:link"}])
+            keyboard.append([{"text": "🗑 Удалить", "callback_data": "vless:del"}])
+        keyboard.append([{"text": "◀️ Сервер", "callback_data": "srv:menu"}])
+
+        self.send(ui.joined(
+            ui.title("VLESS Reality · мобильные", "📱"),
+            ui.esc(f"Порт 443 на {domain_of(self.cfg, self.secrets) or 'вашем домене'}, "
+                   "маскировка под обычный HTTPS. Ссылка вставляется в Hiddify, v2rayNG "
+                   "или sing-box из буфера обмена — файл не нужен."),
+            ui.title("Клиенты"),
+            ui.block(rows) if rows else ui.note("пока ни одного"),
+        ), keyboard)
+
+    def vless_pick(self, action: str) -> None:
+        try:
+            listing = self._panel("list")
+        except remote.RemoteError as exc:
+            return self.send(f"{ui.NO} {ui.esc(str(exc))}")
+        names = [l.split("\t")[0] for l in listing.out.strip().splitlines() if "\t" in l]
+        if not names:
+            return self.vless_menu()
+        rows = [[{"text": n, "callback_data": f"vless:{action}:{n}"}] for n in names[:20]]
+        rows.append([{"text": "◀️ Назад", "callback_data": "vless:menu"}])
+        self.send(ui.joined(
+            ui.title("Удалить клиента" if action == "del" else "Прислать ссылку",
+                     "🗑" if action == "del" else "🔗"),
+            ui.esc("Удаление необратимо: ключ перестанет работать сразу."
+                   if action == "del" else "Ссылка придёт следующим сообщением."),
+        ), rows)
+
+    def vless_issue(self, name: str) -> None:
+        header = ui.title(f"Выпуск ссылки {name}", "📱")
+        message_id = self.send(ui.joined(header, ui.note("создаю клиента в панели…")))
+
+        def worker() -> None:
+            try:
+                made = self._panel(f"add {name}")
+                if not made.ok or "vless://" not in made.out:
+                    return self.edit(message_id, ui.joined(
+                        ui.title("Не вышло", ui.NO), ui.block([made.text(500)])))
+                self._show_link(message_id, name, made.out.strip())
+            except Exception as exc:                           # noqa: BLE001
+                logger.exception("выпуск ссылки не удался")
+                self.edit(message_id, ui.joined(ui.title("Ошибка", ui.NO), ui.block([str(exc)])))
+
+        threading.Thread(target=worker, name="vless-issue", daemon=True).start()
+
+    def vless_link(self, name: str) -> None:
+        try:
+            got = self._panel(f"link {name}")
+        except remote.RemoteError as exc:
+            return self.send(f"{ui.NO} {ui.esc(str(exc))}")
+        if not got.ok or "vless://" not in got.out:
+            return self.send(ui.joined(ui.title("Не нашлось", ui.NO), ui.block([got.text(300)])))
+        self._show_link(self.send(ui.note("…")), name, got.out.strip())
+
+    def _show_link(self, message_id: int, name: str, link: str) -> None:
+        """Ссылка отдельным сообщением моноширинным блоком — чтобы копировалась
+        одним касанием и не ломалась переносами."""
+        self.edit(message_id, ui.joined(
+            ui.title(f"Готово · {name}", ui.YES),
+            ui.esc("Скопируйте ссылку ниже и вставьте в приложение: Hiddify, "
+                   "v2rayNG или sing-box. Добавление профиля из буфера обмена."),
+            ui.note("Ссылка — это ключ доступа. Не публикуйте её."),
+        ))
+        self.send(f"<code>{ui.esc(link)}</code>")
+
+    def vless_del(self, name: str) -> None:
+        try:
+            done = self._panel(f"del {name}")
+        except remote.RemoteError as exc:
+            return self.send(f"{ui.NO} {ui.esc(str(exc))}")
+        self.send(ui.joined(
+            ui.title("Удалён" if done.ok else "Не вышло", ui.YES if done.ok else ui.NO),
+            ui.block([done.text(300)]),
+        ), [[{"text": "📱 К списку", "callback_data": "vless:menu"}]])
 
     # --- AmneziaWG 3.1: выпуск ключей ----------------------------------------
 
@@ -1896,6 +2014,9 @@ class Bot:
         if key == "AWG_CLIENT_NAME":
             self.edit(receipt, ui.joined(ui.title("Принято", ui.YES), ui.esc(value)))
             return self.awg_issue(value)
+        if key == "VLESS_CLIENT_NAME":
+            self.edit(receipt, ui.joined(ui.title("Принято", ui.YES), ui.esc(value)))
+            return self.vless_issue(value)
         self.secrets.set(key, value)
         shown = masked(value) if is_secret(key) else value
         self.edit(receipt, f"✅ {key.replace('_', ' ').lower()}: {shown}")
@@ -2244,6 +2365,22 @@ class Bot:
                  [{"text": "◀️ Отмена", "callback_data": "srv:storage"}]])
         if data.startswith("srv:go:restore:"):
             return self.server_action("restore:" + data.split(":", 3)[3])
+        if data == "vless:menu":
+            return self.vless_menu()
+        if data == "vless:new":
+            self.awaiting = "VLESS_CLIENT_NAME"
+            return self.send(ui.joined(
+                ui.title("Имя для нового клиента", "📱"),
+                ui.esc("Пришлите короткое имя — оно будет видно в списке и в названии "
+                       "профиля на телефоне.\n\nНапример: oleg-iphone, masha-android"),
+                ui.esc("/cancel — выйти"),
+            ))
+        if data in ("vless:link", "vless:del"):
+            return self.vless_pick(data.split(":", 1)[1])
+        if data.startswith("vless:link:"):
+            return self.vless_link(data.split(":", 2)[2])
+        if data.startswith("vless:del:"):
+            return self.vless_del(data.split(":", 2)[2])
         if data == "awg:menu":
             return self.awg_menu()
         if data == "awg:new":

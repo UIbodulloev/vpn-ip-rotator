@@ -564,6 +564,59 @@ class SetupWizardTest(unittest.TestCase):
             self.h.pump()
             self.assertIn("Не принял", self.h.tg.all_visible(), f"принято опасное имя: {bad}")
 
+    def test_vless_показывает_клиентов_панели(self):
+        self._fake_ssh({"client.py list":
+                        "amnezia-1\tuuid-1\t1.2ГБ\tвкл\n"
+                        "oleg-iphone\tuuid-2\t340МБ\tвкл\n"})
+        self.h.tg.user_says("/vless")
+        self.h.pump()
+        card = self.h.tg.all_visible()
+        self.assertIn("oleg-iphone", card)
+        self.assertIn("340МБ", card, "не показан трафик")
+        buttons = [d for _, d in self.h.tg.buttons()]
+        for target in ("vless:new", "vless:link", "vless:del"):
+            self.assertIn(target, buttons)
+
+    def test_выпуск_ссылки_vless(self):
+        link = ("vless://11111111-2222-3333-4444-555555555555@vpn.example.com:443"
+                "?type=tcp&security=reality&pbk=KEY&sni=www.example.com#oleg")
+        calls = self._fake_ssh({"client.py add": link})
+        self.h.tg.user_taps("vless:new")
+        self.h.pump()
+        self.assertEqual(self.h.bot.awaiting, "VLESS_CLIENT_NAME")
+
+        self.h.tg.user_says("oleg")
+        self.h.pump()
+        import time as _t
+        for _ in range(50):
+            if any("vless://" in s for s in self.h.tg.timeline):
+                break
+            _t.sleep(0.02)
+        visible = self.h.tg.all_visible()
+        self.assertIn("vless://", visible, "ссылка не отправлена")
+        self.assertIn("Hiddify", visible, "не сказано, куда её вставлять")
+        self.assertTrue(any("client.py add oleg" in c for c in calls))
+
+    def test_vless_имя_с_инъекцией_отвергается(self):
+        self._fake_ssh({})
+        self.h.tg.user_taps("vless:new")
+        self.h.pump()
+        for bad in ("a; id", "$(whoami)", "../x"):
+            self.h.tg.timeline.clear()
+            self.h.bot.awaiting = "VLESS_CLIENT_NAME"
+            self.h.tg.user_says(bad)
+            self.h.pump()
+            self.assertIn("Не принял", self.h.tg.all_visible(), f"принято: {bad}")
+
+    def test_оба_протокола_доступны_из_меню_сервера(self):
+        self.h.secrets.set("UPCLOUD_TOKEN", GOOD_UC)
+        self.h.secrets.set("SERVER_UUID", self.h.server_uuid)
+        self.h.tg.user_says("/server")
+        self.h.pump()
+        buttons = [d for _, d in self.h.tg.buttons()]
+        self.assertIn("awg:menu", buttons, "нет входа в AmneziaWG 3.1")
+        self.assertIn("vless:menu", buttons, "нет входа в VLESS Reality")
+
     def test_кнопка_инструкции_есть_в_главном_меню(self):
         self.h.tg.user_says("/help")
         self.h.pump()
