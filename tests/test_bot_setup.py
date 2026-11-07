@@ -620,7 +620,19 @@ class SetupWizardTest(unittest.TestCase):
     def test_кнопка_инструкции_есть_в_главном_меню(self):
         self.h.tg.user_says("/help")
         self.h.pump()
-        self.assertIn("guide:menu", [d for _, d in self.h.tg.buttons()])
+        buttons = [d for _, d in self.h.tg.buttons()]
+        self.assertIn("guide:menu", buttons)
+        self.assertIn("guide:howto", buttons, "шпаргалка не вынесена на первый экран")
+
+    def test_шпаргалка_покрывает_обе_выдачи_и_запрет(self):
+        """Главное, что нужно знать администратору, должно быть на одной странице."""
+        from rotator import guide
+        howto = guide.PAGES["howto"][1]
+        for must in ("/vless", "/awg", "/rotate", "/costs", "/diag", "ssh -L"):
+            self.assertIn(must, howto, f"в шпаргалке нет {must}")
+        protocols = guide.PAGES["protocols"][1]
+        self.assertIn("приложение Amnezia", protocols,
+                      "нет предупреждения про затирание 2.0")
 
     def test_меню_команд_публикуется_и_совпадает_со_справкой(self):
         from rotator.bot import COMMANDS, HELP

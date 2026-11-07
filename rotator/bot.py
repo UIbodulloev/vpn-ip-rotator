@@ -468,7 +468,8 @@ class Bot:
         if command in ("/start", "/help"):
             self.send(
                 ui.joined(ui.title("Команды", "🤖"), ui.esc(HELP.split("\n", 2)[-1].strip())),
-                MAIN_KEYBOARD,
+                [[{"text": "🧭 Шпаргалка: что делать", "callback_data": "guide:howto"}]]
+                + MAIN_KEYBOARD,
             )
         elif command == "/menu":
             self.main_menu()
@@ -943,7 +944,8 @@ class Bot:
             [{"text": "🖥 Сервер", "callback_data": "srv:menu"},
              {"text": "💶 Расходы", "callback_data": "cmd:costs"}],
             [{"text": "⚙️ Настройки", "callback_data": "cmd:settings"},
-             {"text": "📖 Инструкция", "callback_data": "guide:menu"}],
+             {"text": "🧭 Шпаргалка", "callback_data": "guide:howto"}],
+            [{"text": "📖 Вся инструкция", "callback_data": "guide:menu"}],
         ])
 
     # --- настройки -----------------------------------------------------------

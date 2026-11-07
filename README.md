@@ -430,7 +430,8 @@ python3 -m unittest discover -s tests -v
 | **Настройка** | `/setup` `/check` `/diag` `/zones` `/plans` |
 | **Справка** | `/guide` |
 
-Страницы справки: `/guide_overview`, `/guide_modes`, `/guide_keys`,
+Страницы справки: `/guide_howto` (шпаргалка по задачам),
+`/guide_protocols` (кому какой протокол), `/guide_overview`, `/guide_modes`, `/guide_keys`,
 `/guide_where`, `/guide_chats`, `/guide_manual`, `/guide_testing`,
 `/guide_money`, `/guide_checklist`.
 
