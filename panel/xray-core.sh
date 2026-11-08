@@ -54,7 +54,17 @@ pin)
         URL="https://github.com/XTLS/Xray-core/releases/download/v$VER/Xray-linux-64.zip"
         say "скачиваю $URL"
         curl -fsSL -o "$TMP/x.zip" "$URL" || die "не скачалось — проверьте, что версия v$VER существует"
-        unzip -q -o "$TMP/x.zip" -d "$TMP" || die "архив не распаковался"
+        # Через python3, а не unzip: на минимальном сервере unzip обычно нет,
+        # а python3 стоит — на нём же работает client.py.
+        python3 - "$TMP/x.zip" "$TMP" <<'PYEOF' || die "архив не распаковался"
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as z:
+    names = [n for n in z.namelist() if n.rsplit("/", 1)[-1] == "xray"]
+    if not names:
+        raise SystemExit("в архиве нет бинарника xray")
+    with z.open(names[0]) as src, open(sys.argv[2] + "/xray", "wb") as dst:
+        dst.write(src.read())
+PYEOF
         [ -f "$TMP/xray" ] || die "в архиве нет бинарника xray"
         chmod 755 "$TMP/xray"
         # Проверяем ДО подмены: сломанный бинарник оставит сервер без VPN.
