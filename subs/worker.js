@@ -183,14 +183,13 @@ function proxies(uuid, env) {
     obfs: { type: "salamander", password: env.VPN_HY2_OBFS },
     tls: { enabled: true, server_name: env.VPN_HOST },
   };
+  // Не urltest. Он выбирает по задержке, а задержка у задушенного VLESS как
+  // раз хорошая: оператор режет полосу, а не пинг. Телефон честно измерял
+  // 48 мс у VLESS против 94 мс у Hysteria2 и уверенно выбирал худший канал.
+  // Поэтому выбор жёсткий, с возможностью переключить руками — на случай
+  // сети, где режут наоборот, UDP.
   return [
-    {
-      type: "urltest",
-      tag: "proxy",
-      outbounds: ["hysteria2", "vless"],
-      interval: "10m",
-      tolerance: 300,
-    },
+    { type: "selector", tag: "proxy", outbounds: ["hysteria2", "vless"], default: "hysteria2" },
     hy2,
     vless,
     direct,
@@ -229,6 +228,12 @@ function singboxConfig(uuid, env, ru) {
         type: "tun",
         tag: "tun-in",
         address: ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
+        // 1400, а не значение по умолчанию. Телефон объявляет приложениям тот
+        // размер пакета, который видит на tun; при девяти тысячах YouTube
+        // отправляет QUIC-датаграммы, которые в реальный канал не влезают,
+        // теряются и пересылаются заново. Внешне это «скорость высокая, а
+        // Shorts подтормаживают».
+        mtu: 1400,
         auto_route: true,
         strict_route: true,
       },
