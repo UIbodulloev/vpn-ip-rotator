@@ -178,9 +178,23 @@ def identity(headers, ip: str, salt: str) -> tuple[str, str, str]:
     return "soft", family, family
 
 
+def looks_like_browser(headers) -> bool:
+    """Это человек открыл ссылку в браузере, а не приложение её установило.
+
+    Так делают и администратор из любопытства, и сам человек, прежде чем
+    скопировать ссылку. Браузер профиль установить не может, а место
+    устройства занял бы — и настоящее приложение получило бы отказ. Проверено
+    на живом ключе: первой привязкой оказалась «mozilla», а sing-box после неё
+    получил 403.
+    """
+    agent = (headers.get("user-agent") or "").lower()
+    accept = (headers.get("accept") or "").lower()
+    return "mozilla" in agent and "text/html" in accept
+
+
 def register(uuid: str, headers, ip: str, limit: int) -> tuple[bool, str]:
     """Пустить ли это устройство к подписке. Пишет состояние по ходу дела."""
-    if uuid == PROBE_UUID:
+    if uuid == PROBE_UUID or looks_like_browser(headers):
         return True, ""
     now = time.time()
     with _state_lock:

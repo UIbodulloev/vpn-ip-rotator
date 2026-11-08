@@ -120,6 +120,30 @@ class DeviceBindingTest(unittest.TestCase):
         allowed, why = self.ask(ip="198.51.100.9")
         self.assertTrue(allowed, why)
 
+    def test_браузер_не_занимает_место_устройства(self):
+        """Ссылку открывают в браузере и администратор, и сам человек. Браузер
+        профиль не установит, а место занял бы — и приложение получило бы
+        отказ. Поймано на живом ключе: привязкой оказалась «mozilla»."""
+        browser = Headers({
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0) Safari/605.1",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9",
+        })
+        for _ in range(3):
+            allowed, why = self.m.register(self.uuid, browser, "203.0.113.5", 1)
+            self.assertTrue(allowed, why)
+        self.assertNotIn(self.uuid, self.m.load_state()["links"],
+                         "браузер занял место устройства")
+        self.assertTrue(self.ask()[0], "после браузера приложение не встало")
+
+    def test_приложение_с_похожим_агентом_всё_равно_считается(self):
+        """У некоторых клиентов User-Agent начинается с Mozilla, но html они не
+        просят. Отличаем по Accept, иначе лимит обойдётся подменой агента."""
+        sneaky = Headers({"User-Agent": "Mozilla/5.0 (compatible; MyProxyApp)",
+                          "Accept": "*/*"})
+        self.assertTrue(self.m.register(self.uuid, sneaky, "203.0.113.5", 1)[0])
+        self.assertIn(self.uuid, self.m.load_state()["links"],
+                      "подмена агента обошла счёт устройств")
+
     # --- точная привязка (Happ, v2RayTun: присылают x-hwid)
 
     def test_отпечаток_устройства_считается_точно(self):
