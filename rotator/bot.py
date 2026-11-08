@@ -242,10 +242,13 @@ def _check_client_name(v: str) -> str:
 
 
 def _check_sub_base(v: str) -> str:
-    if re.fullmatch(r"https://[A-Za-z0-9.-]+[A-Za-z0-9]", v.rstrip("/")):
+    # Порт нужен зеркалу на VPN-сервере: 443 там занят Xray, оно живёт на 8443.
+    if re.fullmatch(r"https://[A-Za-z0-9.-]+[A-Za-z0-9](:\d{1,5})?", v.rstrip("/")):
         return ""
-    return ("Нужен адрес вида https://sub.example.com — без пути и без слэша на конце.\n\n"
-            "Это хост, на который развёрнут генератор подписок (subs/deploy.sh).")
+    return ("Нужен адрес вида https://sub.example.com или https://sub.example.com:8443 — "
+            "без пути и без слэша на конце.\n\n"
+            "Это хост, на который развёрнут генератор подписок: воркер "
+            "(subs/deploy.sh) либо зеркало на VPN-сервере (panel/sub-mirror-install.sh).")
 
 
 def _check_domain(v: str) -> str:

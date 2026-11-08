@@ -776,6 +776,9 @@ class SetupWizardTest(unittest.TestCase):
         check = VALIDATORS["SUB_BASE_URL"]
         self.assertFalse(check("https://sub.example.com"))
         self.assertFalse(check("https://sub.example.com/"))
+        # Зеркало на VPN-сервере живёт на 8443: 443 там занят Xray.
+        self.assertFalse(check("https://sub2.example.com:8443"))
+        self.assertFalse(check("https://sub2.example.com:8443/"))
         for bad in ("sub.example.com", "http://sub.example.com",
                     "https://sub.example.com/path", "не ссылка"):
             self.assertTrue(check(bad), f"принят мусор: {bad}")
