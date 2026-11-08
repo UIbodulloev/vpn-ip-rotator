@@ -231,10 +231,10 @@ function instructionPage(host) {
   <ol>
     <li>
       <b>Установите приложение</b>
-      <p>Называется sing-box. Других приложений не нужно.</p>
+      <p>Называется <b>Hiddify</b>. Других приложений не нужно.</p>
       <div class="apps">
-        <a href="https://apps.apple.com/app/sing-box-vt/id6673731168">iPhone и iPad</a>
-        <a href="https://play.google.com/store/apps/details?id=io.nekohasekai.sfa">Android</a>
+        <a href="https://play.google.com/store/apps/details?id=app.hiddify.com">Android</a>
+        <a href="https://hiddify.com/app/">iPhone и iPad</a>
       </div>
     </li>
     <li>
@@ -245,8 +245,8 @@ function instructionPage(host) {
     </li>
     <li>
       <b>Добавьте профиль</b>
-      <p>В приложении откройте <b>Profiles</b> → <b>+</b> → тип <b>Remote</b>.
-         Вставьте ссылку в поле <b>URL</b>, имя можно любое. Сохраните.</p>
+      <p>Скопируйте ссылку, откройте приложение и нажмите <b>+</b> —
+         оно само предложит добавить её из буфера обмена.</p>
     </li>
     <li>
       <b>Включите</b>
@@ -263,9 +263,9 @@ function instructionPage(host) {
 
   <div class="note" style="background:transparent;color:var(--dim);border:1px solid var(--line)">
     <b>Банковское приложение капризничает?</b>
-    На Android можно убрать его из VPN целиком: в приложении
-    <b>Settings</b> → <b>Per-app proxy</b> → включить и снять галочки
-    с банков и Госуслуг. Такие приложения иногда ходят к своим серверам
+    На Android можно убрать его из VPN целиком: в настройках приложения
+    найдите раздел про приложения (<b>Per-app proxy</b>) и исключите
+    банки и Госуслуги. Такие приложения иногда ходят к своим серверам
     напрямую по адресу, минуя имена сайтов, и тогда список российских
     доменов им не помогает. На iPhone такой настройки нет — там, если
     приложение не пускает, выключите VPN на минуту.
@@ -274,16 +274,23 @@ function instructionPage(host) {
   <div class="note" style="background:transparent;color:var(--dim);border:1px solid var(--line)">
     <b>Если вам дали ссылку на <code>vless://</code></b>
     Это упрощённый вариант: он тоже работает, но через VPN идёт <i>весь</i>
-    трафик, включая российские сайты. Вставляется из буфера обмена в том же
-    sing-box, а также в Hiddify или v2rayNG. Если хотите, чтобы банки шли
-    напрямую, попросите у того, кто дал ссылку, подписку вместо неё.
+    трафик, включая российские сайты. Вставляется из буфера обмена в тот же
+    Hiddify, а также в v2rayNG. Если хотите, чтобы банки шли напрямую,
+    попросите у того, кто дал ссылку, подписку вместо неё.
+  </div>
+
+  <div class="note" style="background:transparent;color:var(--dim);border:1px solid var(--line)">
+    <b>Приложение sing-box сейчас не подойдёт</b>
+    Официальное приложение sing-box не договаривается с нашим сервером о
+    шифровании и пишет <code>reality verification failed</code>. Это их
+    известная недоработка, не ваша ошибка. Ставьте Hiddify.
   </div>
 
   <div class="note" style="background:transparent;color:var(--dim);border:1px solid var(--line)">
     <b>Если что-то не работает</b>
     Выключите и включите переключатель в приложении. Если не помогло — напишите
     тому, кто дал вам ссылку: возможно, сменился адрес сервера, и профиль нужно
-    обновить кнопкой обновления в списке Profiles.
+    обновить кнопкой обновления в списке профилей.
   </div>
 
   <footer>Личный VPN. Настройки обновляются автоматически.</footer>

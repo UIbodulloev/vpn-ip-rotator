@@ -1543,8 +1543,8 @@ class Bot:
         self.send(ui.joined(
             ui.title("VLESS Reality · мобильные", "📱"),
             ui.esc(f"Порт 443 на {domain_of(self.cfg, self.secrets) or 'вашем домене'}, "
-                   "маскировка под обычный HTTPS. Ссылка вставляется в Hiddify, v2rayNG "
-                   "или sing-box из буфера обмена — файл не нужен."),
+                   "маскировка под обычный HTTPS. Ссылка вставляется в Hiddify или "
+                   "v2rayNG из буфера обмена — файл не нужен."),
             ui.title("Клиенты"),
             ui.block(rows) if rows else ui.note("пока ни одного"),
             ui.note("Трафик — вверх и вниз вместе, за всё время: его считает панель, "
@@ -1647,7 +1647,7 @@ class Bot:
         # Отдельным сообщением и без лишнего — чтобы пересылалось как есть.
         self.send(
             f"<b>Ваш VPN</b>\n\n"
-            f"1. Установите приложение <b>sing-box</b>.\n"
+            f"1. Установите приложение <b>Hiddify</b>.\n"
             f"2. Откройте инструкцию: {ui.esc(base)}/\n"
             f"3. Ваша личная ссылка:\n\n"
             f"<code>{ui.esc(base)}/sub/{ui.esc(uuid)}</code>\n\n"
@@ -1660,8 +1660,8 @@ class Bot:
         одним касанием и не ломалась переносами."""
         self.edit(message_id, ui.joined(
             ui.title(f"Готово · {name}", ui.YES),
-            ui.esc("Скопируйте ссылку ниже и вставьте в приложение: Hiddify, "
-                   "v2rayNG или sing-box. Добавление профиля из буфера обмена."),
+            ui.esc("Скопируйте ссылку ниже и вставьте в приложение: Hiddify "
+                   "или v2rayNG. Добавление профиля из буфера обмена."),
             ui.note("Ссылка — это ключ доступа. Не публикуйте её."),
         ))
         self.send(f"<code>{ui.esc(link)}</code>")

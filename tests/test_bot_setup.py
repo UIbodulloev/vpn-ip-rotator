@@ -746,8 +746,12 @@ class SetupWizardTest(unittest.TestCase):
         page = src[src.index("function instructionPage"):]
         for bad in ("http://", "cdn.", "fonts.googleapis", "<script"):
             self.assertNotIn(bad, page, f"страница тянет внешнее: {bad}")
-        for must in ("sing-box", "Profiles", "Remote", "Госуслуги"):
+        for must in ("Hiddify", "Госуслуги", "буфера обмена"):
             self.assertIn(must, page, f"в инструкции нет {must}")
+        # Стоковое приложение sing-box не соединяется с Xray 26.9.8+: человек
+        # должен прочитать об этом здесь, а не гадать над ошибкой.
+        self.assertIn("reality verification failed", page,
+                      "страница не объясняет ошибку официального sing-box")
 
     def test_оба_протокола_доступны_из_меню_сервера(self):
         self.h.secrets.set("UPCLOUD_TOKEN", GOOD_UC)
