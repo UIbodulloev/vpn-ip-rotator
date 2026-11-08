@@ -564,6 +564,62 @@ class SetupWizardTest(unittest.TestCase):
             self.h.pump()
             self.assertIn("Не принял", self.h.tg.all_visible(), f"принято опасное имя: {bad}")
 
+    def _with_upcloud(self):
+        self.h.secrets.set("UPCLOUD_TOKEN", GOOD_UC)
+        self.h.secrets.set("SERVER_UUID", self.h.server_uuid)
+
+    def test_servers_показывает_только_свой_когда_он_один(self):
+        self._with_upcloud()
+        self.h.tg.user_says("/servers")
+        self.h.pump()
+        card = self.h.tg.all_visible()
+        self.assertIn(self.h.server_uuid, card)
+        self.assertIn("🏠", card, "свой сервер не помечен")
+        self.assertNotIn("❓", card, "лишний сервер взялся из ниоткуда")
+        self.assertIn("посторонних серверов нет", card)
+
+    def test_servers_находит_забытый_сервер_и_считает_его_цену(self):
+        """Сбой ротации может оставить работающий сервер: он тратит деньги и
+        может держать копии ключей, а снаружи его не видно."""
+        self.h.cloud.servers["dead-beef-0000-1111-222233334444"] = {
+            "uuid": "dead-beef-0000-1111-222233334444",
+            "state": "started", "zone": "nl-ams1", "plan": "1xCPU-1GB",
+            "hostname": "amnezia-clone", "title": "amnezia-clone",
+        }
+        self.h.cloud.ips["203.0.113.77"] = "dead-beef-0000-1111-222233334444"
+        self._with_upcloud()
+        self.h.tg.user_says("/servers")
+        self.h.pump()
+        card = self.h.tg.all_visible()
+        self.assertIn("amnezia-clone", card, "забытый сервер не показан")
+        self.assertIn("dead-beef-0000-1111-222233334444", card, "нет UUID для поиска в панели")
+        self.assertIn("203.0.113.77", card, "не показан адрес — по нему приходят жалобы")
+        self.assertIn("❓", card, "забытый сервер не помечен")
+        self.assertIn("🏠", card, "свой сервер не помечен")
+        # 0.5556 сотых за час * 730 = 4.06 в месяц; важно, что цена вообще есть.
+        self.assertIn("4.06", card, "не посчитана цена забытого сервера")
+        self.assertIn("удаление необратимо", card, "нет предупреждения перед удалением")
+
+    def test_валюта_берётся_из_account_details(self):
+        """В /1.3/account валюты нет — она только в /1.3/account/details/{user}.
+        Из-за этого в карточке расходов раньше стоял «?» вместо EUR."""
+        self._with_upcloud()
+        self.h.tg.user_says("/costs")
+        self.h.pump()
+        card = self.h.tg.all_visible()
+        self.assertIn("EUR", card, "валюта не прочиталась")
+        self.assertNotIn("?/мес", card, "валюта снова подставилась заглушкой")
+
+    def test_servers_без_заданного_uuid_не_врёт_про_чужие(self):
+        self._with_upcloud()
+        self.h.secrets.set("SERVER_UUID", "")
+        self.h.tg.user_says("/servers")
+        self.h.pump()
+        card = self.h.tg.all_visible()
+        self.assertIn("SERVER_UUID не задан", card)
+        self.assertNotIn("посторонних серверов нет", card,
+                         "без своего UUID нельзя утверждать, что чужих нет")
+
     def test_vless_показывает_клиентов_панели(self):
         self._fake_ssh({"client.py list":
                         "amnezia-1\tuuid-1\t1.2ГБ\tвкл\n"

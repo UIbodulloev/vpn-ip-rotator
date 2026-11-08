@@ -143,7 +143,10 @@ class FakeCloud:
 
     def _upcloud(self, method: str, path: str, body: dict, params: dict) -> FakeResponse:
         if path == "/1.3/account":
-            return FakeResponse(200, {"account": {"username": "fake"}})
+            # Валюты тут нет — настоящий API отдаёт её только в account/details.
+            return FakeResponse(200, {"account": {"username": "fake", "credits": 1000}})
+        if path == "/1.3/account/details/fake":
+            return FakeResponse(200, {"account": {"username": "fake", "currency": "EUR"}})
         if path == "/1.3/price":
             # Реальные величины из документации UpCloud: сотые доли валюты за час.
             return FakeResponse(200, {"prices": {"zone": [{
@@ -159,11 +162,17 @@ class FakeCloud:
             }]}})
 
         if path == "/1.3/ip_address" and method == "GET":
-            return FakeResponse(200, {"ip_addresses": {"ip_address": [
-                {"address": a, "access": "public", "family": "IPv4",
-                 "floating": "yes" if a in self.floating else "no"}
-                for a in self.ips
-            ]}})
+            # Настоящий API кладёт сюда и UUID сервера, к которому привязан
+            # адрес (у неприсоединённых плавающих его нет). По нему строится
+            # список серверов в боте, поэтому фейк обязан вести себя так же.
+            out = []
+            for a, owner in self.ips.items():
+                entry = {"address": a, "access": "public", "family": "IPv4",
+                         "floating": "yes" if a in self.floating else "no"}
+                if owner:
+                    entry["server"] = owner
+                out.append(entry)
+            return FakeResponse(200, {"ip_addresses": {"ip_address": out}})
 
         match = re.fullmatch(r"/1\.3/storage/(private|template|normal|backup)", path)
         if match and method == "GET":

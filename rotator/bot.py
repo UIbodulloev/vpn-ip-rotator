@@ -78,6 +78,7 @@ COMMANDS = [
     ("simulate", "холостой прогон: что сделала бы автоматика"),
     ("plan", "что именно сделает каждый режим на вашем сервере"),
     ("costs", "расходы в UpCloud: за что и сколько"),
+    ("servers", "все серверы аккаунта, включая забытые"),
     ("rotate", "сменить адрес"),
     ("mode", "режим автоматики: auto / clone / move / floating"),
     ("pause", "выключить автоматику"),
@@ -92,6 +93,20 @@ COMMANDS = [
     ("rollback", "пересоздать сервер из последнего Storage Template"),
 ]
 
+def _plural(count: int) -> str:
+    """«Ещё 1 сервер» / «Ещё 2 сервера» / «Ещё 5 серверов»."""
+    tail = count % 100
+    if 11 <= tail <= 14:
+        word = "серверов"
+    elif count % 10 == 1:
+        word = "сервер"
+    elif count % 10 in (2, 3, 4):
+        word = "сервера"
+    else:
+        word = "серверов"
+    return f"Ещё {count} {word}"
+
+
 def _help_text() -> str:
     """Собирается из COMMANDS, чтобы список в чате не расходился с меню."""
     by_name = dict(COMMANDS)
@@ -105,7 +120,7 @@ def _help_text() -> str:
 HELP_GROUPS = [
     ('Главное', ['menu', 'server', 'settings', 'awg', 'vless']),
     ('Наблюдение', ['status', 'probe', 'ip', 'log']),
-    ('Проверка вхолостую', ['simulate', 'plan', 'costs']),
+    ('Проверка вхолостую', ['simulate', 'plan', 'costs', 'servers']),
     ('Управление', ['rotate', 'mode', 'pause', 'resume', 'rollback']),
     ('Настройка', ['setup', 'check', 'diag', 'zones', 'plans']),
     ('Справка', ['guide']),
@@ -506,6 +521,8 @@ class Bot:
             self.cmd_plan(argument)
         elif command == "/costs":
             self.cmd_costs()
+        elif command == "/servers":
+            self.cmd_servers()
         elif command == "/ip":
             self.cmd_ip()
         elif command == "/rotate":
@@ -744,7 +761,7 @@ class Bot:
         message_id = self.send(f"{ui.WAIT} Читаю прайс аккаунта…")
         uc = self.engine.uc
         try:
-            account = uc.account(timeout=UI_TIMEOUT)
+            currency = uc.currency(timeout=UI_TIMEOUT)
             server = uc.server(self.secrets.get("SERVER_UUID"))
             prices = uc.prices(timeout=UI_TIMEOUT)
             storages = uc.storages(timeout=UI_TIMEOUT)
@@ -755,7 +772,7 @@ class Bot:
 
         result = costs.estimate(
             prices=prices,
-            currency=account.get("currency") or "?",
+            currency=currency or "в валюте счёта",
             server=server,
             storages=storages,
             ip_addresses=addresses,
@@ -785,10 +802,72 @@ class Bot:
             ui.note("Оценка по прайсу вашего аккаунта (GET /1.3/price). "
                     "Точная сумма — в счёте UpCloud."),
         ]
-        rows = [[{"text": "📖 Подробнее про деньги", "callback_data": "guide:money"}]]
+        rows = [[{"text": "🗂 Все серверы аккаунта", "callback_data": "cmd:servers"}],
+                [{"text": "📖 Подробнее про деньги", "callback_data": "guide:money"}]]
         if any(line.what == "Шаблон диска" for line in result.lines):
             rows.insert(0, [{"text": "🧹 Убрать лишнее", "callback_data": "costs:prune"}])
         self.edit(message_id, ui.joined(*blocks), rows)
+
+    def cmd_servers(self) -> None:
+        """Все серверы аккаунта, с пометкой тех, о которых ротатор не знает.
+
+        Сбой ротации может оставить работающий сервер: он тикает по счётчику и
+        может держать копии ключей. Снаружи это не видно никак — пока не придёт
+        счёт или жалоба на его адрес.
+        """
+        message_id = self.send(f"{ui.WAIT} Читаю список серверов…")
+        uc = self.engine.uc
+        try:
+            found = uc.servers(timeout=UI_TIMEOUT)
+            addresses = uc.ip_addresses(timeout=UI_TIMEOUT)
+            currency = uc.currency(timeout=UI_TIMEOUT)
+            prices = uc.prices(timeout=UI_TIMEOUT)
+        except Exception as exc:                               # noqa: BLE001
+            return self.edit(message_id, ui.joined(
+                ui.title("Не удалось прочитать список", ui.NO), ui.block([str(exc)])))
+
+        by_server: dict[str, list[str]] = {}
+        for ip in addresses:
+            if ip.get("access") == "public" and ip.get("family") == "IPv4" and ip.get("server"):
+                by_server.setdefault(ip["server"], []).append(ip.get("address") or "")
+
+        ours = (self.secrets.get("SERVER_UUID") or "").strip()
+        cur = currency or "в валюте счёта"
+        lines, strangers, extra_cost = [], [], 0.0
+        # Свой сервер первым, остальные по имени: так список читается сверху вниз.
+        for srv in sorted(found, key=lambda s: (s.get("uuid") != ours, s.get("title") or "")):
+            uuid = srv.get("uuid") or ""
+            mine = uuid == ours
+            price = costs.server_monthly(prices, srv.get("zone") or "", srv.get("plan") or "")
+            if not mine:
+                strangers.append(srv)
+                extra_cost += price or 0.0
+            lines.append(f"{'🏠' if mine else '❓'} {(srv.get('title') or '—')[:30]}")
+            lines.append(f"   {uuid}")
+            lines.append(f"   {srv.get('plan') or '?'} · {srv.get('zone') or '?'} · "
+                         f"{srv.get('state') or '?'}"
+                         + (f" · {price:.2f} {cur}/мес" if price else ""))
+            for address in by_server.get(uuid, []) or ["адрес не найден"]:
+                lines.append(f"   {address}")
+
+        blocks = [ui.title("Серверы аккаунта", "🗂"), ui.block(lines) if lines else
+                  ui.note("в аккаунте нет ни одного сервера")]
+        if not ours:
+            blocks.append(ui.note("SERVER_UUID не задан, поэтому пометить свой сервер нечем."))
+        elif strangers:
+            blocks += [
+                ui.title("Незнакомые", ui.WARN),
+                ui.esc(f"Ротатор знает только один сервер — ваш. {_plural(len(strangers))} "
+                       f"он не трогает — но деньги идут: примерно "
+                       f"{extra_cost:.2f} {cur}/мес."),
+                ui.note("Сбой ротации мог оставить копию с вашими ключами. Прежде чем "
+                        "удалять, посмотрите, что на сервере: удаление необратимо."),
+            ]
+        else:
+            blocks.append(ui.note(f"{ui.YES} посторонних серверов нет — в аккаунте только ваш."))
+
+        self.edit(message_id, ui.joined(*blocks),
+                  [[{"text": "💶 Расходы", "callback_data": "cmd:costs"}]])
 
     def prune_templates(self) -> None:
         """Убрать Storage Template — и те, что в state, и осиротевшие от прошлых сбоев."""

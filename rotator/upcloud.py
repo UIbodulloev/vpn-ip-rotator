@@ -94,6 +94,21 @@ class UpCloud:
     def account(self, timeout: float | None = None) -> dict[str, Any]:
         return self._call("GET", "/1.3/account", timeout=timeout).get("account", {})
 
+    def account_details(self, username: str, timeout: float | None = None) -> dict[str, Any]:
+        """Валюта аккаунта живёт только здесь: в /1.3/account её нет."""
+        return self._call("GET", f"/1.3/account/details/{username}",
+                          timeout=timeout).get("account", {})
+
+    def currency(self, timeout: float | None = None) -> str:
+        """Код валюты счёта. Пустая строка — не удалось выяснить."""
+        try:
+            username = self.account(timeout=timeout).get("username") or ""
+            if not username:
+                return ""
+            return str(self.account_details(username, timeout=timeout).get("currency") or "")
+        except Exception:                                      # noqa: BLE001
+            return ""
+
     def zones(self, timeout: float | None = None) -> list[dict[str, Any]]:
         return self._call("GET", "/1.3/zone", timeout=timeout).get("zones", {}).get("zone", [])
 

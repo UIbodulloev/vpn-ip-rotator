@@ -75,6 +75,22 @@ def _storage_price(zone: dict[str, Any], tier: str) -> tuple[float, float] | Non
     return None
 
 
+def server_monthly(prices: list[dict[str, Any]], zone_name: str, plan: str) -> float | None:
+    """Во сколько обходится один сервер в месяц. None — плана нет в прайсе.
+
+    Нужна, чтобы показать цену чужого сервера в аккаунте: estimate() считает
+    только настроенный, а забытая машина тикает по счётчику ровно так же.
+    """
+    zone = zone_prices(prices, zone_name)
+    if not zone:
+        return None
+    found = _plan_price(zone, plan)
+    if not found:
+        return None
+    price, units = found
+    return monthly(price, 1 / units)
+
+
 def estimate(
     *,
     prices: list[dict[str, Any]],
