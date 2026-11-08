@@ -15,21 +15,136 @@
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-// Правила маршрутизации для России. Наборы проверены на существование;
-// geoip-private больше не выпускается — локальные сети ловим через ip_is_private.
-const SRS = "https://raw.githubusercontent.com/SagerNet";
-const RULE_SETS = [
-  { tag: "ru-domains", url: `${SRS}/sing-geosite/rule-set/geosite-category-ru.srs` },
-  { tag: "ru-yandex", url: `${SRS}/sing-geosite/rule-set/geosite-yandex.srs` },
-  { tag: "ru-vk", url: `${SRS}/sing-geosite/rule-set/geosite-vk.srs` },
-  { tag: "ru-sberbank", url: `${SRS}/sing-geosite/rule-set/geosite-sberbank.srs` },
-  { tag: "ru-ips", url: `${SRS}/sing-geoip/rule-set/geoip-ru.srs` },
-];
-const RU_DOMAIN_TAGS = ["ru-domains", "ru-yandex", "ru-vk", "ru-sberbank"];
+// Списки российских сервисов. Раньше их качал сам телефон с raw.githubusercontent
+// в виде rule-set — и это была главная причина поломок: в России этот адрес
+// заблокирован, поэтому скачивать приходилось через туннель, а туннель на старте
+// ещё не поднят. Не скачалось — служба не запускается вовсе. Теперь списки
+// подставляются прямо в конфиг, и телефону качать нечего.
+//
+// Источник ведёт сообщество, руками списки не правим:
+//   https://russia.iplist.opencck.org/
+const IPLIST = "https://russia.iplist.opencck.org/";
 
-function singboxConfig(uuid, env) {
+// Целые российские зоны закрываются одним суффиксом каждая — держать их
+// в списке доменов незачем.
+const RU_TLDS = [".ru", ".su", ".рф", ".xn--p1ai", ".москва", ".tatar", ".дети"];
+
+// На случай, если источник недоступен: крупные российские сервисы вне зоны .ru.
+// Деградация честная — домены по-прежнему пойдут мимо VPN, а вот подключения
+// прямо по IP-адресу уйдут в туннель.
+const FALLBACK_DOMAINS = [
+  "2gis.com",
+  "adjust.com",
+  "auto.yandex",
+  "avito.st",
+  "bitrix24.com",
+  "bitrix24.net",
+  "cdek.shopping",
+  "clstorage.net",
+  "dbankcloud.com",
+  "detmir.st",
+  "eda.yandex",
+  "habr.com",
+  "habrastorage.org",
+  "metrika.yandex",
+  "mradx.net",
+  "mvk.com",
+  "mycdn.me",
+  "naydex.net",
+  "ozon.com",
+  "ozon.kz",
+  "ozon.travel",
+  "paywb.com",
+  "sbis.link",
+  "static-storage.net",
+  "tamtam.chat",
+  "userapi.com",
+  "vk-apps.com",
+  "vk-cdn.me",
+  "vk-cdn.net",
+  "vk-portal.net",
+  "vk.cc",
+  "vk.com",
+  "vk.me",
+  "vkcache.com",
+  "vkuser.net",
+  "vkuseraudio.net",
+  "vkuservideo.net",
+  "webvisor.com",
+  "x5static.net",
+  "yads.tech",
+  "yandex.by",
+  "yandex.cloud",
+  "yandex.com",
+  "yandex.com.tr",
+  "yandex.kz",
+  "yandex.net",
+  "yandex.st",
+  "yandexadexchange.net",
+  "yandexcloud.net",
+  "yastatic.net",
+  "zen.me"
+];
+
+// «com.am» и подобное — это не домен, а публичный суффикс: такой фильтр увёл бы
+// мимо VPN всю зону целиком.
+const PUBLIC_SUFFIX_HEADS = new Set(["com", "net", "org", "co", "gov", "edu"]);
+
+function cleanDomains(text) {
+  const out = new Set();
+  for (let line of text.split("\n")) {
+    line = line.trim().toLowerCase().replace(/^\*\./, "").replace(/^\.+|\.+$/g, "");
+    // В источнике попадается мусор вида «yandex.net:443» — такое правило
+    // sing-box просто не поймёт.
+    if (!line || /[^a-z0-9.\-\u0080-\uffff]/.test(line) || !line.includes(".")) continue;
+    const parts = line.split(".");
+    if (parts.length === 2 && PUBLIC_SUFFIX_HEADS.has(parts[0])) continue;
+    if (RU_TLDS.some((t) => line.endsWith(t))) continue;   // уже покрыто суффиксом зоны
+    out.add(line);
+  }
+  return [...out].sort();
+}
+
+function cleanCidr(text) {
+  const out = new Set();
+  for (const line of text.split("\n")) {
+    const v = line.trim();
+    if (/^\d{1,3}(\.\d{1,3}){3}\/\d{1,2}$/.test(v)) out.add(v);
+  }
+  return [...out].sort();
+}
+
+/** Списки с кэшированием на сутки. Недоступен источник — отдаём запасной список,
+ *  но подписку не ломаем: неработающий VPN хуже неполного списка. */
+async function ruLists() {
+  const pull = async (query, clean, fallback) => {
+    try {
+      const answer = await fetch(IPLIST + query, {
+        cf: { cacheTtl: 86400, cacheEverything: true },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!answer.ok) throw new Error(`HTTP ${answer.status}`);
+      const list = clean(await answer.text());
+      if (list.length < 20) throw new Error("список подозрительно короткий");
+      return list;
+    } catch {
+      return fallback;
+    }
+  };
+  const [domains, cidr] = await Promise.all([
+    pull("?format=text&data=domains&wildcard=1", cleanDomains, FALLBACK_DOMAINS),
+    pull("?format=text&data=cidr4", cleanCidr, []),
+  ]);
+  return { domains, cidr };
+}
+
+function singboxConfig(uuid, env, ru) {
   const host = env.VPN_HOST;
   const port = Number(env.VPN_PORT || 443);
+  // domain ловит само имя, domain_suffix — поддомены. Поля внутри одного
+  // правила объединяются по «или», поэтому всё помещается в одно правило.
+  const ruDomain = ru.domains;
+  const ruSuffix = RU_TLDS.concat(ru.domains.map((d) => "." + d));
 
   return {
     log: { level: "warn" },
@@ -45,7 +160,7 @@ function singboxConfig(uuid, env) {
         // умолчанию и так прямое, поле было лишним.
         { type: "udp", tag: "dns-direct", server: "77.88.8.8" },
       ],
-      rules: [{ rule_set: RU_DOMAIN_TAGS, action: "route", server: "dns-direct" }],
+      rules: [{ domain: ruDomain, domain_suffix: ruSuffix, action: "route", server: "dns-direct" }],
       final: "dns-proxy",
       strategy: "ipv4_only",
     },
@@ -89,25 +204,14 @@ function singboxConfig(uuid, env) {
         // Локальная сеть — мимо туннеля, иначе отвалится доступ к роутеру и принтеру.
         { ip_is_private: true, action: "route", outbound: "direct" },
         // Банки, Госуслуги и прочее российское — напрямую, без VPN.
-        { rule_set: [...RU_DOMAIN_TAGS, "ru-ips"], action: "route", outbound: "direct" },
+        {
+          domain: ruDomain,
+          domain_suffix: ruSuffix,
+          ip_cidr: ru.cidr,
+          action: "route",
+          outbound: "direct",
+        },
       ],
-      // download_detour: proxy — обязательно. raw.githubusercontent.com в России
-      // блокируется, и напрямую правила просто не скачаются.
-      //
-      // Поле устарело в sing-box 1.14 и исчезнет в 1.16; замена —
-      // http_client: { detour: "proxy" }. Менять пока нельзя: ядра до 1.14
-      // ломаются на незнакомом поле — парсер строгий и отвергает профиль
-      // целиком с «json: unknown field». Когда выйдет 1.16, поле придётся
-      // выбирать по версии ядра, а не заменять механически. То же касается
-      // experimental.cache_file.store_rdrc ниже.
-      rule_set: RULE_SETS.map((r) => ({
-        type: "remote",
-        tag: r.tag,
-        format: "binary",
-        url: r.url,
-        download_detour: "proxy",
-        update_interval: "7d",
-      })),
       final: "proxy",
       auto_detect_interface: true,
       // Адрес сервера у нас домен, а не IP, и его надо разрешить ДО туннеля.
@@ -117,7 +221,7 @@ function singboxConfig(uuid, env) {
     },
 
     experimental: {
-      cache_file: { enabled: true, store_rdrc: true },
+      cache_file: { enabled: true },
     },
   };
 }
@@ -154,7 +258,7 @@ export default {
     }
 
     if (kind === "sub") {
-      const body = JSON.stringify(singboxConfig(uuid.toLowerCase(), env), null, 2);
+      const body = JSON.stringify(singboxConfig(uuid.toLowerCase(), env, await ruLists()), null, 2);
       return new Response(body, {
         headers: {
           "content-type": "application/json; charset=utf-8",

@@ -124,8 +124,12 @@ import json, sys
 cfg = json.load(open(sys.argv[1]))
 # Проверяем связность ссылок: правило не должно указывать на несуществующий тег.
 outs = {o["tag"] for o in cfg["outbounds"]}
-sets = {r["tag"] for r in cfg["route"]["rule_set"]}
+# Наборов правил у нас больше нет: списки подставлены прямо в конфиг, чтобы
+# телефону нечего было качать на старте. Если они вернутся — проверим и их.
+sets = {r["tag"] for r in cfg["route"].get("rule_set", [])}
 problems = []
+if cfg["route"].get("rule_set"):
+    problems.append("вернулись скачиваемые наборы правил — телефон не запустится, если их не скачать")
 for rule in cfg["route"]["rules"]:
     if rule.get("outbound") and rule["outbound"] not in outs:
         problems.append(f"route: нет outbound {rule['outbound']}")
@@ -160,8 +164,19 @@ domain_outs = [o for o in cfg["outbounds"] if isinstance(o.get("server"), str) a
 if domain_outs and len(servers) > 1 and not cfg["route"].get("default_domain_resolver") \
         and not all(o.get("domain_resolver") for o in domain_outs):
     problems.append("route.default_domain_resolver не задан, а в адресе сервера домен")
+# Списки должны быть непустыми: пустой «российский» список означает, что весь
+# трафик пойдёт в туннель, и человек этого не заметит, пока не откроет банк.
+direct = [r for r in cfg["route"]["rules"] if r.get("outbound") == "direct" and r.get("domain_suffix")]
+if not direct:
+    problems.append("в конфиге нет правила «российское — напрямую»")
+else:
+    names = len(direct[0].get("domain", [])) + len(direct[0].get("domain_suffix", []))
+    nets = len(direct[0].get("ip_cidr", []))
+    if names < 50:
+        problems.append(f"список доменов подозрительно короткий: {names}")
+    print("российских имён:", names, "| IP-зон:", nets)
 print("ссылки внутри конфига:", "; ".join(problems) if problems else "все теги на месте ✅")
-print("правил маршрутизации:", len(cfg["route"]["rules"]), "| наборов правил:", len(sets))
+print("правил маршрутизации:", len(cfg["route"]["rules"]))
 PYEOF
 else
     warn "подписка пока не отвечает (код ${CODE:-нет}) — DNS и маршруты Cloudflare расходятся до минуты"

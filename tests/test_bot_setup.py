@@ -739,6 +739,21 @@ class SetupWizardTest(unittest.TestCase):
                     "https://sub.example.com/path", "не ссылка"):
             self.assertTrue(check(bad), f"принят мусор: {bad}")
 
+    def test_подписка_ничего_не_качает_на_старте(self):
+        """Наборы правил качались через туннель, которого на старте ещё нет.
+
+        Это была главная причина, по которой служба вообще не запускалась:
+        «initialize rule-set ... reality verification failed». Списки должны
+        лежать в самом конфиге.
+        """
+        from pathlib import Path as _P
+        src = _P(__file__).resolve().parents[1].joinpath("subs/worker.js").read_text()
+        for bad in ("rule_set", "download_detour", "raw.githubusercontent.com"):
+            self.assertNotIn(bad, src, f"подписка снова зависит от загрузки: {bad}")
+        self.assertIn("domain_suffix", src, "в конфиге нет правил по доменам")
+        self.assertIn("ip_cidr", src, "в конфиге нет правил по IP-зонам")
+        self.assertIn("FALLBACK_DOMAINS", src, "нет запасного списка на случай недоступности источника")
+
     def test_страница_инструкции_в_воркере_самодостаточна(self):
         """Страница должна открываться там, где половина интернета недоступна."""
         from pathlib import Path as _P
