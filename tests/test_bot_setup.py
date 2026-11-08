@@ -517,18 +517,30 @@ class SetupWizardTest(unittest.TestCase):
         return calls
 
     def test_awg_показывает_выпущенные_конфиги(self):
-        self._fake_ssh({"list-clients.sh": "keenetic-home\t10.9.1.2\t12s назад\n"
-                                           "iphone-oleg\t10.9.1.3\tне подключался\n"})
+        self._fake_ssh({"list-clients.sh": "keenetic-home\t10.9.1.2\t47.9МБ\t12мин назад\n"
+                                           "iphone-oleg\t10.9.1.3\t0Б\tне подключался\n"})
         self.h.tg.user_says("/awg")
         self.h.pump()
         card = self.h.tg.all_visible()
         self.assertIn("keenetic-home", card)
         self.assertIn("iphone-oleg", card)
+        self.assertIn("47.9МБ", card, "трафик ключа не показан")
+        self.assertIn("0Б", card, "неиспользованный ключ не отличить от рабочего")
         self.assertIn("НЕ добавляйте сервер в приложение Amnezia", card,
                       "нет предупреждения про затирание 2.0")
         buttons = [d for _, d in self.h.tg.buttons()]
         for target in ("awg:new", "awg:send", "awg:revoke"):
             self.assertIn(target, buttons)
+
+    def test_awg_понимает_старый_формат_без_трафика(self):
+        """Сервер и бот обновляются порознь: три поля вместо четырёх не ломают список."""
+        self._fake_ssh({"list-clients.sh": "keenetic-home\t10.9.1.2\t12s назад\n"})
+        self.h.tg.user_says("/awg")
+        self.h.pump()
+        card = self.h.tg.all_visible()
+        self.assertIn("keenetic-home", card)
+        self.assertIn("12s назад", card)
+        self.assertIn("awg:new", [d for _, d in self.h.tg.buttons()])
 
     def test_выпуск_конфига_присылает_файл(self):
         conf = ("[Interface]\nPrivateKey = test\nAddress = 10.9.1.4/32\n\n"

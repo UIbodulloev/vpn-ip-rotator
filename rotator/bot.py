@@ -1547,6 +1547,8 @@ class Bot:
                    "или sing-box из буфера обмена — файл не нужен."),
             ui.title("Клиенты"),
             ui.block(rows) if rows else ui.note("пока ни одного"),
+            ui.note("Трафик — вверх и вниз вместе, за всё время: его считает панель, "
+                    "и перезапуск ядра счётчик не сбрасывает.") if rows else "",
             ui.note(f"{ui.WARN} у {len(stale)} ключ(ей) настройки не доехали до ядра — "
                     "на устройстве будет timeout. Нажмите «Применить конфиг к ядру».")
             if stale else "",
@@ -1701,9 +1703,14 @@ class Bot:
         rows, names = [], []
         for line in listing.out.strip().splitlines():
             parts = line.split("\t")
-            if len(parts) == 3:
-                names.append(parts[0])
-                rows.append(f"{parts[0]:<18} {parts[1]:<11} {parts[2]}")
+            # Четыре поля — имя, адрес, трафик, рукопожатие. Старый
+            # list-clients.sh отдавал три, без трафика: сервер и бот
+            # обновляются порознь, поэтому понимаем оба формата.
+            if len(parts) in (3, 4):
+                name, address = parts[0], parts[1]
+                traffic, seen = (parts[2], parts[3]) if len(parts) == 4 else ("", parts[2])
+                names.append(name)
+                rows.append(f"{name:<16}{address:<11}{traffic:>8}  {seen}")
             elif line.strip():
                 rows.append(line.strip())
 
@@ -1719,6 +1726,8 @@ class Bot:
                    "Существующие клиенты 2.0 он не затрагивает."),
             ui.title("Выпущенные конфиги"),
             ui.block(rows) if rows else ui.note("пока ни одного"),
+            ui.note("Трафик — вверх и вниз вместе, с последнего перезапуска интерфейса: "
+                    "счётчики живут в ядре и обнуляются вместе с контейнером."),
             ui.note("Конфиг приходит файлом — откройте его в приложении AmneziaWG. "
                     "НЕ добавляйте сервер в приложение Amnezia: оно пересоздаст "
                     "контейнер 2.0 и отключит текущих пользователей."),
