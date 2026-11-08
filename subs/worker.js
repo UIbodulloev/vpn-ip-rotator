@@ -335,10 +335,10 @@ function instructionPage(host) {
   <ol>
     <li>
       <b>Установите приложение</b>
-      <p>Называется <b>Hiddify</b>. Других приложений не нужно.</p>
+      <p>Называется <b>sing-box</b>. Других приложений не нужно.</p>
       <div class="apps">
-        <a href="https://play.google.com/store/apps/details?id=app.hiddify.com">Android</a>
-        <a href="https://hiddify.com/app/">iPhone и iPad</a>
+        <a href="https://play.google.com/store/apps/details?id=io.nekohasekai.sfa">Android</a>
+        <a href="https://apps.apple.com/app/sing-box-vt/id6673731168">iPhone и iPad</a>
       </div>
     </li>
     <li>
@@ -368,8 +368,7 @@ function instructionPage(host) {
   <div class="note" style="background:transparent;color:var(--dim);border:1px solid var(--line)">
     <b>Банковское приложение капризничает?</b>
     На Android можно убрать его из VPN целиком: в настройках приложения
-    найдите раздел про приложения (<b>Per-app proxy</b>) и исключите
-    банки и Госуслуги. Такие приложения иногда ходят к своим серверам
+    найдите <b>Per-app proxy</b> и снимите галочки с банков и Госуслуг. Такие приложения иногда ходят к своим серверам
     напрямую по адресу, минуя имена сайтов, и тогда список российских
     доменов им не помогает. На iPhone такой настройки нет — там, если
     приложение не пускает, выключите VPN на минуту.
@@ -378,16 +377,17 @@ function instructionPage(host) {
   <div class="note" style="background:transparent;color:var(--dim);border:1px solid var(--line)">
     <b>Если вам дали ссылку на <code>vless://</code></b>
     Это упрощённый вариант: он тоже работает, но через VPN идёт <i>весь</i>
-    трафик, включая российские сайты. Вставляется из буфера обмена в тот же
-    Hiddify, а также в v2rayNG. Если хотите, чтобы банки шли напрямую,
+    трафик, включая российские сайты. Зато её понимает любое приложение —
+    и sing-box, и Hiddify, и v2rayNG. Если хотите, чтобы банки шли напрямую,
     попросите у того, кто дал ссылку, подписку вместо неё.
   </div>
 
   <div class="note" style="background:transparent;color:var(--dim);border:1px solid var(--line)">
-    <b>Если видите <code>reality verification failed</code></b>
-    Это не ваша ошибка и не неправильная ссылка: так выглядит расхождение
-    версий между приложением и сервером. Напишите тому, кто дал вам ссылку —
-    это чинится на сервере за минуту.
+    <b>Если приложение не подключается</b>
+    Сначала попробуйте <b>Hiddify</b> — это второе приложение, которое понимает
+    такую же ссылку. Одно из двух обычно соединяется: они используют разные
+    версии одного и того же движка. Если не помогло ни одно, напишите тому, кто
+    дал вам ссылку, и покажите текст ошибки — это чинится на сервере.
   </div>
 
   <div class="note" style="background:transparent;color:var(--dim);border:1px solid var(--line)">
