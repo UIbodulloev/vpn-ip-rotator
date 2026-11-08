@@ -830,6 +830,26 @@ class SetupWizardTest(unittest.TestCase):
         requests.get = lambda *a, **kw: Answer()
         self.addCleanup(lambda: setattr(requests, "get", original))
 
+    def test_простая_ссылка_отдаётся_отдельной_кнопкой(self):
+        """Кнопка «Только ссылка vless://» для приложений на ядре Xray."""
+        uuid = "11111111-2222-3333-4444-555555555555"
+        calls = self._fake_ssh({"client.py list": f"oleg\t{uuid}\t0Б\tвкл\n",
+                                "client.py link": self.LINK})
+        self.h.tg.user_taps("vless:link")
+        self.h.pump()
+        self.assertIn("vless:link:oleg", [d for _, d in self.h.tg.buttons()])
+
+        self.h.tg.user_taps("vless:link:oleg")
+        self.h.pump()
+        visible = self.h.tg.all_visible()
+        self.assertIn("vless://", visible, "ссылка не отправлена")
+        self.assertTrue(any("client.py link oleg" in c for c in calls))
+        # Два отличия от подписки, про которые администратор должен прочитать,
+        # а не узнать от недовольного человека.
+        self.assertIn("белых списков", visible, "не сказано, что весь трафик в VPN")
+        self.assertIn("Привязки к устройству", visible,
+                      "не сказано, что лимит устройств тут не работает")
+
     def test_привязки_устройств_видны_и_снимаются(self):
         uuid = "11111111-2222-3333-4444-555555555555"
         state = ('{"%s": {"limit": 1, "denied": 2, "devices": [{"kind": "soft", '

@@ -1919,6 +1919,24 @@ class Bot:
         if spare:
             self.send(spare)
 
+    def vless_link(self, name: str) -> None:
+        """Простая ссылка vless:// — для приложений на ядре Xray.
+
+        Её отдаёт панель напрямую, минуя зеркало: ни белых списков, ни привязки
+        к устройству здесь нет. Поэтому это не вариант по умолчанию, а запасной.
+        """
+        try:
+            got = self._panel(f"link {name}")
+        except remote.RemoteError as exc:
+            return self.send(f"{ui.NO} {ui.esc(str(exc))}")
+        link = next((l.strip() for l in got.out.splitlines()
+                     if l.strip().startswith("vless://")), "")
+        if not got.ok or not link:
+            return self.send(ui.joined(
+                ui.title("Ссылка не нашлась", ui.NO), ui.block([got.text(300)])),
+                [[{"text": "📱 К списку", "callback_data": "vless:menu"}]])
+        self._show_link(self.send(ui.note("готовлю ссылку…")), name, link)
+
     def vless_sub(self, name: str) -> None:
         """Прислать комплект заново — тому же человеку или на новое устройство.
 
@@ -2011,8 +2029,14 @@ class Bot:
         одним касанием и не ломалась переносами."""
         self.edit(message_id, ui.joined(
             ui.title(f"Готово · {name}", ui.YES),
-            ui.esc("Скопируйте ссылку ниже и вставьте в приложение: Hiddify "
-                   "или v2rayNG. Добавление профиля из буфера обмена."),
+            ui.esc("Скопируйте ссылку ниже и вставьте в приложение: sing-box, "
+                   "Hiddify, v2rayNG или v2RayTun. Добавление профиля из буфера "
+                   "обмена."),
+            ui.note("Весь трафик пойдёт через VPN: белых списков в такой ссылке "
+                    "нет, российские сайты и банки увидят иностранный адрес."),
+            ui.note("Привязки к устройству здесь тоже нет — ссылку отдаёт панель, "
+                    "минуя зеркало. Её можно установить на сколько угодно "
+                    "устройств, и отличить их будет нечем."),
             ui.note("Ссылка — это ключ доступа. Не публикуйте её."),
         ))
         self.send(f"<code>{ui.esc(link)}</code>")
