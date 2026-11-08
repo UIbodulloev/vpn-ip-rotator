@@ -89,6 +89,13 @@ function singboxConfig(uuid, env) {
       ],
       // download_detour: proxy — обязательно. raw.githubusercontent.com в России
       // блокируется, и напрямую правила просто не скачаются.
+      //
+      // Поле устарело в sing-box 1.14 и исчезнет в 1.16; замена —
+      // http_client: { detour: "proxy" }. Менять пока нельзя: ядра до 1.14
+      // ломаются на незнакомом поле — парсер строгий и отвергает профиль
+      // целиком с «json: unknown field». Когда выйдет 1.16, поле придётся
+      // выбирать по версии ядра, а не заменять механически. То же касается
+      // experimental.cache_file.store_rdrc ниже.
       rule_set: RULE_SETS.map((r) => ({
         type: "remote",
         tag: r.tag,
