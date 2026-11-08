@@ -43,6 +43,10 @@ def env(path: str) -> dict[str, str]:
 
 
 CREDS = env("/opt/panel/credentials")
+# Сколько устройств пускать по одному ключу. Один ключ — одно устройство:
+# когда придёт претензия, знать надо не только человека, но и аппарат.
+# Меняется строкой DEVICE_LIMIT в /opt/panel/credentials.
+DEVICE_LIMIT = int(CREDS.get("DEVICE_LIMIT", "1") or 1)
 PARAMS = env("/opt/panel/reality-params.env")
 TOKEN = CREDS["PANEL_API_TOKEN"]
 
@@ -182,7 +186,7 @@ def cmd_add(name: str) -> None:
         # inboundIds именно рядом с client, внутри он не принимается.
         "client": {
             "email": name, "uuid": uid, "flow": flow, "enable": True,
-            "limitIp": 0, "totalGB": 0, "expiryTime": 0, "tgId": 0,
+            "limitIp": DEVICE_LIMIT, "totalGB": 0, "expiryTime": 0, "tgId": 0,
             "subId": uid, "comment": "выдан ботом",
         },
         "inboundIds": [INBOUND_ID],
