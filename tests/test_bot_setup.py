@@ -718,8 +718,25 @@ class SetupWizardTest(unittest.TestCase):
         self.assertIn("не настроен", self.h.tg.all_visible())
         self.assertIn("set:SUB_BASE_URL", [d for _, d in self.h.tg.buttons()])
 
+    def _fake_fetch(self, body, status=200):
+        """Подменяет загрузку подписки воркером: сети в тестах нет."""
+        import requests
+
+        class Answer:
+            status_code = status
+            text = body
+
+            def raise_for_status(self):
+                if status >= 400:
+                    raise requests.HTTPError(f"HTTP {status}")
+
+        original = requests.get
+        requests.get = lambda *a, **kw: Answer()
+        self.addCleanup(lambda: setattr(requests, "get", original))
+
     def test_подписка_присылает_готовое_сообщение(self):
         self.h.secrets.set("SUB_BASE_URL", "https://sub.example.com")
+        self._fake_fetch('{"outbounds": []}')
         self._fake_ssh({"client.py list":
                         "oleg\t11111111-2222-3333-4444-555555555555\t0Б\tвкл\n"})
         self.h.tg.user_taps("vless:sub:oleg")
@@ -729,6 +746,30 @@ class SetupWizardTest(unittest.TestCase):
                       visible, "в сообщении нет ссылки подписки")
         self.assertIn("https://sub.example.com/", visible, "нет ссылки на инструкцию")
         self.assertIn("Госуслуги", visible, "не сказано про белые списки")
+
+    def test_подписка_приходит_и_файлом(self):
+        """У части мобильных операторов ссылка не открывается — нужен файл."""
+        self.h.secrets.set("SUB_BASE_URL", "https://sub.example.com")
+        self._fake_fetch('{"outbounds": [{"tag": "proxy"}]}')
+        self._fake_ssh({"client.py list":
+                        "oleg\t11111111-2222-3333-4444-555555555555\t0Б\tвкл\n"})
+        self.h.tg.user_taps("vless:sub:oleg")
+        self.h.pump()
+        self.assertTrue(self.h.tg.documents, "профиль файлом не отправлен")
+        doc = self.h.tg.documents[-1]
+        self.assertEqual(doc["filename"], "oleg.json")
+        self.assertIn("proxy", doc["content"])
+
+    def test_битая_подписка_файлом_не_рассылается(self):
+        """Воркер ответил не JSON — лучше честная ошибка, чем мусор человеку."""
+        self.h.secrets.set("SUB_BASE_URL", "https://sub.example.com")
+        self._fake_fetch("<html>503</html>")
+        self._fake_ssh({"client.py list":
+                        "oleg\t11111111-2222-3333-4444-555555555555\t0Б\tвкл\n"})
+        self.h.tg.user_taps("vless:sub:oleg")
+        self.h.pump()
+        self.assertFalse(self.h.tg.documents, "отправлен файл с мусором вместо конфига")
+        self.assertIn("не забрался", self.h.tg.all_visible())
 
     def test_адрес_подписок_проверяется(self):
         from rotator.bot import VALIDATORS

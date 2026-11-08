@@ -9,6 +9,7 @@ Long-polling идёт через релей, поэтому на российс�
 
 from __future__ import annotations
 
+import json
 import re
 import threading
 import time
@@ -1653,6 +1654,39 @@ class Bot:
             f"<code>{ui.esc(base)}/sub/{ui.esc(uuid)}</code>\n\n"
             f"Банки и Госуслуги работают сами — VPN отключать не нужно.\n"
             f"Ссылку никому не передавайте."
+        )
+        self.send_profile_file(base, uuid, name)
+
+    def send_profile_file(self, base: str, uuid: str, name: str) -> None:
+        """Тот же профиль файлом — на случай, когда ссылка не открывается.
+
+        У части мобильных операторов Cloudflare недоступен, и телефон не может
+        скачать подписку, хотя сам VPN через этот же канал работает. Файл
+        приходит Телеграмом и импортируется в приложение вручную. Цена — он не
+        обновляется сам: сменятся ключи Reality, и файл придётся выдать заново.
+        Смена IP при ротации файлу не страшна, внутри домен.
+        """
+        import requests
+
+        try:
+            answer = requests.get(f"{base}/sub/{uuid}", timeout=20)
+            answer.raise_for_status()
+            json.loads(answer.text)      # не рассылаем мусор, если воркер ответил ошибкой
+        except Exception as exc:         # noqa: BLE001
+            logger.warning("подписка не забралась файлом: %s", exc)
+            return self.send(ui.joined(
+                ui.title("Файл профиля не забрался", ui.WARN),
+                ui.esc(str(exc)[:200]),
+                ui.note("Ссылка выше всё равно рабочая — файл нужен только там, "
+                        "где она не открывается."),
+            ))
+        self.send_document(
+            f"{name}.json", answer.text,
+            caption=("<b>Тот же профиль файлом</b>\n\n"
+                     "Перешлите его, если у человека не открывается ссылка на подписку — "
+                     "так бывает у мобильных операторов. В приложении файл добавляется "
+                     "как профиль.\n\n"
+                     "Минус: файл не обновляется сам."),
         )
 
     def _show_link(self, message_id: int, name: str, link: str) -> None:
