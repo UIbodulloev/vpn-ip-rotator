@@ -669,12 +669,32 @@ class SetupWizardTest(unittest.TestCase):
         self.h.secrets.set("SUB_BASE_URL", "https://sub.example.com")
         return self._fake_ssh(replies)
 
-    def test_выдача_человеку_одним_сообщением(self):
-        """Админ пересылает одно сообщение, а в нём — все ключи сразу."""
+    def test_по_умолчанию_выдаётся_одна_ссылка(self):
+        """Одна ссылка, одно сообщение, ничего лишнего: ни файла, ни vless://."""
         calls = self._bundle_ssh()
         self.h.tg.user_taps("vless:new")
         self.h.pump()
         self.assertEqual(self.h.bot.awaiting, "VLESS_CLIENT_NAME")
+        self.h.tg.user_says("oleg")
+        self.h.pump()
+        self.assertTrue(self._wait(
+            lambda: "sub/11111111-2222-3333-4444-555555555555" in self.h.tg.all_visible()),
+            "ссылка не отправлена")
+
+        self.assertFalse(any("add-client.sh" in c for c in calls),
+                         "по умолчанию выпущен лишний ключ AmneziaWG")
+        self.assertFalse(self.h.tg.documents, "по умолчанию отправлен файл")
+        visible = self.h.tg.all_visible()
+        self.assertNotIn("vless://", visible, "в сообщении лишняя ссылка vless://")
+        self.assertIn("одно устройство", visible, "не сказано про одно устройство")
+        self.assertIn("sing-box", visible)
+
+    def test_выдача_человеку_одним_сообщением(self):
+        """Админ пересылает одно сообщение, а в нём — все ключи сразу."""
+        calls = self._bundle_ssh()
+        self.h.tg.user_taps("vless:newpair")
+        self.h.pump()
+        self.assertEqual(self.h.bot.awaiting, "VLESS_PAIR_NAME")
 
         self.h.tg.user_says("oleg")
         self.h.pump()
@@ -703,7 +723,7 @@ class SetupWizardTest(unittest.TestCase):
 
     def test_выдача_с_белыми_списками_передаёт_режим(self):
         calls = self._bundle_ssh()
-        self.h.bot.awaiting = "VLESS_CLIENT_NAME"
+        self.h.bot.awaiting = "VLESS_PAIR_NAME"
         self.h.tg.user_says("oleg")
         self.h.pump()
         self.h.tg.user_taps("vless:go:split:oleg")
@@ -809,6 +829,41 @@ class SetupWizardTest(unittest.TestCase):
         original = requests.get
         requests.get = lambda *a, **kw: Answer()
         self.addCleanup(lambda: setattr(requests, "get", original))
+
+    def test_привязки_устройств_видны_и_снимаются(self):
+        uuid = "11111111-2222-3333-4444-555555555555"
+        state = ('{"%s": {"limit": 1, "denied": 2, "devices": [{"kind": "soft", '
+                 '"id": "sing-box", "ua": "sing-box", "first": 1, "last": 2, '
+                 '"hits": 7, "nets": {"aa": 1, "bb": 2}}]}}') % uuid
+        calls = self._fake_ssh({"client.py list": f"oleg\t{uuid}\t0Б\tвкл\n",
+                                "sub-mirror.py devices": state,
+                                "sub-mirror.py reset": "привязка снята"})
+        self.h.tg.user_taps("vless:devices")
+        self.h.pump()
+        card = self.h.tg.all_visible()
+        self.assertIn("oleg", card)
+        self.assertIn("sing-box", card, "не показано приложение")
+        self.assertIn("примерно", card, "не сказано, что счёт приблизительный")
+        self.assertIn("отказов 2", card, "отказы не показаны")
+        buttons = [d for _, d in self.h.tg.buttons()]
+        self.assertIn("vless:unbind", buttons)
+        self.assertIn("vless:two", buttons)
+
+        self.h.tg.user_taps(f"vless:unbind:oleg")
+        self.h.pump()
+        self.assertTrue(any(f"sub-mirror.py reset {uuid}" in c for c in calls),
+                        "привязка не снята на зеркале")
+        self.assertIn("Привязка снята", self.h.tg.all_visible())
+
+    def test_зеркало_без_привязок_не_пугает(self):
+        """Ссылку ещё никто не установил — это нормальное состояние."""
+        uuid = "11111111-2222-3333-4444-555555555555"
+        self._fake_ssh({"client.py list": f"oleg\t{uuid}\t0Б\tвкл\n",
+                        "sub-mirror.py devices": "{}"})
+        self.h.tg.user_taps("vless:devices")
+        self.h.pump()
+        self.assertIn("не установлена", self.h.tg.all_visible())
+        self.assertNotIn("vless:unbind", [d for _, d in self.h.tg.buttons()])
 
     def test_повторная_отправка_не_перевыпускает_ключи(self):
         """«Прислать заново» — то же сообщение. Перевыпуск отключил бы ключ

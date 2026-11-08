@@ -275,6 +275,7 @@ VALIDATORS = {
     "SSH_PRIVATE_KEY": sshkeys.looks_like_private,
     "AWG_CLIENT_NAME": _check_client_name,
     "VLESS_CLIENT_NAME": _check_client_name,
+    "VLESS_PAIR_NAME": _check_client_name,
     "SUB_BASE_URL": _check_sub_base,
     "SSH_PUBKEY": _check_pubkey,
     "VPN_DOMAIN": _check_domain,
@@ -1538,13 +1539,16 @@ class Bot:
             elif line.strip():
                 rows.append(line.strip())
 
-        keyboard = [[{"text": "➕ Выдать человеку · все ключи", "callback_data": "vless:new"}]]
+        keyboard = [[{"text": "➕ Выдать ссылку", "callback_data": "vless:new"}],
+                    [{"text": "➕ Выдать ссылку и файл AmneziaWG",
+                      "callback_data": "vless:newpair"}]]
         if stale:
             keyboard.append([{"text": "🔄 Применить конфиг к ядру", "callback_data": "vless:sync"}])
         if names:
             keyboard.append([{"text": "📤 Прислать ключи заново", "callback_data": "vless:sub"}])
             keyboard.append([{"text": "🔗 Только ссылка vless://", "callback_data": "vless:link"}])
             keyboard.append([{"text": "📄 Профиль файлом", "callback_data": "vless:file"}])
+            keyboard.append([{"text": "📵 Устройства", "callback_data": "vless:devices"}])
             keyboard.append([{"text": "🗑 Удалить", "callback_data": "vless:del"}])
         keyboard.append([{"text": "◀️ Сервер", "callback_data": "srv:menu"}])
 
@@ -1552,9 +1556,11 @@ class Bot:
             ui.title("VLESS Reality · мобильные", "📱"),
             ui.esc(f"Порт 443 на {domain_of(self.cfg, self.secrets) or 'вашем домене'}, "
                    "маскировка под обычный HTTPS."),
-            ui.esc("«Выдать человеку» выпускает сразу оба ключа — подписку для телефона "
-                   "и конфиг AmneziaWG 3.1 запасным каналом — и присылает их одним "
-                   "сообщением, готовым к пересылке."),
+            ui.esc("«Выдать ссылку» присылает одно сообщение с одной ссылкой — "
+                   "подпиской с белыми списками. Она привязывается к первому "
+                   "устройству, на котором её установят."),
+            ui.esc("Вторая кнопка добавляет к ней файл AmneziaWG — запасной канал "
+                   "для роутера и для операторов, где подписка не качается."),
             ui.title("Клиенты"),
             ui.block(rows) if rows else ui.note("пока ни одного"),
             ui.note("Трафик — вверх и вниз вместе, за всё время: его считает панель, "
@@ -1601,6 +1607,12 @@ class Bot:
                     "Пришлю готовое сообщение — его можно переслать человеку как есть."),
             "file": ("Профиль файлом", "📄",
                      "Для тех, у кого ссылка на подписку не открывается."),
+            "unbind": ("Снять привязку", "📵",
+                       "Ссылка встанет на следующее устройство, которое её установит."),
+            "two": ("Разрешить два устройства", "2️⃣",
+                    "По одной ссылке будут работать два устройства."),
+            "one": ("Вернуть одно устройство", "1️⃣",
+                    "Лишние привязки при этом не снимаются — снимите их отдельно."),
         }
         heading, emoji, note = titles[action]
         self.send(ui.joined(ui.title(heading, emoji), ui.esc(note)), rows)
@@ -1619,6 +1631,107 @@ class Bot:
         ), [[{"text": "⚙️ Указать адрес", "callback_data": "set:SUB_BASE_URL"}],
             [{"text": "◀️ Назад", "callback_data": "vless:menu"}]])
         return ""
+
+    MIRROR_SCRIPT = "/opt/panel/sub-mirror.py"
+
+    def _uuid_of(self, name: str) -> str:
+        listing = self._panel("list")
+        return next((l.split("\t")[1] for l in listing.out.splitlines()
+                     if l.split("\t")[0] == name and "\t" in l), "")
+
+    def vless_devices(self) -> None:
+        """Кто к каким ссылкам привязан.
+
+        Счёт ведёт зеркало подписок: ссылка привязывается к первому
+        устройству, которое её установило. Приложения, присылающие отпечаток
+        устройства (Happ, v2RayTun), считаются точно; sing-box и Hiddify
+        отпечаток не присылают, и для них счёт приблизительный — по
+        приложению, числу сетей и одновременности.
+        """
+        try:
+            listing = self._panel("list")
+            answer = self._awg(f"{self.MIRROR_SCRIPT} devices --json")
+        except remote.RemoteError as exc:
+            return self.send(f"{ui.NO} {ui.esc(str(exc))}")
+        if not answer.ok:
+            return self.send(ui.joined(
+                ui.title("Зеркало не ответило", ui.WARN),
+                ui.block([answer.text(400)]),
+                ui.note("Привязку считает зеркало подписок на VPN-сервере. "
+                        "Пока его нет, ссылки работают без ограничения."),
+            ), [[{"text": "◀️ Назад", "callback_data": "vless:menu"}]])
+        try:
+            links = json.loads(answer.out.strip() or "{}")
+        except ValueError:
+            links = {}
+
+        rows, has = [], False
+        for line in listing.out.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            name, uuid = parts[0], parts[1]
+            link = links.get(uuid) or {}
+            devices = link.get("devices") or []
+            if not devices:
+                rows.append(f"{name:<15} не установлена")
+                continue
+            has = True
+            first = devices[0]
+            exact = "точно" if first["kind"] == "hwid" else "примерно"
+            more = f" +{len(devices) - 1}" if len(devices) > 1 else ""
+            denied = f"  отказов {link['denied']}" if link.get("denied") else ""
+            rows.append(f"{name:<15} {first['ua']:<9} {exact:<8} "
+                        f"сетей {len(first['nets'])}{more}{denied}")
+
+        keyboard = []
+        if has:
+            keyboard.append([{"text": "📵 Снять привязку", "callback_data": "vless:unbind"}])
+            keyboard.append([{"text": "2️⃣ Разрешить два устройства",
+                              "callback_data": "vless:two"}])
+            keyboard.append([{"text": "1️⃣ Вернуть одно устройство",
+                              "callback_data": "vless:one"}])
+        keyboard.append([{"text": "◀️ Назад", "callback_data": "vless:menu"}])
+        self.send(ui.joined(
+            ui.title("Устройства по ссылкам", "📵"),
+            ui.esc("Ссылка встаёт на первое устройство, которое её установило. "
+                   "Второму приходит отказ."),
+            ui.block(rows) if rows else ui.note("клиентов нет"),
+            ui.note("«точно» — приложение присылает отпечаток устройства "
+                    "(Happ, v2RayTun), и счёт честный. «примерно» — sing-box и "
+                    "Hiddify отпечаток не присылают: там видно приложение, число "
+                    "сетей и одновременные включения, но различить два одинаковых "
+                    "телефона в одной сети нельзя."),
+            ui.note("Человек сменил телефон — снимите привязку, ссылка встанет "
+                    "заново. Нужно два устройства на одну ссылку — разрешите два."),
+        ), keyboard)
+
+    def vless_unbind(self, name: str) -> None:
+        uuid = self._uuid_of(name)
+        if not uuid:
+            return self.send(f"{ui.NO} клиента {ui.esc(name)} нет")
+        done = self._awg(f"{self.MIRROR_SCRIPT} reset {uuid}")
+        self.send(ui.joined(
+            ui.title("Привязка снята" if done.ok else "Не вышло",
+                     ui.YES if done.ok else ui.NO),
+            ui.block([done.text(300)]),
+            ui.note("Ссылка встанет на то устройство, которое установит её первым.")
+            if done.ok else "",
+        ), [[{"text": "📵 К устройствам", "callback_data": "vless:devices"}]])
+
+    def vless_limit(self, name: str, number: int) -> None:
+        uuid = self._uuid_of(name)
+        if not uuid:
+            return self.send(f"{ui.NO} клиента {ui.esc(name)} нет")
+        done = self._awg(f"{self.MIRROR_SCRIPT} limit {uuid} {int(number)}")
+        self.send(ui.joined(
+            ui.title("Готово" if done.ok else "Не вышло", ui.YES if done.ok else ui.NO),
+            ui.block([done.text(300)]),
+        ), [[{"text": "📵 К устройствам", "callback_data": "vless:devices"}]])
+
+    def vless_issue_one(self, name: str) -> None:
+        """Выпуск по умолчанию: один ключ, одна ссылка, одно сообщение."""
+        self.vless_issue(name, mode="")
 
     def vless_ask_mode(self, name: str) -> None:
         """Один вопрос перед выпуском: как вести российский трафик в AmneziaWG.
@@ -1643,11 +1756,15 @@ class Bot:
             [{"text": "◀️ Отмена", "callback_data": "vless:menu"}],
         ])
 
-    def vless_issue(self, name: str, mode: str = "full") -> None:
-        """Выпуск комплекта. Ключ VLESS — первым: если на нём споткнёмся,
-        отменять ещё нечего. Если споткнётся AmneziaWG, ключ для телефона
-        всё равно уедет человеку, а в чате будет сказано, чего не хватает."""
-        mode = mode if mode in ("full", "split") else "full"
+    def vless_issue(self, name: str, mode: str = "") -> None:
+        """Выпуск. Пустой mode — только подписка, это режим по умолчанию;
+        «full» или «split» — вместе с файлом AmneziaWG.
+
+        Ключ VLESS — первым: если на нём споткнёмся, отменять ещё нечего. Если
+        споткнётся AmneziaWG, ключ для телефона всё равно уедет человеку, а в
+        чате будет сказано, чего не хватает.
+        """
+        mode = mode if mode in ("full", "split") else ""
         base = self._sub_base()
         if not base:
             return
@@ -1662,16 +1779,23 @@ class Bot:
                         ui.title("Ключ VLESS не выпустился", ui.NO),
                         ui.block([made.text(500)]),
                         ui.note("AmneziaWG не трогал: выпускать половину комплекта "
-                                "смысла нет."),
+                                "смысла нет.") if mode else "",
                     ))
                 link = next(l.strip() for l in made.out.splitlines()
                             if l.strip().startswith("vless://"))
                 uuid = link.split("://", 1)[1].split("@", 1)[0]
 
-                self.edit(message_id, ui.joined(header, ui.note("выпускаю ключ AmneziaWG 3.1…")))
-                conf, trouble = self._awg_conf_new(name, mode)
+                conf, trouble = "", ""
+                if mode:
+                    self.edit(message_id, ui.joined(
+                        header, ui.note("выпускаю ключ AmneziaWG 3.1…")))
+                    conf, trouble = self._awg_conf_new(name, mode)
 
-                if conf:
+                if not mode:
+                    done = ("Ссылка готова. Сообщение ниже можно переслать человеку "
+                            "целиком — там и ссылка, и адрес инструкции.")
+                    where = "одна ссылка — одно устройство"
+                elif conf:
                     done = ("Выпущены оба ключа. Сообщение ниже можно переслать "
                             "человеку целиком — там и подписка, и файл.")
                     where = ("AmneziaWG: российское идёт мимо VPN" if mode == "split"
@@ -1681,15 +1805,15 @@ class Bot:
                             "к пересылке. Конфига AmneziaWG в нём нет.")
                     where = ""
                 self.edit(message_id, ui.joined(
-                    ui.title(f"Готово · {name}", ui.YES if conf else ui.WARN),
+                    ui.title(f"Готово · {name}", ui.YES if conf or not mode else ui.WARN),
                     ui.esc(done),
                     ui.note(where),
                     ui.joined(ui.title("AmneziaWG не выпустился", ui.WARN),
                               ui.block([trouble])) if trouble else "",
                 ))
-                self.send_bundle(base, name, uuid, link, conf)
+                self.send_bundle(base, name, uuid, "" if not mode else link, conf)
             except Exception as exc:                           # noqa: BLE001
-                logger.exception("выдача комплекта не удалась")
+                logger.exception("выдача не удалась")
                 self.edit(message_id, ui.joined(ui.title("Ошибка", ui.NO), ui.block([str(exc)])))
 
         threading.Thread(target=worker, name="vless-issue", daemon=True).start()
@@ -1728,6 +1852,23 @@ class Bot:
         длинная и зависит от домена. Обрезанный ключ выглядит как рабочий, но
         не работает, поэтому лишнее уходит вторым сообщением целиком.
         """
+        sub = f"{ui.esc(base)}/sub/{ui.esc(uuid)}"
+        if not with_file and not link:
+            # Одна ссылка — ни нумерации, ни выбора: человеку нечего решать.
+            return "\n".join([
+                "<b>Ваш личный VPN</b>",
+                "",
+                f"Инструкция с картинками: {ui.esc(base)}/",
+                "",
+                "Установите приложение <b>sing-box</b>, скопируйте ссылку "
+                "и нажмите в приложении «+»:",
+                f"<code>{sub}</code>",
+                "",
+                "Российские сайты, банки и Госуслуги работают сами — "
+                "выключать VPN не нужно.",
+                "Ссылка рассчитана на одно устройство: на втором она не "
+                "установится. Нужна вторая — попросите отдельную.",
+            ]), ""
         head = [
             "<b>Ваш личный VPN</b>",
             "",
@@ -1736,7 +1877,7 @@ class Bot:
             "<b>1. Телефон — основной способ</b>",
             "Установите приложение <b>sing-box</b>, скопируйте ссылку и нажмите "
             "в приложении «+»:",
-            f"<code>{ui.esc(base)}/sub/{ui.esc(uuid)}</code>",
+            f"<code>{sub}</code>",
         ]
         if with_file:
             head += [
@@ -2404,6 +2545,9 @@ class Bot:
             return self.awg_issue(value)
         if key == "VLESS_CLIENT_NAME":
             self.edit(receipt, ui.joined(ui.title("Принято", ui.YES), ui.esc(value)))
+            return self.vless_issue_one(value)
+        if key == "VLESS_PAIR_NAME":
+            self.edit(receipt, ui.joined(ui.title("Принято", ui.YES), ui.esc(value)))
             return self.vless_ask_mode(value)
         self.secrets.set(key, value)
         shown = masked(value) if is_secret(key) else value
@@ -2757,8 +2901,9 @@ class Bot:
             return self.vless_menu()
         if data == "vless:sync":
             return self.vless_sync()
-        if data == "vless:new":
-            self.awaiting = "VLESS_CLIENT_NAME"
+        if data in ("vless:new", "vless:newpair"):
+            self.awaiting = ("VLESS_PAIR_NAME" if data.endswith("pair")
+                             else "VLESS_CLIENT_NAME")
             return self.send(ui.joined(
                 ui.title("Имя для нового клиента", "🎁"),
                 ui.esc("Пришлите короткое имя — одно на человека и устройство. "
@@ -2769,7 +2914,16 @@ class Bot:
         if data.startswith("vless:go:"):
             _, _, mode, client = data.split(":", 3)
             return self.vless_issue(client, mode)
-        if data in ("vless:link", "vless:del", "vless:sub", "vless:file"):
+        if data == "vless:devices":
+            return self.vless_devices()
+        if data.startswith("vless:unbind:"):
+            return self.vless_unbind(data.split(":", 2)[2])
+        if data.startswith("vless:two:"):
+            return self.vless_limit(data.split(":", 2)[2], 2)
+        if data.startswith("vless:one:"):
+            return self.vless_limit(data.split(":", 2)[2], 1)
+        if data in ("vless:link", "vless:del", "vless:sub", "vless:file",
+                    "vless:unbind", "vless:two", "vless:one"):
             return self.vless_pick(data.split(":", 1)[1])
         if data.startswith("vless:link:"):
             return self.vless_link(data.split(":", 2)[2])

@@ -3,6 +3,9 @@
 
     sub-mirror.py serve       слушать HTTPS (так его запускает systemd)
     sub-mirror.py selftest    проверить, что воркер отвечает, ничего не занимая
+    sub-mirror.py devices     кто к каким ссылкам привязан
+    sub-mirror.py reset UUID  снять привязку: ссылка снова встанет на любое устройство
+    sub-mirror.py limit UUID N  сколько устройств пускать по ссылке (0 — без счёта)
 
 Зачем. Подписку раздаёт воркер на Cloudflare, но часть мобильных операторов
 режет диапазоны, где живут бесплатные зоны Cloudflare: у человека не
@@ -17,17 +20,35 @@
 Порт 443 занят Xray с Reality и трогать его нельзя: на нём держится вся
 маскировка под обычный HTTPS. Поэтому 8443.
 
+Одна ссылка — одно устройство. Считается здесь, на установке профиля: ровно
+так это сделано в панелях вроде Remnawave. Приложение присылает заголовок
+`x-hwid` — отпечаток устройства, — и ссылка привязывается к первому, кто её
+установил; второму приходит 403. Заголовок присылают Happ, v2RayTun и
+подобные; sing-box и Hiddify — нет, и для них привязка приблизительная: по
+семейству приложения, числу сетей и частоте обновлений. Что именно считается,
+видно в `devices`.
+
+Чего это НЕ делает: уже установленный профиль продолжает работать, его никто
+не отзывает, и человек, выгрузивший конфиг файлом, может отдать его другому.
+Ограничение на самом канале — дело сервера, а не ссылки: у VLESS это
+`limitIp` в панели (нужен журнал доступа Xray), у Hysteria2 такого нет вовсе.
+
 Настройки — в /opt/panel/sub-mirror.env:
     UPSTREAM=https://sub.example.net
     HOSTNAME=sub2.example.net
     PORT=8443
     CERT_DIR=…               необязательно; по умолчанию /etc/letsencrypt/live/<HOSTNAME>
+    DEVICES=1                сколько устройств пускать по одной ссылке; 0 — не считать
 """
 from __future__ import annotations
 
+import hashlib
 import http.server
+import ipaddress
+import json
 import os
 import re
+import secrets
 import socket
 import ssl
 import sys
@@ -42,6 +63,24 @@ CACHE_DIR = Path("/var/cache/sub-mirror")
 CACHE_TTL = 3600.0
 FETCH_TIMEOUT = 15.0
 
+STATE_FILE = Path("/var/lib/sub-mirror/devices.json")
+# Этим адресом проверяют саму раздачу — установщик, selftest, рука
+# администратора. Привязывать его к «устройству» нельзя: вторая же проверка
+# получила бы 403 и выглядела как поломка.
+PROBE_UUID = "00000000-0000-4000-8000-000000000000"
+# Сколько разных сетей терпим у одного устройства. Телефон за месяц видит
+# домашний Wi-Fi, рабочий, пару чужих и пул оператора — шесть /16 хватает, а
+# компании друзей из разных городов не хватает сразу.
+NET_BUDGET = 6
+NET_WINDOW = 30 * 86400.0
+# Два обновления из разных сетей в пределах этого времени — это два устройства:
+# одно приложение обновляется раз в сутки по таймеру, а не дважды за десять
+# минут из разных сетей.
+OVERLAP = 900.0
+# Первый час после привязки не придираемся: установка часто дёргает адрес
+# несколько раз подряд, иногда уже на ходу, со сменой сети.
+INSTALL_GRACE = 3600.0
+
 # Пути берём только эти. Всё остальное — 404, и ничего из файловой системы
 # наружу не отдаётся: зеркало не умеет читать диск по запросу.
 ROUTES = (
@@ -52,7 +91,7 @@ ROUTES = (
 
 
 def settings() -> dict[str, str]:
-    out = {"PORT": "8443"}
+    out = {"PORT": "8443", "DEVICES": "1"}
     if ENV_FILE.exists():
         for line in ENV_FILE.read_text().splitlines():
             line = line.strip()
@@ -69,6 +108,172 @@ def settings() -> dict[str, str]:
 def cache_file(path: str) -> Path:
     # Имя файла из пути: путь уже проверен по ROUTES, фантазии там неоткуда взяться.
     return CACHE_DIR / (path.strip("/").replace("/", "_") or "index")
+
+
+# --- Одна ссылка — одно устройство -------------------------------------------
+# Состояние маленькое, а запись редкая (раз в сутки на человека), поэтому
+# хватает файла под блокировкой: база здесь была бы лишней зависимостью.
+_state_lock = threading.Lock()
+
+
+def load_state() -> dict:
+    try:
+        data = json.loads(STATE_FILE.read_text())
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict) or not data.get("salt"):
+        # Соль нужна, чтобы хранить сети хешами: адреса людей нам не нужны, а
+        # сравнивать хеши так же удобно. Пропадёт соль — просто слетят привязки.
+        data = {"salt": secrets.token_hex(16), "links": {}}
+    data.setdefault("links", {})
+    return data
+
+
+def save_state(data: dict) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_name(STATE_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1))
+    os.chmod(tmp, 0o600)
+    tmp.replace(STATE_FILE)        # подмена одним движением: полуфайла не бывает
+
+
+def ua_family(ua: str) -> str:
+    """Семейство приложения из User-Agent. Версия нам не нужна: она меняется
+    при каждом обновлении, а устройство остаётся тем же."""
+    low = (ua or "").lower()
+    known = ("sing-box", "sfa", "sfi", "sfm", "hiddify", "v2raytun", "v2rayng",
+             "happ", "clash", "nekobox", "nekoray", "karing", "streisand",
+             "shadowrocket", "foxray", "v2box", "throne", "flclash")
+    for name in known:
+        if name in low:
+            return "sing-box" if name in ("sfa", "sfi", "sfm") else name
+    return (low.split("/")[0][:24] or "неизвестное")
+
+
+def net_hash(ip: str, salt: str) -> str:
+    """Сеть клиента хешем. Берём /16 у IPv4 и /32 у IPv6: операторы гоняют
+    адрес внутри своего пула, и по /24 один телефон выглядел бы десятком."""
+    try:
+        address = ipaddress.ip_address(ip)
+        network = ipaddress.ip_network(f"{ip}/{16 if address.version == 4 else 32}",
+                                       strict=False)
+    except ValueError:
+        network = ip
+    return hashlib.blake2s(str(network).encode(), key=salt.encode()[:32],
+                           digest_size=6).hexdigest()
+
+
+def identity(headers, ip: str, salt: str) -> tuple[str, str, str]:
+    """(вид, отпечаток, семейство приложения).
+
+    Точный вид — `hwid`: приложение само присылает отпечаток устройства. Так
+    делают Happ и v2RayTun, и тогда счёт устройств честный. sing-box и Hiddify
+    отпечаток не присылают, и остаётся приблизительный `soft`.
+    """
+    hwid = (headers.get("x-hwid") or headers.get("x-device-id") or "").strip()
+    family = ua_family(headers.get("user-agent", ""))
+    if hwid:
+        return "hwid", hashlib.blake2s(hwid.encode(), key=salt.encode()[:32],
+                                       digest_size=8).hexdigest(), family
+    return "soft", family, family
+
+
+def register(uuid: str, headers, ip: str, limit: int) -> tuple[bool, str]:
+    """Пустить ли это устройство к подписке. Пишет состояние по ходу дела."""
+    if uuid == PROBE_UUID:
+        return True, ""
+    now = time.time()
+    with _state_lock:
+        state = load_state()
+        kind, ident, family = identity(headers, ip, state["salt"])
+        net = net_hash(ip, state["salt"])
+        link = state["links"].setdefault(uuid, {"first": now, "devices": [],
+                                                "denied": 0, "last_denied": 0})
+        cap = int(link.get("limit", limit) or 0)
+
+        def deny(state_: dict, link_: dict, when: float, why: str) -> tuple[bool, str]:
+            link_["denied"] = link_.get("denied", 0) + 1
+            link_["last_denied"] = when
+            save_state(state_)
+            return False, why
+
+        mine = next((d for d in link["devices"]
+                     if d["kind"] == kind and d["id"] == ident), None)
+        if mine is None:
+            if cap and len(link["devices"]) >= cap:
+                return deny(state, link, now,
+                            f"устройств по ссылке уже {len(link['devices'])} из {cap}")
+            mine = {"kind": kind, "id": ident, "ua": family, "first": now,
+                    "last": now, "hits": 0, "nets": {}, "day": now, "today": 0}
+            link["devices"].append(mine)
+
+        # Приблизительная привязка (sing-box, Hiddify: отпечатка нет). Отказываем
+        # только по тому, чего у одного устройства не бывает: десятка сетей за
+        # месяц и двух сетей одновременно. Частоту обновлений считаем, но по ней
+        # не отказываем: человек жмёт «обновить» как раз когда у него что-то не
+        # работает, и получить отказ именно в этот момент — худшее из решений.
+        # Точную привязку (hwid) этими правилами не стесняем вовсе.
+        if cap and kind == "soft" and now - mine["first"] > INSTALL_GRACE:
+            fresh = {k: t for k, t in mine["nets"].items() if now - t < NET_WINDOW}
+            if net not in fresh and len(fresh) >= NET_BUDGET * cap:
+                mine["nets"] = fresh
+                return deny(state, link, now,
+                            f"сетей за месяц {len(fresh)} при лимите {NET_BUDGET * cap}")
+            if net != mine.get("net") and now - mine["last"] < OVERLAP:
+                return deny(state, link, now,
+                            "две разные сети в пределах "
+                            f"{int(OVERLAP // 60)} минут — это два устройства")
+
+        if now - mine.get("day", 0) > 86400:
+            mine["day"], mine["today"] = now, 0
+        mine["today"] = mine.get("today", 0) + 1
+        mine["nets"] = {k: t for k, t in mine["nets"].items() if now - t < NET_WINDOW}
+        mine["nets"][net] = now
+        mine["net"] = net
+        mine["last"] = now
+        mine["hits"] = mine.get("hits", 0) + 1
+        mine["ua"] = family
+        save_state(state)
+        return True, ""
+
+
+def show_devices(as_json: bool = False) -> None:
+    state = load_state()
+    if as_json:
+        print(json.dumps(state["links"], ensure_ascii=False))
+        return
+    if not state["links"]:
+        return print("привязок нет: ни одну ссылку ещё не устанавливали")
+    for uuid, link in sorted(state["links"].items(),
+                             key=lambda kv: -max((d["last"] for d in kv[1]["devices"]),
+                                                 default=0)):
+        cap = link.get("limit", "по умолчанию")
+        print(f"{uuid}  лимит {cap}  отказов {link.get('denied', 0)}")
+        for d in link["devices"]:
+            when = time.strftime("%d.%m %H:%M", time.localtime(d["last"]))
+            day = d.get("today", 0)
+            exact = "точная" if d["kind"] == "hwid" else "приблизительная"
+            print(f"    {d['ua']:<12} {exact:<16} сетей {len(d['nets'])}  "
+                  f"обновлений {d['hits']} (за сутки {day})  последнее {when}")
+
+
+def reset_link(uuid: str) -> None:
+    with _state_lock:
+        state = load_state()
+        if state["links"].pop(uuid, None) is None:
+            raise SystemExit(f"привязки для {uuid} и не было")
+        save_state(state)
+    print(f"привязка снята: {uuid} снова встанет на любое устройство")
+
+
+def set_limit(uuid: str, number: int) -> None:
+    with _state_lock:
+        state = load_state()
+        link = state["links"].setdefault(uuid, {"first": time.time(), "devices": [],
+                                                "denied": 0, "last_denied": 0})
+        link["limit"] = number
+        save_state(state)
+    print(f"{uuid}: устройств по ссылке — {number or 'сколько угодно'}")
 
 
 def fetch(upstream: str, path: str) -> tuple[bytes, str, bool]:
@@ -102,12 +307,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "sub-mirror"
     sys_version = ""
     upstream = ""
+    device_limit = 1
 
     def log_message(self, fmt: str, *args) -> None:
         # Без адресов клиентов: зеркало раздаёт ключи доступа, журнал с ними
         # рядом — лишний способ эти ключи потерять.
         print(f"{self.command} {self.path.split('/')[1] if '/' in self.path[1:] else self.path} "
               f"-> {args[1] if len(args) > 1 else ''}", file=sys.stderr, flush=True)
+
+    def refuse(self, why: str, body: bool = True) -> None:
+        """Отказ так, чтобы человек понял причину и из приложения, и из браузера."""
+        print(f"отказ: {why}", file=sys.stderr, flush=True)
+        text = ("Эта ссылка уже установлена на другом устройстве.\n\n"
+                "Одна ссылка работает на одном устройстве. Попросите "
+                "свою ссылку у того, кто дал вам эту.\n").encode()
+        self.send_response(403)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(text)))
+        self.send_header("Cache-Control", "no-store")
+        # Заголовок из того же обихода, что и x-hwid: приложения, которые умеют
+        # считать устройства, показывают человеку понятное сообщение сами.
+        self.send_header("x-hwid-max-devices-reached", "true")
+        self.end_headers()
+        if body:
+            self.wfile.write(text)
 
     def do_HEAD(self) -> None:                                 # noqa: N802
         """Некоторые клиенты сначала спрашивают заголовки. Без этого метода
@@ -118,6 +341,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if not any(r.match(path) for r in ROUTES):
             return self.send_error(404, "not found")
+        if path.startswith("/sub/") and self.device_limit:
+            try:
+                allowed, why = register(path.rsplit("/", 1)[1].lower(), self.headers,
+                                        self.client_address[0], self.device_limit)
+            except OSError as exc:
+                # Учёт устройств — дело второе. Не записалось состояние — пускаем
+                # и жалуемся в журнал: остаться без VPN хуже, чем без учёта.
+                print(f"учёт устройств не работает ({exc}), пускаю без счёта",
+                      file=sys.stderr, flush=True)
+                allowed, why = True, ""
+            if not allowed:
+                return self.refuse(why, body)
         try:
             content, kind, stale = fetch(self.upstream, path)
         except Exception as exc:                               # noqa: BLE001
@@ -165,11 +400,13 @@ def serve() -> None:
     context.load_cert_chain(cert, key)
 
     Handler.upstream = cfg["UPSTREAM"]
+    Handler.device_limit = int(cfg.get("DEVICES", "1") or 0)
     server = http.server.ThreadingHTTPServer(("", int(cfg["PORT"])), Handler)
     server.socket = context.wrap_socket(server.socket, server_side=True)
     threading.Thread(target=watch_certificate, args=(context, cert, key),
                      daemon=True, name="cert-watch").start()
-    print(f"зеркало подписок на :{cfg['PORT']}, источник {cfg['UPSTREAM']}",
+    print(f"зеркало подписок на :{cfg['PORT']}, источник {cfg['UPSTREAM']}, "
+          f"устройств на ссылку: {Handler.device_limit or 'не считаем'}",
           file=sys.stderr, flush=True)
     server.serve_forever()
 
@@ -201,5 +438,11 @@ if __name__ == "__main__":
         serve()
     elif action == "selftest":
         selftest()
+    elif action == "devices":
+        show_devices(as_json="--json" in sys.argv)
+    elif action == "reset" and len(sys.argv) > 2:
+        reset_link(sys.argv[2].lower())
+    elif action == "limit" and len(sys.argv) > 3:
+        set_limit(sys.argv[2].lower(), int(sys.argv[3]))
     else:
         raise SystemExit(__doc__)

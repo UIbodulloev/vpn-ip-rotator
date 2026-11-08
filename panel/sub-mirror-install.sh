@@ -49,6 +49,7 @@ cat > /opt/panel/sub-mirror.env <<EOF
 UPSTREAM=$UPSTREAM
 HOSTNAME=$HOST
 PORT=$PORT
+DEVICES=${DEVICES:-1}
 EOF
 chmod 644 /opt/panel/sub-mirror.env
 # Скрипт могут запускать и из репозитория, и уже из /opt/panel — во втором
@@ -99,6 +100,9 @@ PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=/var/cache/sub-mirror
+# Привязки устройств. StateDirectory — чтобы каталог появился сам и был
+# доступен на запись: ProtectSystem=strict делает /var/lib только читаемым.
+StateDirectory=sub-mirror
 ReadOnlyPaths=/etc/letsencrypt
 
 [Install]
