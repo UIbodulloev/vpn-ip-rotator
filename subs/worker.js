@@ -138,6 +138,65 @@ async function ruLists() {
   return { domains, cidr };
 }
 
+/** Исходящие: Hysteria2 по UDP, VLESS по TCP и автоматический выбор между ними.
+ *
+ *  У мобильных операторов в России душат длинные TCP-соединения к иностранным
+ *  адресам — VLESS подключается и ползёт. UDP при этом проходит. Hysteria2 с
+ *  обфускацией salamander выглядит как бесформенный UDP, поэтому идёт на полной
+ *  скорости; VLESS остаётся на случай сетей, где режут наоборот — UDP.
+ *
+ *  Телефон выбирает сам: urltest пробует оба и берёт живой. Hysteria2 стоит
+ *  первым, а tolerance большой — чтобы выбор не прыгал туда-сюда на мелкой
+ *  разнице задержек.
+ */
+function proxies(uuid, env) {
+  const vless = {
+    type: "vless",
+    tag: "vless",
+    server: env.VPN_HOST,
+    server_port: Number(env.VPN_PORT || 443),
+    uuid,
+    flow: "xtls-rprx-vision",
+    tls: {
+      enabled: true,
+      server_name: env.VPN_SNI,
+      utls: { enabled: true, fingerprint: env.VPN_FINGERPRINT || "chrome" },
+      reality: {
+        enabled: true,
+        public_key: env.VPN_PUBLIC_KEY,
+        short_id: env.VPN_SHORT_ID,
+      },
+    },
+  };
+  const direct = { type: "direct", tag: "direct" };
+
+  if (!env.VPN_HY2_PORT || !env.VPN_HY2_OBFS) {
+    return [{ ...vless, tag: "proxy" }, direct];
+  }
+
+  const hy2 = {
+    type: "hysteria2",
+    tag: "hysteria2",
+    server: env.VPN_HOST,
+    server_port: Number(env.VPN_HY2_PORT),
+    password: uuid,
+    obfs: { type: "salamander", password: env.VPN_HY2_OBFS },
+    tls: { enabled: true, server_name: env.VPN_HOST },
+  };
+  return [
+    {
+      type: "urltest",
+      tag: "proxy",
+      outbounds: ["hysteria2", "vless"],
+      interval: "10m",
+      tolerance: 300,
+    },
+    hy2,
+    vless,
+    direct,
+  ];
+}
+
 function singboxConfig(uuid, env, ru) {
   const host = env.VPN_HOST;
   const port = Number(env.VPN_PORT || 443);
@@ -175,27 +234,7 @@ function singboxConfig(uuid, env, ru) {
       },
     ],
 
-    outbounds: [
-      {
-        type: "vless",
-        tag: "proxy",
-        server: host,
-        server_port: port,
-        uuid,
-        flow: "xtls-rprx-vision",
-        tls: {
-          enabled: true,
-          server_name: env.VPN_SNI,
-          utls: { enabled: true, fingerprint: env.VPN_FINGERPRINT || "chrome" },
-          reality: {
-            enabled: true,
-            public_key: env.VPN_PUBLIC_KEY,
-            short_id: env.VPN_SHORT_ID,
-          },
-        },
-      },
-      { type: "direct", tag: "direct" },
-    ],
+    outbounds: proxies(uuid, env),
 
     route: {
       rules: [

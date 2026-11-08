@@ -43,6 +43,19 @@ done
 VPN_PORT="${VPN_PORT:-443}"
 VPN_FINGERPRINT="${VPN_FINGERPRINT:-chrome}"
 
+# Hysteria2 — необязателен: нет его на сервере, подписка просто останется
+# с одним VLESS. Параметры пишет panel/hysteria2-install.sh.
+HY2_FILE="${HY2_FILE:-/opt/panel/hysteria2.env}"
+if [[ -z "${VPN_HY2_PORT:-}" && -f "$HY2_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source <(grep -E '^[A-Z_]+=' "$HY2_FILE")
+    VPN_HY2_PORT="${PORT:-}"
+    VPN_HY2_OBFS="${OBFS_PASSWORD:-}"
+    [[ -n "$VPN_HY2_PORT" ]] && say "беру Hysteria2 из $HY2_FILE (UDP $VPN_HY2_PORT)"
+fi
+VPN_HY2_PORT="${VPN_HY2_PORT:-}"
+VPN_HY2_OBFS="${VPN_HY2_OBFS:-}"
+
 ZONE_NAME="${CF_ZONE_NAME:-${HOSTNAME_ARG#*.}}"
 
 jq_get() { python3 -c '
@@ -69,9 +82,11 @@ TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 # переразвёртыванием, не трогая логику.
 VPN_HOST="$VPN_HOST" VPN_PORT="$VPN_PORT" VPN_PUBLIC_KEY="$VPN_PUBLIC_KEY" \
 VPN_SHORT_ID="$VPN_SHORT_ID" VPN_SNI="$VPN_SNI" VPN_FINGERPRINT="$VPN_FINGERPRINT" \
+VPN_HY2_PORT="$VPN_HY2_PORT" VPN_HY2_OBFS="$VPN_HY2_OBFS" \
 COMPAT_DATE="$COMPAT_DATE" python3 > "$TMP/metadata.json" <<'PYEOF'
 import json, os
-keys = ("VPN_HOST","VPN_PORT","VPN_PUBLIC_KEY","VPN_SHORT_ID","VPN_SNI","VPN_FINGERPRINT")
+keys = ("VPN_HOST","VPN_PORT","VPN_PUBLIC_KEY","VPN_SHORT_ID","VPN_SNI","VPN_FINGERPRINT",
+        "VPN_HY2_PORT","VPN_HY2_OBFS")
 print(json.dumps({
     "main_module": "worker.js",
     "compatibility_date": os.environ["COMPAT_DATE"],

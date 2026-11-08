@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -63,6 +64,24 @@ def api(method: str, path: str, payload: dict | None = None) -> dict:
 
 
 LIVE_CONFIG = "/app/bin/config.json"
+HY2_SYNC = "/opt/panel/hy2-sync.py"
+HY2_ENV = "/opt/panel/hysteria2.env"
+
+
+def sync_hysteria2() -> None:
+    """Отразить правку во втором протоколе, если он установлен.
+
+    Пароль Hysteria2 у человека — это его UUID из VLESS, поэтому список
+    пользователей надо пересобрать после каждой выдачи и отзыва. Неудача тут
+    не должна рушить выдачу VLESS: ключ уже создан и работает, про вторую
+    половину просто честно сообщаем.
+    """
+    if not (os.path.exists(HY2_SYNC) and os.path.exists(HY2_ENV)):
+        return
+    done = subprocess.run([HY2_SYNC], capture_output=True, text=True, timeout=120)
+    if done.returncode != 0:
+        print(f"ВНИМАНИЕ: Hysteria2 не обновлён: "
+              f"{(done.stderr or done.stdout).strip()[:200]}", file=sys.stderr)
 
 
 def restart_xray() -> None:
@@ -177,6 +196,7 @@ def cmd_add(name: str) -> None:
         raise SystemExit("клиент создан, но не читается обратно — проверьте панель")
     restart_xray()
     wait_live(created["uuid"], present=True)
+    sync_hysteria2()
     print(build_link(created["uuid"], name, created.get("flow") or flow))
 
 
@@ -218,6 +238,7 @@ def cmd_del(name: str) -> None:
         raise SystemExit(f"панель: {(answer.get('msg') or '').strip()}")
     restart_xray()
     wait_live(doomed["uuid"], present=False)
+    sync_hysteria2()
     print(f"удалён: {name}")
 
 
