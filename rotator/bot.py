@@ -1538,20 +1538,23 @@ class Bot:
             elif line.strip():
                 rows.append(line.strip())
 
-        keyboard = [[{"text": "➕ Выпустить ссылку", "callback_data": "vless:new"}]]
+        keyboard = [[{"text": "➕ Выдать человеку · все ключи", "callback_data": "vless:new"}]]
         if stale:
             keyboard.append([{"text": "🔄 Применить конфиг к ядру", "callback_data": "vless:sync"}])
         if names:
-            keyboard.append([{"text": "📲 Подписка с белыми списками", "callback_data": "vless:sub"}])
-            keyboard.append([{"text": "🔗 Простая ссылка", "callback_data": "vless:link"}])
+            keyboard.append([{"text": "📤 Прислать ключи заново", "callback_data": "vless:sub"}])
+            keyboard.append([{"text": "🔗 Только ссылка vless://", "callback_data": "vless:link"}])
+            keyboard.append([{"text": "📄 Профиль файлом", "callback_data": "vless:file"}])
             keyboard.append([{"text": "🗑 Удалить", "callback_data": "vless:del"}])
         keyboard.append([{"text": "◀️ Сервер", "callback_data": "srv:menu"}])
 
         self.send(ui.joined(
             ui.title("VLESS Reality · мобильные", "📱"),
             ui.esc(f"Порт 443 на {domain_of(self.cfg, self.secrets) or 'вашем домене'}, "
-                   "маскировка под обычный HTTPS. Ссылка вставляется в Hiddify или "
-                   "v2rayNG из буфера обмена — файл не нужен."),
+                   "маскировка под обычный HTTPS."),
+            ui.esc("«Выдать человеку» выпускает сразу оба ключа — подписку для телефона "
+                   "и конфиг AmneziaWG 3.1 запасным каналом — и присылает их одним "
+                   "сообщением, готовым к пересылке."),
             ui.title("Клиенты"),
             ui.block(rows) if rows else ui.note("пока ни одного"),
             ui.note("Трафик — вверх и вниз вместе, за всё время: его считает панель, "
@@ -1594,48 +1597,195 @@ class Bot:
         titles = {
             "del": ("Удалить клиента", "🗑", "Удаление необратимо: ключ перестанет работать сразу."),
             "link": ("Простая ссылка", "🔗", "Весь трафик пойдёт через VPN, без белых списков."),
-            "sub": ("Подписка с белыми списками", "📲",
+            "sub": ("Прислать ключи заново", "📤",
                     "Пришлю готовое сообщение — его можно переслать человеку как есть."),
+            "file": ("Профиль файлом", "📄",
+                     "Для тех, у кого ссылка на подписку не открывается."),
         }
         heading, emoji, note = titles[action]
         self.send(ui.joined(ui.title(heading, emoji), ui.esc(note)), rows)
 
-    def vless_issue(self, name: str) -> None:
-        header = ui.title(f"Выпуск ссылки {name}", "📱")
-        message_id = self.send(ui.joined(header, ui.note("создаю клиента в панели…")))
+    # --- Выдача человеку: два ключа и одно сообщение --------------------------
+
+    def _sub_base(self) -> str:
+        """Адрес генератора подписок или пустая строка с объяснением в чате."""
+        base = self.secrets.get("SUB_BASE_URL").rstrip("/")
+        if base:
+            return base
+        self.send(ui.joined(
+            ui.title("Генератор подписок не настроен", ui.WARN),
+            ui.esc("Разверните его (subs/deploy.sh) и укажите адрес в настройках — "
+                   "без него телефонам нечего присылать."),
+        ), [[{"text": "⚙️ Указать адрес", "callback_data": "set:SUB_BASE_URL"}],
+            [{"text": "◀️ Назад", "callback_data": "vless:menu"}]])
+        return ""
+
+    def vless_ask_mode(self, name: str) -> None:
+        """Один вопрос перед выпуском: как вести российский трафик в AmneziaWG.
+
+        Подписка для телефона пускает российское напрямую всегда — у неё есть
+        список доменов. У AmneziaWG доменов нет, только адреса, поэтому там это
+        отдельный выбор и отдельная цена: список на 800 строк вместо одной.
+        """
+        self.send(ui.joined(
+            ui.title(f"Выдать {name}", "🎁"),
+            ui.esc("Выпущу сразу два ключа: подписку для телефона (VLESS и Hysteria2) "
+                   "и конфиг AmneziaWG 3.1 — запасным каналом и для роутера."),
+            ui.esc("Выбор ниже касается только файла AmneziaWG: подписка российские "
+                   "сайты мимо VPN пускает в любом случае."),
+            ui.note("Весь трафик — проверенный режим, работает у всех. "
+                    "Российское мимо VPN — банки видят домашний адрес, "
+                    "но конфиг разрастается до ~800 строк, и старые роутеры "
+                    "такое иногда не принимают."),
+        ), [
+            [{"text": "🌍 Весь трафик через VPN", "callback_data": f"vless:go:full:{name}"}],
+            [{"text": "🇷🇺 Российское мимо VPN", "callback_data": f"vless:go:split:{name}"}],
+            [{"text": "◀️ Отмена", "callback_data": "vless:menu"}],
+        ])
+
+    def vless_issue(self, name: str, mode: str = "full") -> None:
+        """Выпуск комплекта. Ключ VLESS — первым: если на нём споткнёмся,
+        отменять ещё нечего. Если споткнётся AmneziaWG, ключ для телефона
+        всё равно уедет человеку, а в чате будет сказано, чего не хватает."""
+        mode = mode if mode in ("full", "split") else "full"
+        base = self._sub_base()
+        if not base:
+            return
+        header = ui.title(f"Выдаю {name}", "🎁")
+        message_id = self.send(ui.joined(header, ui.note("выпускаю ключ VLESS…")))
 
         def worker() -> None:
             try:
                 made = self._panel(f"add {name}")
                 if not made.ok or "vless://" not in made.out:
                     return self.edit(message_id, ui.joined(
-                        ui.title("Не вышло", ui.NO), ui.block([made.text(500)])))
-                self._show_link(message_id, name, made.out.strip())
+                        ui.title("Ключ VLESS не выпустился", ui.NO),
+                        ui.block([made.text(500)]),
+                        ui.note("AmneziaWG не трогал: выпускать половину комплекта "
+                                "смысла нет."),
+                    ))
+                link = next(l.strip() for l in made.out.splitlines()
+                            if l.strip().startswith("vless://"))
+                uuid = link.split("://", 1)[1].split("@", 1)[0]
+
+                self.edit(message_id, ui.joined(header, ui.note("выпускаю ключ AmneziaWG 3.1…")))
+                conf, trouble = self._awg_conf_new(name, mode)
+
+                if conf:
+                    done = ("Выпущены оба ключа. Сообщение ниже можно переслать "
+                            "человеку целиком — там и подписка, и файл.")
+                    where = ("AmneziaWG: российское идёт мимо VPN" if mode == "split"
+                             else "AmneziaWG: весь трафик через VPN")
+                else:
+                    done = ("Ключ для телефона выпущен, сообщение ниже готово "
+                            "к пересылке. Конфига AmneziaWG в нём нет.")
+                    where = ""
+                self.edit(message_id, ui.joined(
+                    ui.title(f"Готово · {name}", ui.YES if conf else ui.WARN),
+                    ui.esc(done),
+                    ui.note(where),
+                    ui.joined(ui.title("AmneziaWG не выпустился", ui.WARN),
+                              ui.block([trouble])) if trouble else "",
+                ))
+                self.send_bundle(base, name, uuid, link, conf)
             except Exception as exc:                           # noqa: BLE001
-                logger.exception("выпуск ссылки не удался")
+                logger.exception("выдача комплекта не удалась")
                 self.edit(message_id, ui.joined(ui.title("Ошибка", ui.NO), ui.block([str(exc)])))
 
         threading.Thread(target=worker, name="vless-issue", daemon=True).start()
 
-    def vless_link(self, name: str) -> None:
+    # Ошибки AmneziaWG возвращаются текстом, а не исключением: ключ VLESS к этому
+    # моменту уже выпущен, и упасть здесь значило бы не отдать человеку вообще
+    # ничего. Пусть уедет половина комплекта, а в чате будет видно, чего нет.
+    def _awg_conf_new(self, name: str, mode: str) -> tuple[str, str]:
+        """Выпустить конфиг AmneziaWG и вернуть (текст, что пошло не так)."""
         try:
-            got = self._panel(f"link {name}")
+            made = self._awg(f"{self.AWG_DIR}/add-client.sh {name} {mode}", timeout=150)
         except remote.RemoteError as exc:
-            return self.send(f"{ui.NO} {ui.esc(str(exc))}")
-        if not got.ok or "vless://" not in got.out:
-            return self.send(ui.joined(ui.title("Не нашлось", ui.NO), ui.block([got.text(300)])))
-        self._show_link(self.send(ui.note("…")), name, got.out.strip())
+            return "", str(exc)
+        if not made.ok:
+            return "", made.text(400)
+        return self._awg_conf(name)
+
+    def _awg_conf(self, name: str) -> tuple[str, str]:
+        """Прочитать уже выпущенный конфиг. Пустой текст — конфига нет."""
+        try:
+            got = self._awg(f"cat {self.AWG_DIR}/clients/{name}.conf")
+        except remote.RemoteError as exc:
+            return "", str(exc)
+        if got.ok and "[Interface]" in got.out:
+            return got.out, ""
+        return "", got.text(300)
+
+    # Сообщение для пересылки. Пишется для человека, который про VPN не знает
+    # ничего: сначала что делать, потом почему.
+    @staticmethod
+    def bundle_caption(base: str, name: str, uuid: str, link: str,
+                       with_file: bool) -> tuple[str, str]:
+        """Текст сообщения и остаток, который в него не влез.
+
+        Подпись к файлу Telegram обрезает на 1024 символах, а ссылка vless://
+        длинная и зависит от домена. Обрезанный ключ выглядит как рабочий, но
+        не работает, поэтому лишнее уходит вторым сообщением целиком.
+        """
+        head = [
+            "<b>Ваш личный VPN</b>",
+            "",
+            f"Инструкция с картинками: {ui.esc(base)}/",
+            "",
+            "<b>1. Телефон — основной способ</b>",
+            "Установите приложение <b>sing-box</b>, скопируйте ссылку и нажмите "
+            "в приложении «+»:",
+            f"<code>{ui.esc(base)}/sub/{ui.esc(uuid)}</code>",
+        ]
+        if with_file:
+            head += [
+                "",
+                "<b>2. Запасной способ и роутеры</b>",
+                "Установите приложение <b>AmneziaWG</b> и откройте в нём файл "
+                f"<b>{ui.esc(name)}.conf</b> из этого сообщения.",
+            ]
+        extra = [
+            "",
+            "<b>3. Если приложение просит ссылку vless://</b>",
+            f"<code>{ui.esc(link)}</code>",
+        ] if link else []
+        foot = [
+            "",
+            "Российские сайты, банки и Госуслуги работают сами — выключать VPN не нужно.",
+            "Ключи личные и рассчитаны на одно устройство. "
+            "Нужно второе — попросите отдельные.",
+        ]
+        caption = "\n".join(head + extra + foot)
+        if len(caption) <= 950:
+            return caption, ""
+        return "\n".join(head + foot), "\n".join(extra[1:])
+
+    def send_bundle(self, base: str, name: str, uuid: str, link: str, conf: str) -> None:
+        caption, spare = self.bundle_caption(base, name, uuid, link, bool(conf))
+        if conf and self.send_document(f"{name}.conf", conf, caption=caption):
+            if spare:
+                self.send(spare)
+            return
+        if conf:
+            self.send(ui.joined(
+                ui.title("Файл не ушёл", ui.WARN),
+                ui.esc(f"Конфиг лежит на сервере: {self.AWG_DIR}/clients/{name}.conf — "
+                       "заберите его через scp. Ключи ниже рабочие."),
+            ))
+        self.send(caption)
+        if spare:
+            self.send(spare)
 
     def vless_sub(self, name: str) -> None:
-        """Готовое сообщение для пересылки: подписка плюс страница инструкции."""
-        base = self.secrets.get("SUB_BASE_URL").rstrip("/")
+        """Прислать комплект заново — тому же человеку или на новое устройство.
+
+        Ключи не перевыпускаются: подписка живёт по тому же адресу, а конфиг
+        AmneziaWG лежит на сервере с момента выдачи.
+        """
+        base = self._sub_base()
         if not base:
-            return self.send(ui.joined(
-                ui.title("Генератор подписок не настроен", ui.WARN),
-                ui.esc("Разверните его (subs/deploy.sh) и укажите адрес в настройках — "
-                       "без него белые списки для телефонов не работают."),
-            ), [[{"text": "⚙️ Указать адрес", "callback_data": "set:SUB_BASE_URL"}],
-                [{"text": "◀️ Назад", "callback_data": "vless:menu"}]])
+            return
         try:
             listing = self._panel("list")
         except remote.RemoteError as exc:
@@ -1645,23 +1795,42 @@ class Bot:
         if not uuid:
             return self.send(f"{ui.NO} клиента {ui.esc(name)} нет")
 
-        self.send(ui.joined(
-            ui.title(f"Подписка готова · {name}", ui.YES),
-            ui.esc("Следующее сообщение можно переслать человеку целиком — "
-                   "там и ссылка, и инструкция."),
-            ui.note("Ссылка персональная. У каждого должна быть своя."),
-        ))
-        # Отдельным сообщением и без лишнего — чтобы пересылалось как есть.
-        self.send(
-            f"<b>Ваш VPN</b>\n\n"
-            f"1. Установите приложение <b>Hiddify</b>.\n"
-            f"2. Откройте инструкцию: {ui.esc(base)}/\n"
-            f"3. Ваша личная ссылка:\n\n"
-            f"<code>{ui.esc(base)}/sub/{ui.esc(uuid)}</code>\n\n"
-            f"Банки и Госуслуги работают сами — VPN отключать не нужно.\n"
-            f"Ссылку никому не передавайте."
-        )
-        self.send_profile_file(base, uuid, name)
+        def worker() -> None:
+            try:
+                got = self._panel(f"link {name}")
+                link = next((l.strip() for l in got.out.splitlines()
+                             if l.strip().startswith("vless://")), "")
+                conf, _ = self._awg_conf(name)
+                self.send(ui.joined(
+                    ui.title(f"Комплект · {name}", ui.YES),
+                    ui.esc("Следующее сообщение можно переслать человеку целиком."),
+                    ui.note("Ссылки персональные. У каждого устройства должны быть свои.")
+                    if conf else ui.note("Конфига AmneziaWG у этого имени нет — "
+                                         "в сообщении только ключи для телефона. "
+                                         "Выпустить его: 🔐 AmneziaWG 3.1 → Выпустить конфиг."),
+                ))
+                self.send_bundle(base, name, uuid, link, conf)
+            except Exception as exc:                           # noqa: BLE001
+                logger.exception("повторная отправка комплекта не удалась")
+                self.send(ui.joined(ui.title("Ошибка", ui.NO), ui.block([str(exc)])))
+
+        threading.Thread(target=worker, name="vless-resend", daemon=True).start()
+
+    def vless_file(self, name: str) -> None:
+        """Подписка файлом — отдельной кнопкой, потому что нужна не всем."""
+        base = self._sub_base()
+        if not base:
+            return
+        try:
+            listing = self._panel("list")
+        except remote.RemoteError as exc:
+            return self.send(f"{ui.NO} {ui.esc(str(exc))}")
+        uuid = next((l.split("\t")[1] for l in listing.out.splitlines()
+                     if l.split("\t")[0] == name and "\t" in l), "")
+        if not uuid:
+            return self.send(f"{ui.NO} клиента {ui.esc(name)} нет")
+        threading.Thread(target=self.send_profile_file, args=(base, uuid, name),
+                         name="vless-file", daemon=True).start()
 
     def send_profile_file(self, base: str, uuid: str, name: str) -> None:
         """Тот же профиль файлом — на случай, когда ссылка не открывается.
@@ -2234,7 +2403,7 @@ class Bot:
             return self.awg_issue(value)
         if key == "VLESS_CLIENT_NAME":
             self.edit(receipt, ui.joined(ui.title("Принято", ui.YES), ui.esc(value)))
-            return self.vless_issue(value)
+            return self.vless_ask_mode(value)
         self.secrets.set(key, value)
         shown = masked(value) if is_secret(key) else value
         self.edit(receipt, f"✅ {key.replace('_', ' ').lower()}: {shown}")
@@ -2590,12 +2759,16 @@ class Bot:
         if data == "vless:new":
             self.awaiting = "VLESS_CLIENT_NAME"
             return self.send(ui.joined(
-                ui.title("Имя для нового клиента", "📱"),
-                ui.esc("Пришлите короткое имя — оно будет видно в списке и в названии "
-                       "профиля на телефоне.\n\nНапример: oleg-iphone, masha-android"),
+                ui.title("Имя для нового клиента", "🎁"),
+                ui.esc("Пришлите короткое имя — одно на человека и устройство. "
+                       "Оно попадёт и в список панели, и в название файла "
+                       "AmneziaWG.\n\nНапример: oleg-iphone, masha-android"),
                 ui.esc("/cancel — выйти"),
             ))
-        if data in ("vless:link", "vless:del", "vless:sub"):
+        if data.startswith("vless:go:"):
+            _, _, mode, client = data.split(":", 3)
+            return self.vless_issue(client, mode)
+        if data in ("vless:link", "vless:del", "vless:sub", "vless:file"):
             return self.vless_pick(data.split(":", 1)[1])
         if data.startswith("vless:link:"):
             return self.vless_link(data.split(":", 2)[2])
@@ -2603,6 +2776,8 @@ class Bot:
             return self.vless_del(data.split(":", 2)[2])
         if data.startswith("vless:sub:"):
             return self.vless_sub(data.split(":", 2)[2])
+        if data.startswith("vless:file:"):
+            return self.vless_file(data.split(":", 2)[2])
         if data == "awg:menu":
             return self.awg_menu()
         if data == "awg:new":

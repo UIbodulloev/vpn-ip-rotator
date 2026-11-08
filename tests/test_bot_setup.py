@@ -645,25 +645,101 @@ class SetupWizardTest(unittest.TestCase):
         for target in ("vless:new", "vless:link", "vless:del"):
             self.assertIn(target, buttons)
 
-    def test_выпуск_ссылки_vless(self):
-        link = ("vless://11111111-2222-3333-4444-555555555555@vpn.example.com:443"
-                "?type=tcp&security=reality&pbk=KEY&sni=www.example.com#oleg")
-        calls = self._fake_ssh({"client.py add": link})
+    LINK = ("vless://11111111-2222-3333-4444-555555555555@vpn.example.com:443"
+            "?type=tcp&security=reality&pbk=KEY&sni=www.example.com#oleg")
+    CONF = "[Interface]\nPrivateKey = x\nAddress = 172.29.172.5/32\n"
+
+    def _wait(self, condition, tries: int = 100):
+        """Выдача идёт в отдельном потоке: ждём, пока он доберётся до конца."""
+        import time as _t
+        for _ in range(tries):
+            if condition():
+                return True
+            _t.sleep(0.02)
+        return False
+
+    def _bundle_ssh(self, drop: tuple[str, ...] = (), **extra):
+        replies = {"client.py add": self.LINK,
+                   "client.py link": self.LINK,
+                   "add-client.sh": "готово: /opt/awg31/clients/oleg.conf",
+                   "cat /opt/awg31/clients/oleg.conf": self.CONF}
+        replies.update(extra)
+        for key in drop:                 # команда свалится: ответа для неё нет
+            replies.pop(key, None)
+        self.h.secrets.set("SUB_BASE_URL", "https://sub.example.com")
+        return self._fake_ssh(replies)
+
+    def test_выдача_человеку_одним_сообщением(self):
+        """Админ пересылает одно сообщение, а в нём — все ключи сразу."""
+        calls = self._bundle_ssh()
         self.h.tg.user_taps("vless:new")
         self.h.pump()
         self.assertEqual(self.h.bot.awaiting, "VLESS_CLIENT_NAME")
 
         self.h.tg.user_says("oleg")
         self.h.pump()
-        import time as _t
-        for _ in range(50):
-            if any("vless://" in s for s in self.h.tg.timeline):
-                break
-            _t.sleep(0.02)
+        buttons = [d for _, d in self.h.tg.buttons()]
+        self.assertIn("vless:go:full:oleg", buttons, "не спросили про белые списки")
+        self.assertIn("vless:go:split:oleg", buttons)
+
+        self.h.tg.user_taps("vless:go:full:oleg")
+        self.h.pump()
+        self.assertTrue(self._wait(lambda: self.h.tg.documents), "комплект не отправлен")
+
+        self.assertTrue(any("client.py add oleg" in c for c in calls), "ключ VLESS не выпущен")
+        self.assertTrue(any("add-client.sh oleg full" in c for c in calls),
+                        "ключ AmneziaWG не выпущен вместе с VLESS")
+        self.assertEqual(len(self.h.tg.documents), 1, "ключи разъехались по разным файлам")
+        doc = self.h.tg.documents[-1]
+        self.assertEqual(doc["filename"], "oleg.conf")
+        self.assertIn("[Interface]", doc["content"])
+        caption = doc["caption"]
+        self.assertIn("https://sub.example.com/sub/11111111-2222-3333-4444-555555555555",
+                      caption, "в сообщении нет подписки для телефона")
+        self.assertIn("https://sub.example.com/", caption, "нет ссылки на инструкцию")
+        self.assertIn("vless://", caption, "нет простой ссылки vless")
+        self.assertIn("AmneziaWG", caption, "не сказано, чем открыть файл")
+        self.assertIn("sing-box", caption, "не сказано, какое приложение ставить")
+
+    def test_выдача_с_белыми_списками_передаёт_режим(self):
+        calls = self._bundle_ssh()
+        self.h.bot.awaiting = "VLESS_CLIENT_NAME"
+        self.h.tg.user_says("oleg")
+        self.h.pump()
+        self.h.tg.user_taps("vless:go:split:oleg")
+        self.h.pump()
+        self.assertTrue(self._wait(lambda: any("add-client.sh oleg split" in c for c in calls)),
+                        "режим белых списков не доехал до сервера")
+
+    def test_сбой_amneziawg_не_отменяет_ключ_для_телефона(self):
+        """Выпуск половины комплекта лучше, чем ничего: ключ VLESS уже выдан."""
+        calls = self._bundle_ssh(drop=("add-client.sh",))
+        self.h.tg.user_taps("vless:go:full:oleg")
+        self.h.pump()
+        self.assertTrue(self._wait(
+            lambda: "sub/11111111-2222-3333-4444-555555555555" in self.h.tg.all_visible()),
+            "ключ для телефона не доехал")
         visible = self.h.tg.all_visible()
-        self.assertIn("vless://", visible, "ссылка не отправлена")
-        self.assertIn("Hiddify", visible, "не сказано, куда её вставлять")
+        self.assertIn("AmneziaWG не выпустился", visible, "сбой не показан администратору")
+        self.assertFalse(self.h.tg.documents, "отправлен файл, которого нет")
         self.assertTrue(any("client.py add oleg" in c for c in calls))
+
+    def test_подпись_к_файлу_влезает_в_предел_телеграма(self):
+        """У подписи к файлу предел 1024 символа. Длинная ссылка vless уедет
+        отдельным сообщением, но обрезанных ключей быть не должно."""
+        long_link = ("vless://11111111-2222-3333-4444-555555555555@"
+                     "very-long-domain-name-for-this-vpn.example.com:443?" + "x=1&" * 120)
+        self._bundle_ssh(**{"client.py add": long_link})
+        self.h.tg.user_taps("vless:go:full:oleg")
+        self.h.pump()
+        self.assertTrue(self._wait(lambda: self.h.tg.documents), "комплект не отправлен")
+        caption = self.h.tg.documents[-1]["caption"]
+        self.assertLessEqual(len(caption), 1024, "подпись не влезет в Telegram")
+        self.assertIn("sub/11111111-2222-3333-4444-555555555555", caption)
+        self.assertNotIn("very-long-domain-name", caption, "длинная ссылка не ушла из подписи")
+        self.assertTrue(self._wait(
+            lambda: "very-long-domain-name-for-this-vpn.example.com" in self.h.tg.all_visible()),
+            "длинная ссылка потерялась вместо отдельного сообщения")
 
     def test_ключ_не_доехавший_до_ядра_виден_и_лечится(self):
         """Клиент есть в панели, но ядро его не знает — снаружи это timeout.
@@ -734,18 +810,21 @@ class SetupWizardTest(unittest.TestCase):
         requests.get = lambda *a, **kw: Answer()
         self.addCleanup(lambda: setattr(requests, "get", original))
 
-    def test_подписка_присылает_готовое_сообщение(self):
-        self.h.secrets.set("SUB_BASE_URL", "https://sub.example.com")
-        self._fake_fetch('{"outbounds": []}')
-        self._fake_ssh({"client.py list":
-                        "oleg\t11111111-2222-3333-4444-555555555555\t0Б\tвкл\n"})
+    def test_повторная_отправка_не_перевыпускает_ключи(self):
+        """«Прислать заново» — то же сообщение. Перевыпуск отключил бы ключ
+        на устройстве, которое уже работает."""
+        calls = self._bundle_ssh(**{"client.py list":
+                                    "oleg\t11111111-2222-3333-4444-555555555555\t0Б\tвкл\n"})
         self.h.tg.user_taps("vless:sub:oleg")
         self.h.pump()
-        visible = self.h.tg.all_visible()
+        self.assertTrue(self._wait(lambda: self.h.tg.documents), "комплект не отправлен")
+        caption = self.h.tg.documents[-1]["caption"]
         self.assertIn("https://sub.example.com/sub/11111111-2222-3333-4444-555555555555",
-                      visible, "в сообщении нет ссылки подписки")
-        self.assertIn("https://sub.example.com/", visible, "нет ссылки на инструкцию")
-        self.assertIn("Госуслуги", visible, "не сказано про белые списки")
+                      caption, "в сообщении нет ссылки подписки")
+        self.assertIn("https://sub.example.com/", caption, "нет ссылки на инструкцию")
+        self.assertIn("Госуслуги", caption, "не сказано про белые списки")
+        self.assertFalse(any("client.py add" in c for c in calls), "ключ перевыпущен заново")
+        self.assertFalse(any("add-client.sh" in c for c in calls), "конфиг перевыпущен заново")
 
     def test_подписка_приходит_и_файлом(self):
         """У части мобильных операторов ссылка не открывается — нужен файл."""
@@ -753,9 +832,9 @@ class SetupWizardTest(unittest.TestCase):
         self._fake_fetch('{"outbounds": [{"tag": "proxy"}]}')
         self._fake_ssh({"client.py list":
                         "oleg\t11111111-2222-3333-4444-555555555555\t0Б\tвкл\n"})
-        self.h.tg.user_taps("vless:sub:oleg")
+        self.h.tg.user_taps("vless:file:oleg")
         self.h.pump()
-        self.assertTrue(self.h.tg.documents, "профиль файлом не отправлен")
+        self.assertTrue(self._wait(lambda: self.h.tg.documents), "профиль файлом не отправлен")
         doc = self.h.tg.documents[-1]
         self.assertEqual(doc["filename"], "oleg.json")
         self.assertIn("proxy", doc["content"])
@@ -766,10 +845,10 @@ class SetupWizardTest(unittest.TestCase):
         self._fake_fetch("<html>503</html>")
         self._fake_ssh({"client.py list":
                         "oleg\t11111111-2222-3333-4444-555555555555\t0Б\tвкл\n"})
-        self.h.tg.user_taps("vless:sub:oleg")
+        self.h.tg.user_taps("vless:file:oleg")
         self.h.pump()
+        self.assertTrue(self._wait(lambda: "не забрался" in self.h.tg.all_visible()))
         self.assertFalse(self.h.tg.documents, "отправлен файл с мусором вместо конфига")
-        self.assertIn("не забрался", self.h.tg.all_visible())
 
     def test_адрес_подписок_проверяется(self):
         from rotator.bot import VALIDATORS
@@ -803,13 +882,21 @@ class SetupWizardTest(unittest.TestCase):
         from pathlib import Path as _P
         src = _P(__file__).resolve().parents[1].joinpath("subs/worker.js").read_text()
         page = src[src.index("function instructionPage"):]
-        for bad in ("http://", "cdn.", "fonts.googleapis", "<script"):
+        for bad in ("http://", "cdn.", "fonts.googleapis", "<script", "<img"):
             self.assertNotIn(bad, page, f"страница тянет внешнее: {bad}")
-        for must in ("sing-box", "Hiddify", "Госуслуги", "буфера обмена"):
+        for must in ("sing-box", "Hiddify", "Госуслуги", "буфера обмена",
+                     "AmneziaWG", "org.amnezia.awg", "id6478942365"):
             self.assertIn(must, page, f"в инструкции нет {must}")
+        # Теперь человеку присылают два ключа, и страница обязана объяснить оба:
+        # иначе файл .conf в сообщении выглядит мусором, который он выбросит.
+        self.assertIn("Способ 1", page, "нет раздела про телефон")
+        self.assertIn("Способ 2", page, "нет раздела про файл AmneziaWG")
+        # Рисунки экранов — inline SVG: по сети не грузятся, в тёмной теме живут.
+        self.assertGreaterEqual(page.count("<svg"), 4, "шаги без рисунков")
+        self.assertIn("var(--accent)", page, "рисунки не переживут тёмную тему")
         # Какое из двух приложений соединится, зависит от версии ядра на
         # сервере. Человек должен прочитать «попробуйте второе», а не гадать.
-        self.assertIn("не подключается", page,
+        self.assertIn("не запускается", page,
                       "страница не говорит, что делать, если приложение не идёт")
 
     def test_оба_протокола_доступны_из_меню_сервера(self):

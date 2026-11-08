@@ -131,6 +131,16 @@ else
     check_ok "$(api POST "/zones/$ZONE_ID/workers/routes" -H 'Content-Type: application/json' --data "$BODY")" "создание маршрута"
 fi
 
+# Зеркало на VPN-сервере держит ответы воркера час. Без сброса кэша люди ещё
+# час читают старую инструкцию и качают старый профиль — а выглядит это так,
+# будто развёртывание не сработало.
+MIRROR_CACHE=/var/cache/sub-mirror
+if [[ -d "$MIRROR_CACHE" ]]; then
+    COUNT=$(find "$MIRROR_CACHE" -type f | wc -l | tr -d ' ')
+    find "$MIRROR_CACHE" -type f -delete
+    say "сбросил кэш зеркала: $COUNT файл(ов)"
+fi
+
 say "проверяю"
 PROBE="00000000-0000-4000-8000-000000000000"
 for _ in $(seq 1 20); do
@@ -219,6 +229,25 @@ else
 fi
 CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "https://$HOSTNAME_ARG/sub/not-a-uuid" || true)
 [[ "$CODE" == "404" ]] && say "мусор в пути отбивается 404" || warn "на мусорный путь ответ $CODE"
+
+# Страница инструкции. Её читают люди, которые про VPN не знают ничего, и
+# сломанной её никто не починит: проверяем, что она вообще отдаётся и что в
+# ней не осталось неподставленных кусков шаблона.
+CODE=$(curl -sS -o "$TMP/page.html" -w '%{http_code}' --max-time 10 "https://$HOSTNAME_ARG/" || true)
+if [[ "$CODE" == "200" ]]; then
+    PROBLEMS=""
+    grep -q '\${' "$TMP/page.html" && PROBLEMS="осталась неподставленная вставка \${…}"
+    for NEEDLE in "sing-box" "AmneziaWG" "$HOSTNAME_ARG" "</html>"; do
+        grep -qF -- "$NEEDLE" "$TMP/page.html" || PROBLEMS="$PROBLEMS; нет «$NEEDLE»"
+    done
+    if [[ -n "$PROBLEMS" ]]; then
+        warn "страница инструкции: ${PROBLEMS#; }"
+    else
+        say "страница инструкции отдаётся: $(wc -c < "$TMP/page.html" | tr -d ' ') байт, оба способа на месте"
+    fi
+else
+    warn "страница инструкции не ответила (код ${CODE:-нет})"
+fi
 echo
 echo "Страница для пользователей: https://$HOSTNAME_ARG/"
 echo "Подписка:                   https://$HOSTNAME_ARG/sub/<uuid-клиента>"

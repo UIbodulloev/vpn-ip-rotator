@@ -358,7 +358,9 @@ export default {
 
 /**
  * Страница для пользователя. Самодостаточная: ни внешних стилей, ни шрифтов,
- * ни скриптов — чтобы открывалась и там, где половина интернета недоступна.
+ * ни скриптов, ни картинок по сети — чтобы открывалась и там, где половина
+ * интернета недоступна. Рисунки экранов — inline SVG: это схемы, а не снимки,
+ * зато они весят килобайты и читаются в тёмной теме.
  */
 function instructionPage(host) {
   return `<!doctype html>
@@ -372,10 +374,12 @@ function instructionPage(host) {
   :root{
     --bg:#f6f7f9; --card:#fff; --ink:#15181d; --dim:#5c6370;
     --line:#e3e6ea; --accent:#1d6fe0; --okbg:#eaf6ec; --okink:#1d6b32;
+    --soft:#eef2f7; --warn:#fdf3e3; --warnink:#7a5218;
   }
   @media (prefers-color-scheme:dark){
     :root{ --bg:#14171c; --card:#1c2026; --ink:#e8eaed; --dim:#9aa2ae;
-           --line:#2b313a; --accent:#6aa9f5; --okbg:#182a1d; --okink:#8fd3a0; }
+           --line:#2b313a; --accent:#6aa9f5; --okbg:#182a1d; --okink:#8fd3a0;
+           --soft:#23282f; --warn:#2a2316; --warnink:#e0c38a; }
   }
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--ink);
@@ -383,7 +387,18 @@ function instructionPage(host) {
        padding:24px 16px 56px}
   main{max-width:620px;margin:0 auto}
   h1{font-size:26px;line-height:1.25;margin:0 0 6px}
-  .lead{color:var(--dim);margin:0 0 28px}
+  h2{font-size:20px;line-height:1.3;margin:36px 0 4px}
+  .lead{color:var(--dim);margin:0 0 24px}
+  .sub{color:var(--dim);margin:0 0 16px;font-size:15px}
+
+  /* Что прислали */
+  .got{background:var(--card);border:1px solid var(--line);border-radius:14px;
+       padding:16px 18px;margin-bottom:10px;display:flex;gap:14px;align-items:flex-start}
+  .got .ico{flex:0 0 38px}
+  .got b{display:block;margin-bottom:2px}
+  .got p{margin:0;color:var(--dim);font-size:15px}
+
+  /* Шаги */
   ol{list-style:none;counter-reset:s;padding:0;margin:0}
   li{counter-increment:s;background:var(--card);border:1px solid var(--line);
      border-radius:14px;padding:18px 18px 18px 60px;margin-bottom:12px;position:relative}
@@ -392,85 +407,273 @@ function instructionPage(host) {
      font-weight:600;font-size:15px;display:flex;align-items:center;justify-content:center}
   li b{display:block;margin-bottom:4px}
   li p{margin:0;color:var(--dim);font-size:15px}
+  li p+p{margin-top:8px}
+
+  figure{margin:14px 0 0;text-align:center}
+  figure svg{width:100%;max-width:270px;height:auto;
+     border-radius:12px;background:var(--soft)}
+  figcaption{color:var(--dim);font-size:13px;margin-top:6px}
+
   .apps{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
-  .apps a{flex:1 1 140px;text-align:center;text-decoration:none;
-     background:var(--accent);color:#fff;padding:11px 14px;border-radius:10px;font-weight:600}
+  .apps a{flex:1 1 130px;text-align:center;text-decoration:none;
+     background:var(--accent);color:#fff;padding:11px 14px;border-radius:10px;
+     font-weight:600;font-size:15px}
   code{background:var(--bg);border:1px solid var(--line);border-radius:6px;
      padding:2px 6px;font-size:14px;word-break:break-all}
   .note{background:var(--okbg);color:var(--okink);border-radius:14px;
-     padding:16px 18px;margin-top:22px;font-size:15px}
+     padding:16px 18px;margin-top:16px;font-size:15px}
   .note b{display:block;margin-bottom:4px}
-  footer{color:var(--dim);font-size:13px;margin-top:26px;text-align:center}
+  .plain{background:transparent;color:var(--dim);border:1px solid var(--line)}
+  .warn{background:var(--warn);color:var(--warnink)}
+  details{background:var(--card);border:1px solid var(--line);border-radius:14px;
+     padding:14px 18px;margin-top:10px}
+  details summary{cursor:pointer;font-weight:600}
+  details p{color:var(--dim);font-size:15px;margin:10px 0 0}
+  footer{color:var(--dim);font-size:13px;margin-top:34px;text-align:center}
 </style>
 </head>
 <body>
 <main>
-  <h1>Настройка VPN</h1>
+  <h1>Как включить VPN</h1>
   <p class="lead">Пять минут, один раз. Дальше работает само.</p>
+
+  <h2>Что вам прислали</h2>
+  <p class="sub">В сообщении две вещи. Начните со <b>ссылки</b> — файл нужен
+     только как запасной вариант.</p>
+
+  <div class="got">
+    <svg class="ico" viewBox="0 0 38 38" aria-hidden="true">
+      <rect x="1" y="9" width="36" height="20" rx="10" fill="none"
+            stroke="var(--accent)" stroke-width="2"/>
+      <path d="M12 19h14" stroke="var(--accent)" stroke-width="2" stroke-linecap="round"/>
+      <circle cx="12" cy="19" r="3.2" fill="var(--accent)"/>
+      <circle cx="26" cy="19" r="3.2" fill="var(--accent)"/>
+    </svg>
+    <div>
+      <b>Ссылка вида https://${host}/sub/…</b>
+      <p>Главное. Телефон сам скачивает по ней настройки и сам их обновляет.
+         Если сервер переедет — у вас ничего не сломается.</p>
+    </div>
+  </div>
+
+  <div class="got">
+    <svg class="ico" viewBox="0 0 38 38" aria-hidden="true">
+      <path d="M9 3h13l8 8v24H9z" fill="none" stroke="var(--dim)" stroke-width="2"/>
+      <path d="M22 3v8h8" fill="none" stroke="var(--dim)" stroke-width="2"/>
+      <path d="M14 20h10M14 26h10" stroke="var(--dim)" stroke-width="2" stroke-linecap="round"/>
+    </svg>
+    <div>
+      <b>Файл с названием вида имя.conf</b>
+      <p>Запасной канал на случай, если первый способ не пойдёт, и
+         единственный способ для роутера. Другое приложение, другая технология.</p>
+    </div>
+  </div>
+
+  <h2>Способ 1 · Телефон</h2>
+  <p class="sub">Начните с него.</p>
 
   <ol>
     <li>
-      <b>Установите приложение</b>
-      <p>Называется <b>sing-box</b>. Других приложений не нужно.</p>
+      <b>Установите приложение sing-box</b>
+      <p>Других приложений не нужно. В магазине оно так и называется —
+         <b>sing-box</b>, значок чёрно-белый.</p>
       <div class="apps">
         <a href="https://play.google.com/store/apps/details?id=io.nekohasekai.sfa">Android</a>
         <a href="https://apps.apple.com/app/sing-box-vt/id6673731168">iPhone и iPad</a>
       </div>
     </li>
+
     <li>
-      <b>Скопируйте свою ссылку</b>
-      <p>Её прислали вам отдельным сообщением. Выглядит так:
-         <code>https://${host}/sub/…</code><br>
-         Ссылка личная — не передавайте её другим.</p>
+      <b>Скопируйте присланную ссылку</b>
+      <p>Задержите палец на ссылке в сообщении и выберите <b>Копировать</b>.
+         Открывать её в браузере не нужно — браузер покажет непонятный текст,
+         и это нормально.</p>
+      <figure>
+        <svg viewBox="0 0 270 150" role="img" aria-label="Сообщение со ссылкой и меню копирования">
+          <rect x="14" y="16" width="200" height="46" rx="12" fill="var(--card)"
+                stroke="var(--line)"/>
+          <text x="28" y="36" font-size="11" fill="var(--dim)">Ваш личный VPN</text>
+          <text x="28" y="52" font-size="11" fill="var(--accent)">https://…/sub/a1b2…</text>
+          <rect x="60" y="74" width="150" height="60" rx="12" fill="var(--card)"
+                stroke="var(--accent)" stroke-width="2"/>
+          <rect x="68" y="82" width="134" height="24" rx="7" fill="var(--accent)" opacity="0.14"/>
+          <text x="80" y="98" font-size="12" font-weight="600" fill="var(--ink)">Копировать</text>
+          <text x="80" y="124" font-size="12" fill="var(--dim)">Открыть</text>
+        </svg>
+        <figcaption>Схема: длинное нажатие на ссылку</figcaption>
+      </figure>
     </li>
+
     <li>
-      <b>Добавьте профиль</b>
-      <p>Скопируйте ссылку, откройте приложение и нажмите <b>+</b> —
-         оно само предложит добавить её из буфера обмена.</p>
+      <b>Добавьте профиль в приложение</b>
+      <p>Откройте sing-box, внизу выберите <b>Профили</b> и нажмите <b>+</b>
+         в правом верхнем углу. В открывшемся окне выберите
+         <b>Импорт из буфера обмена</b> — приложение подставит вашу ссылку само.</p>
+      <p>Если такого пункта нет, выберите <b>Удалённый профиль</b> (Remote) и
+         вставьте ссылку в поле адреса, имя — любое.</p>
+      <figure>
+        <svg viewBox="0 0 270 190" role="img" aria-label="Экран профилей с кнопкой плюс">
+          <rect x="35" y="8" width="200" height="174" rx="16" fill="var(--card)"
+                stroke="var(--line)"/>
+          <text x="52" y="34" font-size="13" font-weight="600" fill="var(--ink)">Профили</text>
+          <circle cx="212" cy="29" r="15" fill="var(--accent)"/>
+          <path d="M212 22v14M205 29h14" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/>
+          <circle cx="212" cy="29" r="22" fill="none" stroke="var(--accent)"
+                  stroke-width="1.5" stroke-dasharray="4 4"/>
+          <rect x="52" y="54" width="166" height="34" rx="9" fill="var(--soft)"/>
+          <text x="64" y="75" font-size="11" fill="var(--dim)">пока ни одного</text>
+          <rect x="52" y="104" width="166" height="62" rx="11" fill="var(--bg)"
+                stroke="var(--accent)" stroke-width="1.5"/>
+          <text x="64" y="126" font-size="11" font-weight="600" fill="var(--ink)">Импорт из буфера</text>
+          <text x="64" y="146" font-size="11" fill="var(--dim)">Удалённый профиль</text>
+        </svg>
+        <figcaption>Схема: кнопка + на экране «Профили»</figcaption>
+      </figure>
     </li>
+
     <li>
       <b>Включите</b>
-      <p>Вернитесь на главный экран приложения и нажмите большую кнопку включения.
-         Система один раз спросит разрешение на VPN — согласитесь.</p>
+      <p>Вернитесь на первый экран и нажмите большую круглую кнопку.
+         Телефон один раз спросит разрешение на VPN — согласитесь.
+         Сверху появится значок ключика или VPN: он и значит, что всё работает.</p>
+      <figure>
+        <svg viewBox="0 0 270 190" role="img" aria-label="Главный экран с кнопкой включения">
+          <rect x="35" y="8" width="200" height="174" rx="16" fill="var(--card)"
+                stroke="var(--line)"/>
+          <circle cx="135" cy="86" r="42" fill="var(--accent)" opacity="0.14"/>
+          <circle cx="135" cy="86" r="42" fill="none" stroke="var(--accent)" stroke-width="3"/>
+          <path d="M135 66v26" stroke="var(--accent)" stroke-width="4" stroke-linecap="round"/>
+          <path d="M118 72a23 23 0 1 0 34 0" fill="none" stroke="var(--accent)"
+                stroke-width="4" stroke-linecap="round"/>
+          <text x="135" y="152" font-size="12" font-weight="600" text-anchor="middle"
+                fill="var(--okink)">Подключено</text>
+        </svg>
+        <figcaption>Схема: кнопка включения</figcaption>
+      </figure>
+    </li>
+
+    <li>
+      <b>Проверьте</b>
+      <p>Откройте YouTube. Если видео играет — готово, больше ничего делать не нужно.
+         Приложение можно закрыть, VPN останется включённым.</p>
     </li>
   </ol>
 
   <div class="note">
     <b>Банки и Госуслуги работают сами</b>
-    Российские сайты и приложения идут напрямую, минуя VPN — отключать его
-    не нужно. Это настроено за вас.
+    Российские сайты и приложения идут напрямую, минуя VPN. Выключать его
+    не нужно — это уже настроено за вас.
   </div>
 
-  <div class="note" style="background:transparent;color:var(--dim);border:1px solid var(--line)">
-    <b>Банковское приложение капризничает?</b>
-    На Android можно убрать его из VPN целиком: в настройках приложения
-    найдите <b>Per-app proxy</b> и снимите галочки с банков и Госуслуг. Такие приложения иногда ходят к своим серверам
-    напрямую по адресу, минуя имена сайтов, и тогда список российских
-    доменов им не помогает. На iPhone такой настройки нет — там, если
-    приложение не пускает, выключите VPN на минуту.
+  <h2>Способ 2 · Файл AmneziaWG</h2>
+  <p class="sub">Нужен в двух случаях: первый способ не заработал или вы
+     настраиваете роутер.</p>
+
+  <ol>
+    <li>
+      <b>Установите приложение AmneziaWG</b>
+      <p>Именно <b>AmneziaWG</b>, а не <b>Amnezia VPN</b> — это два разных
+         приложения одного автора, и второе вам не подойдёт.</p>
+      <div class="apps">
+        <a href="https://play.google.com/store/apps/details?id=org.amnezia.awg">Android</a>
+        <a href="https://apps.apple.com/app/amneziawg/id6478942365">iPhone и iPad</a>
+      </div>
+    </li>
+    <li>
+      <b>Откройте присланный файл</b>
+      <p>Нажмите на файл в сообщении и выберите <b>Открыть в AmneziaWG</b>.
+         Приложение само создаст подключение.</p>
+      <p>Если выбора не предложили: сохраните файл, откройте AmneziaWG,
+         нажмите <b>+</b> и выберите <b>Импорт из файла</b>.</p>
+      <figure>
+        <svg viewBox="0 0 270 150" role="img" aria-label="Файл открывается в приложении">
+          <rect x="16" y="46" width="60" height="58" rx="9" fill="var(--card)"
+                stroke="var(--line)"/>
+          <path d="M34 62h18M34 74h24M34 86h24" stroke="var(--dim)" stroke-width="2"
+                stroke-linecap="round"/>
+          <text x="46" y="118" font-size="10" text-anchor="middle" fill="var(--dim)">имя.conf</text>
+          <path d="M92 75h58" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round"/>
+          <path d="M142 68l9 7-9 7" fill="none" stroke="var(--accent)" stroke-width="2.5"
+                stroke-linecap="round" stroke-linejoin="round"/>
+          <rect x="166" y="34" width="86" height="82" rx="14" fill="var(--card)"
+                stroke="var(--accent)" stroke-width="2"/>
+          <text x="209" y="62" font-size="11" font-weight="600" text-anchor="middle"
+                fill="var(--ink)">AmneziaWG</text>
+          <rect x="182" y="74" width="54" height="22" rx="7" fill="var(--accent)"/>
+          <text x="209" y="89" font-size="10" font-weight="600" text-anchor="middle"
+                fill="#fff">Добавить</text>
+        </svg>
+        <figcaption>Схема: открыть файл в AmneziaWG</figcaption>
+      </figure>
+    </li>
+    <li>
+      <b>Включите переключатель</b>
+      <p>В списке появится ваше подключение — сдвиньте переключатель справа.
+         Телефон спросит разрешение на VPN один раз.</p>
+    </li>
+  </ol>
+
+  <div class="note plain">
+    <b>Чем этот способ отличается</b>
+    Файл не обновляется сам. Если сервер переедет, подключение перестанет
+    работать и файл придётся попросить заново. У ссылки из первого способа
+    такой беды нет. Поэтому файл — запасной, а не основной.
   </div>
 
-  <div class="note" style="background:transparent;color:var(--dim);border:1px solid var(--line)">
-    <b>Если вам дали ссылку на <code>vless://</code></b>
-    Это упрощённый вариант: он тоже работает, но через VPN идёт <i>весь</i>
-    трафик, включая российские сайты. Зато её понимает любое приложение —
-    и sing-box, и Hiddify, и v2rayNG. Если хотите, чтобы банки шли напрямую,
-    попросите у того, кто дал ссылку, подписку вместо неё.
-  </div>
+  <h2>Если что-то не так</h2>
 
-  <div class="note" style="background:transparent;color:var(--dim);border:1px solid var(--line)">
-    <b>Если приложение не подключается</b>
-    Сначала попробуйте <b>Hiddify</b> — это второе приложение, которое понимает
-    такую же ссылку. Одно из двух обычно соединяется: они используют разные
-    версии одного и того же движка. Если не помогло ни одно, напишите тому, кто
-    дал вам ссылку, и покажите текст ошибки — это чинится на сервере.
-  </div>
+  <details>
+    <summary>Ссылка не открывается, профиль не скачивается</summary>
+    <p>Так бывает у некоторых мобильных операторов. Попробуйте с Wi-Fi: профиль
+       скачается один раз и дальше будет работать в любой сети. Если Wi-Fi нет —
+       напишите тому, кто дал вам ссылку, и попросите <b>файл профиля</b>:
+       он добавляется без интернета.</p>
+  </details>
 
-  <div class="note" style="background:transparent;color:var(--dim);border:1px solid var(--line)">
-    <b>Если что-то не работает</b>
-    Выключите и включите переключатель в приложении. Если не помогло — напишите
-    тому, кто дал вам ссылку: возможно, сменился адрес сервера, и профиль нужно
-    обновить кнопкой обновления в списке профилей.
+  <details>
+    <summary>Приложение подключилось, но сайты не открываются</summary>
+    <p>Выключите и включите кнопку в приложении. Не помогло — перезагрузите
+       телефон. Если и это не помогло, напишите тому, кто дал ссылку:
+       возможно, нужно обновить профиль кнопкой обновления в списке профилей.</p>
+  </details>
+
+  <details>
+    <summary>Банковское приложение капризничает</summary>
+    <p>На Android его можно убрать из VPN целиком: в настройках sing-box
+       найдите <b>Per-app proxy</b> и снимите галочки с банков и Госуслуг.
+       Такие приложения иногда ходят к своим серверам напрямую по адресу,
+       минуя имена сайтов, и тогда список российских сайтов им не помогает.
+       На iPhone такой настройки нет — выключите VPN на минуту.</p>
+  </details>
+
+  <details>
+    <summary>sing-box не запускается или пишет ошибку</summary>
+    <p>Сначала обновите приложение в магазине: старые версии не понимают
+       новые настройки, и это самая частая причина. Если не помогло,
+       установите <b>Hiddify</b> — оно понимает ту же ссылку и использует
+       другую версию того же движка. Одно из двух обычно соединяется.
+       Текст ошибки покажите тому, кто дал вам ссылку: это чинится на сервере.</p>
+  </details>
+
+  <details>
+    <summary>Хочу поставить на второе устройство</summary>
+    <p>Попросите второй ключ. Ссылка и файл рассчитаны на одно устройство:
+       если включить их на двух, оба будут работать с перебоями — так устроена
+       защита от передачи ключей посторонним.</p>
+  </details>
+
+  <details>
+    <summary>Мне дали только ссылку vless://</summary>
+    <p>Это упрощённый вариант: он тоже работает, но через VPN идёт <i>весь</i>
+       трафик, включая российские сайты и банки. Зато её понимает любое
+       приложение — sing-box, Hiddify, v2rayNG, v2RayTun. Хотите, чтобы банки
+       шли напрямую, — попросите ссылку на подписку вместо неё.</p>
+  </details>
+
+  <div class="note warn">
+    <b>Ключи личные</b>
+    Не публикуйте и не пересылайте их. По ключу видно, кому он выдан,
+    а если им пользуется кто-то ещё, у вас начнутся обрывы.
   </div>
 
   <footer>Личный VPN. Настройки обновляются автоматически.</footer>
