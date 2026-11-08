@@ -384,10 +384,10 @@ function instructionPage(host) {
   </div>
 
   <div class="note" style="background:transparent;color:var(--dim);border:1px solid var(--line)">
-    <b>Приложение sing-box сейчас не подойдёт</b>
-    Официальное приложение sing-box не договаривается с нашим сервером о
-    шифровании и пишет <code>reality verification failed</code>. Это их
-    известная недоработка, не ваша ошибка. Ставьте Hiddify.
+    <b>Если видите <code>reality verification failed</code></b>
+    Это не ваша ошибка и не неправильная ссылка: так выглядит расхождение
+    версий между приложением и сервером. Напишите тому, кто дал вам ссылку —
+    это чинится на сервере за минуту.
   </div>
 
   <div class="note" style="background:transparent;color:var(--dim);border:1px solid var(--line)">
