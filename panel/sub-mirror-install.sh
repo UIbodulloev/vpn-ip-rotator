@@ -51,7 +51,13 @@ HOSTNAME=$HOST
 PORT=$PORT
 EOF
 chmod 644 /opt/panel/sub-mirror.env
-install -m 755 "$HERE/sub-mirror.py" /opt/panel/sub-mirror.py
+# Скрипт могут запускать и из репозитория, и уже из /opt/panel — во втором
+# случае копировать нечего, и install ругнулся бы на файл сам в себя.
+if [ "$(readlink -f "$HERE/sub-mirror.py")" != "$(readlink -f /opt/panel/sub-mirror.py)" ]; then
+    install -m 755 "$HERE/sub-mirror.py" /opt/panel/sub-mirror.py
+else
+    chmod 755 /opt/panel/sub-mirror.py
+fi
 install -d -m 750 /var/cache/sub-mirror
 
 say "проверяю связь с воркером глазами зеркала"
