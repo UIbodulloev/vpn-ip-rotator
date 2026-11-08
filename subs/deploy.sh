@@ -51,10 +51,16 @@ if [[ -z "${VPN_HY2_PORT:-}" && -f "$HY2_FILE" ]]; then
     source <(grep -E '^[A-Z_]+=' "$HY2_FILE")
     VPN_HY2_PORT="${PORT:-}"
     VPN_HY2_OBFS="${OBFS_PASSWORD:-}"
+    VPN_HY2_PORTS="${PORTS:-}"
+    VPN_HY2_UP="${UP_MBPS:-}"
+    VPN_HY2_DOWN="${DOWN_MBPS:-}"
     [[ -n "$VPN_HY2_PORT" ]] && say "беру Hysteria2 из $HY2_FILE (UDP $VPN_HY2_PORT)"
 fi
 VPN_HY2_PORT="${VPN_HY2_PORT:-}"
 VPN_HY2_OBFS="${VPN_HY2_OBFS:-}"
+VPN_HY2_PORTS="${VPN_HY2_PORTS:-}"
+VPN_HY2_UP="${VPN_HY2_UP:-}"
+VPN_HY2_DOWN="${VPN_HY2_DOWN:-}"
 
 ZONE_NAME="${CF_ZONE_NAME:-${HOSTNAME_ARG#*.}}"
 
@@ -83,10 +89,11 @@ TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 VPN_HOST="$VPN_HOST" VPN_PORT="$VPN_PORT" VPN_PUBLIC_KEY="$VPN_PUBLIC_KEY" \
 VPN_SHORT_ID="$VPN_SHORT_ID" VPN_SNI="$VPN_SNI" VPN_FINGERPRINT="$VPN_FINGERPRINT" \
 VPN_HY2_PORT="$VPN_HY2_PORT" VPN_HY2_OBFS="$VPN_HY2_OBFS" \
+VPN_HY2_PORTS="$VPN_HY2_PORTS" VPN_HY2_UP="$VPN_HY2_UP" VPN_HY2_DOWN="$VPN_HY2_DOWN" \
 COMPAT_DATE="$COMPAT_DATE" python3 > "$TMP/metadata.json" <<'PYEOF'
 import json, os
 keys = ("VPN_HOST","VPN_PORT","VPN_PUBLIC_KEY","VPN_SHORT_ID","VPN_SNI","VPN_FINGERPRINT",
-        "VPN_HY2_PORT","VPN_HY2_OBFS")
+        "VPN_HY2_PORT","VPN_HY2_OBFS","VPN_HY2_PORTS","VPN_HY2_UP","VPN_HY2_DOWN")
 print(json.dumps({
     "main_module": "worker.js",
     "compatibility_date": os.environ["COMPAT_DATE"],

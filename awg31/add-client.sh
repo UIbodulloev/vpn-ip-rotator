@@ -7,12 +7,20 @@
 # они берутся из одного файла obfuscation.conf, а не дублируются руками.
 set -euo pipefail
 
-NAME="${1:?укажите имя клиента: add-client.sh keenetic-home}"
+NAME="${1:?укажите имя клиента: add-client.sh keenetic-home [split]}"
+MODE="${2:-full}"        # full — весь трафик в туннель; split — кроме российского
 # Имя может прийти из Telegram — строго ограничиваем набор символов.
 [[ "$NAME" =~ ^[A-Za-z0-9_-]{1,32}$ ]] || { echo "недопустимое имя: только латиница, цифры, дефис и подчёркивание"; exit 2; }
 DIR=/opt/awg31
 CONF=$DIR/awg1.conf
 CONTAINER=awg31
+# Домен берём оттуда же, откуда его берут VLESS и подписка, — один источник
+# правды. Иначе копия скрипта из репозитория затирает рабочий домен примером,
+# и конфиги уходят людям с мёртвым адресом.
+PARAMS=/opt/panel/reality-params.env
+if [ -z "${ENDPOINT_HOST:-}" ] && [ -f "$PARAMS" ]; then
+    ENDPOINT_HOST=$(grep -m1 '^HOST=' "$PARAMS" | cut -d= -f2- | tr -d ' ')
+fi
 ENDPOINT_HOST="${ENDPOINT_HOST:-vpn.example.net}"
 
 # shellcheck source=/dev/null
@@ -60,10 +68,21 @@ mkdir -p "$DIR/clients"
   echo "[Peer]"
   echo "PublicKey = $SRV_PUB"
   echo "PresharedKey = $PSK"
-  echo "AllowedIPs = 0.0.0.0/0, ::/0"
+  if [ "$MODE" = "split" ]; then
+      # Российские адреса идут мимо туннеля — банки и Госуслуги видят домашний
+      # адрес. IPv6 целиком оставляем в туннеле: списка российских сетей для
+      # него нет, и дыру лучше закрыть, чем оставить.
+      echo "AllowedIPs = $("$DIR/split-tunnel.py"), ::/0"
+  else
+      echo "AllowedIPs = 0.0.0.0/0, ::/0"
+  fi
   echo "Endpoint = $ENDPOINT_HOST:$PORT"
   echo "PersistentKeepalive = 25"
 } > "$OUT"
 chmod 600 "$OUT"
 
-echo "готово: $OUT  (адрес в туннеле $CLIENT_IP)"
+if [ "$MODE" = "split" ]; then
+    echo "готово: $OUT  (адрес в туннеле $CLIENT_IP, российское мимо VPN)"
+else
+    echo "готово: $OUT  (адрес в туннеле $CLIENT_IP)"
+fi

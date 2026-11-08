@@ -183,6 +183,17 @@ function proxies(uuid, env) {
     obfs: { type: "salamander", password: env.VPN_HY2_OBFS },
     tls: { enabled: true, server_name: env.VPN_HOST },
   };
+  // Объявленная полоса включает на сервере Brutal: он держит скорость, не
+  // отступая при потерях. Выключено по умолчанию — цифра одна на все сети,
+  // а у телефона их две, и правильного значения для обеих не существует.
+  // Перескок портов: клиент шлёт по всему диапазону, сервер сводит их на один.
+  if (env.VPN_HY2_PORTS) {
+    hy2.server_ports = [env.VPN_HY2_PORTS];
+  }
+  if (env.VPN_HY2_UP && env.VPN_HY2_DOWN) {
+    hy2.up_mbps = Number(env.VPN_HY2_UP);
+    hy2.down_mbps = Number(env.VPN_HY2_DOWN);
+  }
   // Не urltest. Он выбирает по задержке, а задержка у задушенного VLESS как
   // раз хорошая: оператор режет полосу, а не пинг. Телефон честно измерял
   // 48 мс у VLESS против 94 мс у Hysteria2 и уверенно выбирал худший канал.

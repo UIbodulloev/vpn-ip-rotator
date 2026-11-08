@@ -56,6 +56,7 @@ def clients() -> list[tuple[str, str]]:
 
 def build(cfg: dict[str, str], people: list[tuple[str, str]]) -> dict:
     live = Path(f"/etc/letsencrypt/live/{cfg['DOMAIN']}")
+    brutal = bool(cfg.get("UP_MBPS")) and bool(cfg.get("DOWN_MBPS"))
     return {
         "log": {"level": "warn", "timestamp": True},
         "inbounds": [{
@@ -64,9 +65,12 @@ def build(cfg: dict[str, str], people: list[tuple[str, str]]) -> dict:
             "listen": "::",
             "listen_port": int(cfg["PORT"]),
             "users": [{"name": name, "password": uuid} for name, uuid in people],
-            # Скорость не ограничиваем и заявленной клиентом не верим: пусть
-            # работает BBR, иначе один телефон объявит себе гигабит и съест канал.
-            "ignore_client_bandwidth": True,
+            # По умолчанию BBR: ядро само подстраивается под потери. Если в
+            # hysteria2.env заданы UP_MBPS/DOWN_MBPS, клиент объявляет полосу и
+            # включается Brutal — он держит её, игнорируя потери. На дёрганой
+            # соте это быстрее, но объявленная цифра становится и потолком, и
+            # обязательством: больше не разгонится, меньше — зальёт канал.
+            "ignore_client_bandwidth": not brutal,
             # Salamander превращает QUIC в случайный UDP. Это и есть главный
             # смысл всей затеи: у оператора душится TCP, а бесформенный UDP
             # проходит — ровно как AmneziaWG на своём порту.
