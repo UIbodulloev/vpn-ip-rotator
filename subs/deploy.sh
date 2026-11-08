@@ -143,9 +143,23 @@ for rule in cfg["dns"]["rules"]:
             problems.append(f"dns: нет rule_set {tag}")
 if cfg["dns"]["final"] not in servers:
     problems.append("dns.final указывает в пустоту")
+by_tag = {o["tag"]: o for o in cfg["outbounds"]}
 for s in cfg["dns"]["servers"]:
-    if s.get("detour") and s["detour"] not in outs:
-        problems.append(f"dns: detour {s['detour']} не существует")
+    detour = s.get("detour")
+    if not detour:
+        continue
+    if detour not in outs:
+        problems.append(f"dns: detour {detour} не существует")
+    # Ядро отказывается стартовать с detour на пустой direct и пишет
+    # «start dns/udp[<тег>]»: такой detour для него бессмыслица.
+    elif set(by_tag[detour]) <= {"type", "tag"}:
+        problems.append(f"dns: detour {detour} ведёт на пустой outbound — ядро не запустится")
+# С sing-box 1.14 outbound с доменом в адресе требует резолвера, если DNS-серверов
+# больше одного. Без этого профиль не запускается вообще.
+domain_outs = [o for o in cfg["outbounds"] if isinstance(o.get("server"), str) and not o["server"].replace(".", "").isdigit()]
+if domain_outs and len(servers) > 1 and not cfg["route"].get("default_domain_resolver") \
+        and not all(o.get("domain_resolver") for o in domain_outs):
+    problems.append("route.default_domain_resolver не задан, а в адресе сервера домен")
 print("ссылки внутри конфига:", "; ".join(problems) if problems else "все теги на месте ✅")
 print("правил маршрутизации:", len(cfg["route"]["rules"]), "| наборов правил:", len(sets))
 PYEOF

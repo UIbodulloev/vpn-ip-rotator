@@ -39,7 +39,11 @@ function singboxConfig(uuid, env) {
       // ответы для европейской локации и медленный доступ к местным сервисам.
       servers: [
         { type: "udp", tag: "dns-proxy", server: "1.1.1.1", detour: "proxy" },
-        { type: "udp", tag: "dns-direct", server: "77.88.8.8", detour: "direct" },
+        // Без detour. В новом формате DNS-сервер набирает соединение сам, как
+        // outbound, и detour на пустой direct ядро считает бессмыслицей —
+        // отказывается стартовать: «start dns/udp[dns-direct]». Поведение по
+        // умолчанию и так прямое, поле было лишним.
+        { type: "udp", tag: "dns-direct", server: "77.88.8.8" },
       ],
       rules: [{ rule_set: RU_DOMAIN_TAGS, action: "route", server: "dns-direct" }],
       final: "dns-proxy",
@@ -106,6 +110,10 @@ function singboxConfig(uuid, env) {
       })),
       final: "proxy",
       auto_detect_interface: true,
+      // Адрес сервера у нас домен, а не IP, и его надо разрешить ДО туннеля.
+      // С sing-box 1.14 это обязательное поле, если DNS-серверов больше одного:
+      // без него профиль не запускается вовсе.
+      default_domain_resolver: "dns-direct",
     },
 
     experimental: {
