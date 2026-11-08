@@ -212,13 +212,23 @@ function singboxConfig(uuid, env, ru) {
       // ответы для европейской локации и медленный доступ к местным сервисам.
       servers: [
         { type: "udp", tag: "dns-proxy", server: "1.1.1.1", detour: "proxy" },
+        // Fake-IP: на запрос имени телефон получает ответ мгновенно, из
+        // служебного диапазона, и сразу открывает соединение. Настоящее имя
+        // достаётся из самого соединения и по нему принимается решение. Иначе
+        // перед каждым новым хостом уходит лишний обход до сервера и обратно —
+        // на мобильной сети это те самые 90 мс паузы перед картинкой.
+        { type: "fakeip", tag: "dns-fake", inet4_range: "198.18.0.0/15", inet6_range: "fc00::/18" },
         // Без detour. В новом формате DNS-сервер набирает соединение сам, как
         // outbound, и detour на пустой direct ядро считает бессмыслицей —
         // отказывается стартовать: «start dns/udp[dns-direct]». Поведение по
         // умолчанию и так прямое, поле было лишним.
         { type: "udp", tag: "dns-direct", server: "77.88.8.8" },
       ],
-      rules: [{ domain: ruDomain, domain_suffix: ruSuffix, action: "route", server: "dns-direct" }],
+      rules: [
+        // Российское резолвим по-настоящему: его адреса нужны правилу по IP.
+        { domain: ruDomain, domain_suffix: ruSuffix, action: "route", server: "dns-direct" },
+        { query_type: ["A", "AAAA"], action: "route", server: "dns-fake" },
+      ],
       final: "dns-proxy",
       strategy: "ipv4_only",
     },
@@ -245,6 +255,13 @@ function singboxConfig(uuid, env, ru) {
       rules: [
         { action: "sniff" },
         { protocol: "dns", action: "hijack-dns" },
+        // QUIC в отказ. YouTube и Google ходят по HTTP/3 поверх UDP, и внутри
+        // туннеля это ведёт себя заметно хуже, чем обычный HTTPS: своя
+        // подстройка под потери поверх чужой, свой подбор размера пакета
+        // поверх чужого. Получив отказ, приложение само переходит на TCP —
+        // ровно то, с чем прокси справляется хорошо. Это и есть разница между
+        // «скорость высокая» и «превью не грузятся».
+        { protocol: "quic", action: "reject" },
         // Локальная сеть — мимо туннеля, иначе отвалится доступ к роутеру и принтеру.
         { ip_is_private: true, action: "route", outbound: "direct" },
         // Банки, Госуслуги и прочее российское — напрямую, без VPN.
@@ -265,7 +282,9 @@ function singboxConfig(uuid, env, ru) {
     },
 
     experimental: {
-      cache_file: { enabled: true },
+      // store_fakeip: иначе после перезапуска соответствия имя-адрес теряются
+      // и первые обращения к уже открытым приложениям срываются.
+      cache_file: { enabled: true, store_fakeip: true },
     },
   };
 }

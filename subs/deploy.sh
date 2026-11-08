@@ -193,6 +193,20 @@ else:
 print("ссылки внутри конфига:", "; ".join(problems) if problems else "все теги на месте ✅")
 print("правил маршрутизации:", len(cfg["route"]["rules"]))
 PYEOF
+    # Настоящая проверка — тем же ядром, что стоит у людей на телефонах.
+    # Наши самодельные проверки ловят оборванные ссылки, но не незнакомые поля
+    # и не запрещённые сочетания: на них ядро просто не стартует, и человек
+    # видит простыню на пол-экрана вместо работающего VPN.
+    if command -v /opt/panel/sing-box >/dev/null; then
+        if /opt/panel/sing-box check -c "$TMP/sub.json" 2>"$TMP/check.err"; then
+            say "ядро sing-box $(/opt/panel/sing-box version | head -1 | awk '{print $3}') принимает конфиг"
+        else
+            cat "$TMP/check.err" >&2
+            die "ядро отвергает конфиг — на телефоне он тоже не запустится"
+        fi
+    else
+        warn "sing-box не установлен, конфиг проверен только на связность ссылок"
+    fi
 else
     warn "подписка пока не отвечает (код ${CODE:-нет}) — DNS и маршруты Cloudflare расходятся до минуты"
 fi
