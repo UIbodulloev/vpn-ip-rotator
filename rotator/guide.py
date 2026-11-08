@@ -257,6 +257,17 @@ dash.cloudflare.com → My Profile → API Tokens → Create Token
 Zone Resources: Include → Specific zone → ваш домен.
 НЕ используйте Global API Key — он даёт доступ ко всему аккаунту.
 
+▪️ Токен Cloudflare для подписок (нужен один раз)
+Это ОТДЕЛЬНЫЙ токен, шире обычного: он заливает воркер подписок.
+Тот же путь, Create Custom Token, права:
+  Account → Workers Scripts → Edit
+  Zone → Workers Routes → Edit
+  Zone → DNS → Edit
+  Zone → Zone → Read
+Zone Resources: Include → Specific zone → ваш домен.
+Боту он не нужен и в настройках не хранится: положите его файлом на сервер,
+разверните подписки (subs/deploy.sh) и сразу отзовите кнопкой Delete.
+
 ▪️ Админ-токен UpCloud (необязательный)
 Тот же путь, но под основным аккаунтом, а не субаккаунтом. Обязательно
 ограничьте его по allowed IP ranges.
