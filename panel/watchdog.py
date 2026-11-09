@@ -128,7 +128,7 @@ def probe_guard() -> bool:
     try:
         req = urllib.request.Request("http://127.0.0.1:8899/auth", method="POST",
                                      data=b'{"addr":"127.0.0.1:1","auth":"watchdog","tx":0}')
-        with urllib.request.urlopen(req, timeout=5) as answer:
+        with urllib.request.urlopen(req, timeout=10) as answer:
             return '"ok"' in answer.read().decode()
     except OSError:
         return False

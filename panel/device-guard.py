@@ -57,6 +57,7 @@ import http.server
 import ipaddress
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -81,6 +82,7 @@ WINDOW = 6             # сколько последних замеров пом
 STRIKES = 5            # в скольких из них должно быть превышение
 FORGET = 600.0         # сеть, не появлявшаяся 10 минут, теряет «старшинство»
 RULE_PREFIX = "guard-"
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
 def settings() -> dict[str, str]:
@@ -301,8 +303,10 @@ class Guard:
         uuid = (secret or "").strip().lower()
         name = self.state.users.get(uuid)
         if name is None:
-            # Ключ могли выдать секунду назад: перечитываем, но не чаще раза в 5 с.
-            if time.time() - self._users_at > 5:
+            # Ключ могли выдать секунду назад: перечитываем, но не чаще раза в 5 с
+            # и только для того, что похоже на ключ. Мусор (сканеры, проверка
+            # сторожа здоровья) не должен гонять docker exec на каждый вход.
+            if UUID_RE.match(uuid) and time.time() - self._users_at > 5:
                 self.refresh_users(force=True)
             name = self.state.users.get(uuid)
         if name is None:
