@@ -56,8 +56,11 @@ def people(c: Ctx) -> list[dict]:
     if existing is not None:
         names = existing
     awg31 = c.ops.awg31_known()
+    uuid_of = {k["name"]: k["uuid"] for k in c.ops.keys()}
+    binds = c.ops.bindings()
     out = []
     for name in sorted(names):
+        bound = binds.get(uuid_of.get(name, "")) or {}
         v, h = vless.get(name) or {}, hy2.get(name) or {}
         tv, th = traffic.get(("vless", name), {}), traffic.get(("hy2", name), {})
         live = bool(online.get(name)) or bool(h.get("online"))
@@ -66,6 +69,7 @@ def people(c: Ctx) -> list[dict]:
                     or ["hy2", "vless"], "live": live, "seen": now if live else seen,
                     "nets": len(online.get(name) or {}), "blocked": name in blocks,
                     "enabled": v.get("enabled", True),
+                    "devices": len(bound.get("devices") or []), "denied": bound.get("denied", 0),
                     "day": tv.get("day", 0) + th.get("day", 0), "month": tv.get("month", 0) + th.get("month", 0),
                     "all": tv.get("all", 0) + th.get("all", 0),
                     "href": link("/person", k="key", n=name)})
@@ -109,6 +113,13 @@ def alerts(c: Ctx) -> list[tuple[str, str]]:
     if c.now - snap.get("collected", 0) > 20 * 60:
         out.append(("bad", f"Снимок с VPN-сервера не обновлялся {span(c.now - snap.get('collected', 0))} — "
                            "сервер мог стать недоступен."))
+    try:
+        stuck = [l["name"] for l in device_links(c) if l["stuck"]]
+    except Exception:                                      # noqa: BLE001 — тревога не должна ронять обзор
+        stuck = []
+    if stuck:
+        out.append(("warn", "Ссылку открыли не в приложении, и VPN-приложение получает отказ: "
+                            + esc(", ".join(stuck)) + " — <a href='/devices'><u>исправить</u></a>."))
     for b in (snap.get("guard") or {}).get("blocks") or []:
         out.append(("warn", f"Ключ «{esc(b.get('user'))}» работал на двух устройствах — лишнее отрезано "
                             f"(<a href='{link('/person', k='key', n=b.get('user'))}'><u>открыть</u></a>)."))
@@ -231,7 +242,9 @@ def people_page(c: Ctx) -> tuple[str, str, str]:
         status = ('<span class="dot on"></span> онлайн' + (f" · {p['nets']} сети" if p["nets"] > 1 else "")
                   if p["live"] else f'<span class="dot"></span> {ago(p["seen"], c.now)}')
         extra = (" " + badge("отрезано лишнее", "warn") if p["blocked"] else "") + \
-                (" " + badge("выключен") if not p["enabled"] else "")
+                (" " + badge("выключен") if not p["enabled"] else "") + \
+                (" " + badge(f"{p['devices']} устр.") if p.get("devices", 0) >= 2 else "") + \
+                (" " + badge(f"отказов {p['denied']}", "warn") if p.get("denied") else "")
         sub = ("ключ · " + " + ".join(PROTO_NAME[x] for x in p["protos"]) if p["kind"] == "key"
                else "AmneziaWG · " + ("роутер/файл" if p.get("server") == "awg31" else "приложение Amnezia"))
         plain = ("онлайн" if p["live"] else ago(p["seen"], c.now))
@@ -253,6 +266,7 @@ def people_page(c: Ctx) -> tuple[str, str, str]:
     search = (f'<form class="search" method="get" action="/people"><input type="hidden" name="f" value="{esc(f)}">'
               f'<input name="q" value="{esc(c.q.get("q", ""))}" placeholder="Поиск по имени" type="search"></form>')
     out = [c.note, head("Люди", f"{counts['all']} всего · онлайн {counts['online']}",
+                        f'<a class="btn" href="/devices">{icon("shield")}Устройства</a>'
                         f'<a class="btn primary" href="/people/new">{icon("plus")}Выдать ключ</a>'),
            f'<div class="toolbar">{filters}{search}</div>', '<div class="list">', "".join(rows), "</div>"]
     return "Люди", "/people", "".join(out)
@@ -288,20 +302,10 @@ def person_page(c: Ctx) -> tuple[str, str, str]:
             f'<div class="copy"><code>{esc(sub or "SUB_BASE_URL не задан")}</code></div>'
             f'<p class="small muted" style="margin:14px 0 6px">Ссылка vless:// — весь трафик через VPN, для любого приложения</p>'
             f'<div class="copy"><code>{esc(vlink or "—")}</code></div></div>')
-        dev_rows = "".join(f"<li>{esc(d.get('ua'))} · {'точно' if d.get('kind') == 'hwid' else 'примерно'} · "
-                           f"сетей {len(d.get('nets') or {})} · {ago(d.get('last'), c.now)}</li>" for d in devices)
-        cards.append(
-            f'<div class="card"><h2>Устройства</h2><p class="sub">одна ссылка — одно устройство; лишнее отрезает сторож</p>'
-            + kv([("Состояние", status), ("Сети сейчас", esc(", ".join(nets.values())) or "—"),
-                  ("Разрешено устройств", esc(limit)), ("Привязана к", f"{len(devices)} устр." if devices else "не установлена")])
-            + (f'<ul class="small muted" style="margin:10px 0 0;padding-left:18px">{dev_rows}</ul>' if dev_rows else "")
-            + "".join(flash("warn", f"Отрезано {esc(b.get('ip'))} до {when(b.get('until'))}") for b in blocks)
-            + '<div class="actions" style="margin-top:14px">'
-            + (button("key.unblock", "Снять блокировку", c.csrf, {"name": name}, "btn sm", "unlock") if blocks else "")
-            + button("key.unbind", "Снять привязку", c.csrf, {"name": name}, "btn sm")
-            + (button("key.limit", "Разрешить 2 устройства", c.csrf, {"name": name, "n": 2}, "btn sm")
-               if str(limit) != "2" else button("key.limit", "Вернуть 1 устройство", c.csrf, {"name": name, "n": 1}, "btn sm"))
-            + "</div></div>")
+        # Та же карточка, что в разделе «Устройства»: одни и те же действия везде.
+        entry = next((l for l in device_links(c) if l["name"] == name), None)
+        if entry:
+            cards.append(link_card(c, entry, STUCK_TEXT if entry["stuck"] else "", title="Устройства"))
         cards.append(
             f'<div class="card danger-zone"><h2>Удалить ключ</h2><p class="sub">подписка и ссылка перестанут работать '
             f'сразу и на всех устройствах</p>{button("key.delete", "Удалить ключ", c.csrf, {"name": name}, "btn danger", "trash")}</div>')
@@ -349,6 +353,116 @@ def new_person(c: Ctx) -> tuple[str, str, str]:
             f'<button class="btn primary">{icon("plus")}Выдать</button></form>')
     return "Новый ключ", "/people", c.note + head("Выдать ключ", "Ключ начнёт работать сразу, без перезапуска сервера.",
                                                   back=("/people", "Люди")) + form
+
+
+# --- Устройства ---------------------------------------------------------------
+
+APP_TITLES = {"sing-box": "sing-box", "hiddify": "Hiddify", "v2raytun": "v2RayTun", "v2rayng": "v2rayNG",
+              "happ": "Happ", "mozilla": "браузер или превью ссылки", "неизвестное": "неизвестный клиент"}
+
+
+def device_links(c: Ctx) -> list[dict]:
+    """Ключи с их привязками: устройства, отказы, замены, живые сети."""
+    from .admin_ops import is_weak
+    bindings = c.ops.bindings()
+    guard = c.snap.get("guard") or {}
+    online, blocks = guard.get("online") or {}, guard.get("blocks") or []
+    out = []
+    for k in c.ops.keys():
+        link = bindings.get(k["uuid"]) or {}
+        devices = sorted(link.get("devices") or [], key=lambda d: d.get("first", 0))
+        for d in devices:
+            d["weak"] = is_weak(d)
+        nets = online.get(k["name"]) or {}
+        out.append({"name": k["name"], "uuid": k["uuid"], "devices": devices, "limit": link.get("limit"),
+                    "denied": link.get("denied", 0), "last_denied": link.get("last_denied", 0),
+                    "replaced": link.get("replaced", 0), "last_replaced": link.get("last_replaced"),
+                    "nets": nets, "blocks": [b for b in blocks if b.get("user") == k["name"]],
+                    # Место заняло не приложение, и приложение из-за этого получает отказ —
+                    # ровно то, что было с farah-phone.
+                    "stuck": bool(devices) and all(d["weak"] for d in devices) and link.get("denied", 0) > 0})
+    return out
+
+
+def device_row(c: Ctx, lk: dict, d: dict) -> str:
+    app = APP_TITLES.get(d.get("ua"), d.get("ua") or "?")
+    how = "точно, по отпечатку" if d.get("kind") == "hwid" else "примерно, по приложению"
+    warn = badge("не приложение", "warn") if d.get("weak") else ""
+    return (f'<div class="ev"><span class="ic {"warn" if d.get("weak") else ""}">{icon("server")}</span>'
+            f'<p><b>{esc(app)}</b> {warn}<br><span class="muted small">{esc(how)} · сетей за месяц '
+            f'{len(d.get("nets") or {})} · обновлений сегодня {d.get("today", 0)} · всего {d.get("hits", 0)}<br>'
+            f'появилось {when(d.get("first"))} · последний раз {ago(d.get("last"), c.now)}</span></p>'
+            f'<time>{button("key.drop", "Убрать", c.csrf, {"name": lk["name"], "device": d.get("id")}, "btn sm")}</time></div>')
+
+
+STUCK_TEXT = ("Ссылку открыли не в VPN-приложении (браузер или превью), и само приложение получает отказ. "
+              "Нажмите «Убрать» у этого устройства — или подождите: приложение вытеснит его при следующем обновлении.")
+
+
+def link_card(c: Ctx, lk: dict, why: str, title: str = "") -> str:
+    limit = lk["limit"] or 1
+    actions = [button("key.unbind", "Снять все привязки", c.csrf, {"name": lk["name"]}, "btn sm")]
+    for n in (1, 2, 3):
+        if n != limit:
+            actions.append(button("key.limit", f"Разрешить {n}", c.csrf, {"name": lk["name"], "n": n}, "btn sm"))
+    if lk["blocks"]:
+        actions.insert(0, button("key.unblock", "Снять блокировку", c.csrf, {"name": lk["name"]}, "btn sm", "unlock"))
+    facts = [f"разрешено {limit}", f"привязано {len(lk['devices'])}"]
+    if lk["denied"]:
+        facts.append(f"отказов {lk['denied']}, последний {ago(lk['last_denied'], c.now)}")
+    if lk["replaced"]:
+        lr = lk["last_replaced"] or {}
+        facts.append(f"заменено «{APP_TITLES.get(lr.get('was'), lr.get('was'))}» → "
+                     f"«{APP_TITLES.get(lr.get('now'), lr.get('now'))}»")
+    if len(lk["nets"]) > 1:
+        facts.append("сейчас из сетей: " + ", ".join(lk["nets"].values()))
+    devices = "".join(device_row(c, lk, d) for d in lk["devices"]) or '<div class="empty">ссылку ещё не устанавливали</div>'
+    blocks = "".join(flash("warn", f"Отрезано {esc(b.get('ip'))} до {when(b.get('until'))}") for b in lk["blocks"])
+    heading = esc(title) if title else f'<a href="{link("/person", k="key", n=lk["name"])}">{esc(lk["name"])}</a>'
+    return (f'<div class="card"><div class="card-head"><div><h2>{heading}</h2>'
+            f'<p class="sub">{esc(" · ".join(facts))}</p></div></div>'
+            f'{flash("warn", why) if why else ""}{blocks}<div class="feed">{devices}</div>'
+            f'<div class="actions" style="margin-top:12px">{"".join(actions)}</div></div>')
+
+
+def devices_page(c: Ctx) -> tuple[str, str, str]:
+    links = device_links(c)
+    stuck = [l for l in links if l["stuck"]]
+    many = [l for l in links if len(l["devices"]) >= 2 and not l["stuck"]]
+    denied = [l for l in links if l["denied"] and not l["stuck"] and len(l["devices"]) < 2]
+    live = [l for l in links if (len(l["nets"]) > 1 or l["blocks"]) and l not in many and l not in denied and l not in stuck]
+
+    out = [c.note, head("Устройства", "Сколько устройств стоит на каждой ссылке, кому отказали и почему",
+                        back=("/people", "Люди"))]
+    out.append('<div class="grid g4">')
+    out.append(kpi("Ссылок на 2+ устройствах", str(sum(len(l["devices"]) >= 2 for l in links)), "", "people"))
+    out.append(kpi("Отказы при установке", str(sum(l["denied"] for l in links)),
+                   f"у {sum(bool(l['denied']) for l in links)} ключей", "shield"))
+    out.append(kpi("Место занял не приложение", str(len(stuck)), "браузер или превью ссылки", "alert"))
+    out.append(kpi("Сейчас из 2+ сетей", str(sum(len(l["nets"]) > 1 for l in links)),
+                   f"отрезано: {sum(len(l['blocks']) for l in links)}", "globe"))
+    out.append("</div>")
+
+    out.append('<div class="card sec"><h2>Как это работает</h2><p class="sub" style="margin:0">'
+               'Ссылка привязывается к первому устройству, которое её <b>установило</b>. Если по ней пришло второе, '
+               'оно получает отказ, а здесь растёт счётчик «отказов». Браузер и превью в мессенджерах место не занимают; '
+               'если всё-таки заняли (старые привязки), настоящее приложение теперь вытесняет их само при следующем '
+               'обновлении подписки. Отдельно сторож следит за живыми подключениями: два устройства одновременно '
+               'дольше полутора минут — лишнее отрезается на 30 минут.</p></div>')
+
+    def section(title: str, items: list[dict], why: str, empty: str) -> None:
+        body = "".join(link_card(c, l, why) for l in items) or f'<div class="empty card">{esc(empty)}</div>'
+        out.append(f'<div class="sec"><h2>{esc(title)} <span class="count">{len(items)}</span></h2>'
+                   f'<div class="grid g2">{body}</div></div>')
+
+    section("Требует внимания: место занял не приложение", stuck, STUCK_TEXT, "таких нет")
+    section("Два и более устройства", many, "", "ни одна ссылка не стоит больше чем на одном устройстве")
+    section("Пытались поставить на второе устройство", denied,
+            "Ссылку пробовали установить ещё где-то и получили отказ. Если это тот же человек с новым "
+            "телефоном — снимите привязку; если второе устройство его — разрешите 2.", "отказов не было")
+    if live:
+        section("Сейчас из нескольких сетей", live, "", "")
+    return "Устройства", "/devices", "".join(out)
 
 
 # --- Адреса -------------------------------------------------------------------

@@ -28,6 +28,16 @@ from . import log, modes, remote, ui
 logger = log.get("admin")
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
+
+# Настоящие VPN-приложения — как в panel/sub-mirror.py (APP_FAMILIES). Всё
+# остальное в привязке — «слабое» устройство: браузер, превью, неизвестный клиент.
+APP_FAMILIES = {"sing-box", "hiddify", "v2raytun", "v2rayng", "happ", "clash", "nekobox", "nekoray",
+                "karing", "streisand", "shadowrocket", "foxray", "v2box", "throne", "flclash"}
+
+
+def is_weak(device: dict) -> bool:
+    return device.get("kind") != "hwid" and device.get("ua") not in APP_FAMILIES
 ISSUE_KINDS = {
     "sub": ("Подписка для телефона", "sing-box, Hysteria2 + VLESS, российское напрямую. Основной вариант."),
     "split": ("Подписка + файл AmneziaWG", "Файл — для второго устройства или роутера; российское мимо VPN."),
@@ -292,6 +302,19 @@ class Ops:
         if done.ok:
             self.audit(f"{name}: устройств — {n}")
         return done.ok, (f"Теперь по ключу «{name}» можно {n} устр." if done.ok else done.text(300))
+
+    def key_drop_device(self, name: str, device_id: str) -> tuple[bool, str]:
+        k = self.key(name)
+        if not k:
+            return False, "Ключа нет."
+        if not DEVICE_ID_RE.match(device_id or ""):
+            return False, "Неверное устройство."
+        done = self.ssh(f"/opt/panel/sub-mirror.py drop {k['uuid']} {shlex.quote(device_id)}")
+        self.forget("bindings")
+        if done.ok:
+            self.audit(f"{name}: убрано устройство {device_id}")
+        return done.ok, (f"Устройство убрано из привязки «{name}» — на его место встанет то, что установит "
+                         "ссылку следующим." if done.ok else done.text(300))
 
     def key_unblock(self, name: str) -> tuple[bool, str]:
         done = self.ssh(f"/opt/panel/device-guard.py unblock {shlex.quote(name)}")

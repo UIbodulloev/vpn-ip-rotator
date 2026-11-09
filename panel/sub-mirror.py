@@ -6,6 +6,7 @@
     sub-mirror.py devices     кто к каким ссылкам привязан
     sub-mirror.py reset UUID  снять привязку: ссылка снова встанет на любое устройство
     sub-mirror.py limit UUID N  сколько устройств пускать по ссылке (0 — без счёта)
+    sub-mirror.py drop UUID ID  убрать одно устройство из привязки (ID — из devices --json)
 
 Зачем. Подписку раздаёт воркер на Cloudflare, но часть мобильных операторов
 режет диапазоны, где живут бесплатные зоны Cloudflare: у человека не
@@ -137,17 +138,38 @@ def save_state(data: dict) -> None:
     tmp.replace(STATE_FILE)        # подмена одним движением: полуфайла не бывает
 
 
+KNOWN_APPS = ("sing-box", "sfa", "sfi", "sfm", "hiddify", "v2raytun", "v2rayng",
+              "happ", "clash", "nekobox", "nekoray", "karing", "streisand",
+              "shadowrocket", "foxray", "v2box", "throne", "flclash")
+# Семейства, которые устанавливают профиль по-настоящему. Остальное — «слабое»
+# устройство: браузер, превью ссылки, неизвестный клиент.
+APP_FAMILIES = {"sing-box" if n in ("sfa", "sfi", "sfm") else n for n in KNOWN_APPS}
+
+# Кто открывает ссылку, чтобы нарисовать превью, а не установить профиль:
+# мессенджеры и соцсети тянут её сами, как только ссылку кто-то отправил.
+PREVIEW_BOTS = ("telegrambot", "whatsapp", "facebookexternalhit", "facebot", "twitterbot",
+                "slackbot", "discordbot", "vkshare", "skypeuripreview", "viber",
+                "linkedinbot", "applebot", "googlebot", "bingbot", "yandex", "embedly",
+                "pinterest", "redditbot", "mattermost", "iframely", "preview")
+
+
 def ua_family(ua: str) -> str:
     """Семейство приложения из User-Agent. Версия нам не нужна: она меняется
     при каждом обновлении, а устройство остаётся тем же."""
     low = (ua or "").lower()
-    known = ("sing-box", "sfa", "sfi", "sfm", "hiddify", "v2raytun", "v2rayng",
-             "happ", "clash", "nekobox", "nekoray", "karing", "streisand",
-             "shadowrocket", "foxray", "v2box", "throne", "flclash")
-    for name in known:
+    for name in KNOWN_APPS:
         if name in low:
             return "sing-box" if name in ("sfa", "sfi", "sfm") else name
     return (low.split("/")[0][:24] or "неизвестное")
+
+
+def is_weak(device: dict) -> bool:
+    """«Слабое» устройство: не настоящее VPN-приложение и без отпечатка.
+
+    Так выглядят браузер без text/html в Accept, превью ссылки и неизвестные
+    клиенты. Отказать им совсем нельзя — подменой агента обходился бы лимит, —
+    но и место настоящего приложения они занимать не должны."""
+    return device.get("kind") != "hwid" and device.get("ua") not in APP_FAMILIES
 
 
 def net_hash(ip: str, salt: str) -> str:
@@ -189,6 +211,8 @@ def looks_like_browser(headers) -> bool:
     """
     agent = (headers.get("user-agent") or "").lower()
     accept = (headers.get("accept") or "").lower()
+    if any(bot in agent for bot in PREVIEW_BOTS) and not any(app in agent for app in KNOWN_APPS):
+        return True                 # превью в мессенджере: ссылку отправили, а не установили
     return "mozilla" in agent and "text/html" in accept
 
 
@@ -214,11 +238,23 @@ def register(uuid: str, headers, ip: str, limit: int) -> tuple[bool, str]:
         mine = next((d for d in link["devices"]
                      if d["kind"] == kind and d["id"] == ident), None)
         if mine is None:
-            if cap and len(link["devices"]) >= cap:
-                return deny(state, link, now,
-                            f"устройств по ссылке уже {len(link['devices'])} из {cap}")
             mine = {"kind": kind, "id": ident, "ua": family, "first": now,
                     "last": now, "hits": 0, "nets": {}, "day": now, "today": 0}
+            if cap and len(link["devices"]) >= cap:
+                # Место занято. Настоящее приложение вытесняет «слабое»
+                # устройство (браузер, превью, неизвестный клиент) — иначе
+                # человек, открывший ссылку не там, остаётся без VPN, как было
+                # с farah-phone. Слабое настоящее не вытесняет никогда: так
+                # подменой агента лимит не обойти.
+                weak = [d for d in link["devices"] if is_weak(d)]
+                if is_weak(mine) or not weak:
+                    return deny(state, link, now,
+                                f"устройств по ссылке уже {len(link['devices'])} из {cap}")
+                gone = min(weak, key=lambda d: d.get("last", 0))
+                link["devices"].remove(gone)
+                link["replaced"] = link.get("replaced", 0) + 1
+                link["last_replaced"] = {"t": now, "was": gone.get("ua"), "now": family}
+                print(f"место «{gone.get('ua')}» занял «{family}»", file=sys.stderr, flush=True)
             link["devices"].append(mine)
 
         # Приблизительная привязка (sing-box, Hiddify: отпечатка нет). Отказываем
@@ -278,6 +314,20 @@ def reset_link(uuid: str) -> None:
             raise SystemExit(f"привязки для {uuid} и не было")
         save_state(state)
     print(f"привязка снята: {uuid} снова встанет на любое устройство")
+
+
+def drop_device(uuid: str, device_id: str) -> None:
+    """Убрать одно устройство из привязки, не трогая остальные."""
+    with _state_lock:
+        state = load_state()
+        link = state["links"].get(uuid)
+        before = len((link or {}).get("devices") or [])
+        if link:
+            link["devices"] = [d for d in link["devices"] if str(d.get("id")) != device_id]
+        if not link or len(link["devices"]) == before:
+            raise SystemExit(f"у {uuid} нет устройства {device_id}")
+        save_state(state)
+    print(f"устройство {device_id} убрано: на его место встанет следующее, кто установит ссылку")
 
 
 def set_limit(uuid: str, number: int) -> None:
@@ -458,5 +508,7 @@ if __name__ == "__main__":
         reset_link(sys.argv[2].lower())
     elif action == "limit" and len(sys.argv) > 3:
         set_limit(sys.argv[2].lower(), int(sys.argv[3]))
+    elif action == "drop" and len(sys.argv) > 3:
+        drop_device(sys.argv[2].lower(), sys.argv[3])
     else:
         raise SystemExit(__doc__)

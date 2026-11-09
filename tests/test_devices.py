@@ -204,6 +204,57 @@ class DeviceBindingTest(unittest.TestCase):
         self.assertNotIn("203.0.113", text)
         self.assertNotIn("203.0", text)
 
+    # --- farah-phone: ссылку открыли не в приложении, и оно получило отказ ---
+
+    def test_браузер_без_html_не_мешает_приложению(self):
+        """Вживую: привязкой farah-phone стал «mozilla» без text/html в Accept
+        (превью или предзагрузка), а sing-box трижды получил отказ. Настоящее
+        приложение должно занять место такого «слабого» устройства."""
+        weird = Headers({"User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36", "Accept": "*/*"})
+        self.assertTrue(self.m.register(self.uuid, weird, "203.0.113.5", 1)[0])
+        allowed, why = self.ask(app="SFA/1.14.4 (sing-box 1.14.4)", ip="198.51.100.9")
+        self.assertTrue(allowed, why)
+        link = self.m.load_state()["links"][self.uuid]
+        self.assertEqual([d["ua"] for d in link["devices"]], ["sing-box"])
+        self.assertEqual(link["replaced"], 1)
+        self.assertEqual(link["last_replaced"]["was"], "mozilla")
+
+    def test_слабое_не_вытесняет_приложение(self):
+        """Обратное запрещено: подменой агента лимит не обойти."""
+        self.assertTrue(self.ask()[0])
+        sneaky = Headers({"User-Agent": "Mozilla/5.0 (compatible; MyProxyApp)", "Accept": "*/*"})
+        allowed, why = self.m.register(self.uuid, sneaky, "198.51.100.9", 1)
+        self.assertFalse(allowed)
+        self.assertEqual([d["ua"] for d in self.m.load_state()["links"][self.uuid]["devices"]], ["sing-box"])
+
+    def test_приложение_не_вытесняет_приложение(self):
+        self.assertTrue(self.ask(app="Hiddify/2.5.7")[0])
+        self.assertFalse(self.ask(app="v2rayTun/4.1", ip="198.51.100.9")[0])
+
+    def test_превью_в_мессенджерах_не_занимает_место(self):
+        for agent in ("TelegramBot (like TwitterBot)", "WhatsApp/2.24.1.10 A",
+                      "Mozilla/5.0 (Macintosh) AppleWebKit (KHTML, like Gecko) facebookexternalhit/1.1 Facebot Twitterbot/1.0",
+                      "Mozilla/5.0 (compatible; vkShare; +http://vk.com/dev/Share)",
+                      "Viber/20.6", "Mozilla/5.0 (compatible; YandexBot/3.0)"):
+            allowed, why = self.m.register(self.uuid, Headers({"User-Agent": agent, "Accept": "*/*"}),
+                                           "203.0.113.5", 1)
+            self.assertTrue(allowed, agent)
+        self.assertNotIn(self.uuid, self.m.load_state()["links"], "превью заняло место устройства")
+        self.assertTrue(self.ask()[0])
+
+    def test_приложение_с_preview_в_агенте_не_пропускается(self):
+        """Слово «preview» в агенте настоящего приложения — не повод не считать его."""
+        self.assertTrue(self.ask(app="Hiddify/2.5.7 preview")[0])
+        self.assertIn(self.uuid, self.m.load_state()["links"])
+
+    def test_одно_устройство_убирается_точечно(self):
+        self.assertTrue(self.ask(limit=2)[0])
+        self.assertTrue(self.ask(app="Hiddify/2.5.7", ip="198.51.100.9", limit=2)[0])
+        self.m.drop_device(self.uuid, "sing-box")
+        self.assertEqual([d["ua"] for d in self.m.load_state()["links"][self.uuid]["devices"]], ["hiddify"])
+        with self.assertRaises(SystemExit):
+            self.m.drop_device(self.uuid, "sing-box")
+
     def test_семейство_приложения_узнаётся(self):
         for ua, family in (("SFA/1.14.4 (sing-box)", "sing-box"),
                            ("SFI/1.12.0", "sing-box"),

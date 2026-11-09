@@ -266,6 +266,8 @@ def make_handler(bot, stats: Stats, auth: Auth, ops: Ops):
                     return self.render(session, pages.new_person(c))
                 if path == "/person":
                     return self.render(session, pages.person_page(c))
+                if path == "/devices":
+                    return self.render(session, pages.devices_page(c))
                 if path == "/addresses":
                     return self.render(session, pages.addresses(c))
                 if path == "/server":
@@ -366,7 +368,10 @@ def make_handler(bot, stats: Stats, auth: Auth, ops: Ops):
             if action == "key.unbind":
                 return done(ops.key_unbind(name))
             if action == "key.limit":
-                return done(ops.key_limit(name, 2 if form.get("n") == "2" else 1))
+                n = form.get("n", "1")
+                return done(ops.key_limit(name, int(n) if n in ("1", "2", "3") else 1))
+            if action == "key.drop":
+                return done(ops.key_drop_device(name, form.get("device", "")))
             if action == "key.unblock":
                 return done(ops.key_unblock(name))
             if action == "key.sync":

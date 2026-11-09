@@ -167,6 +167,7 @@ class FakeBot:
         self.keys = {"anna": "8c360150-56d5-4f24-bb69-b3660c65fbe9"}
         self.awg31 = {"keenetic-home"}
         self.panel_down = False
+        self.bindings: dict = {}              # как в /var/lib/sub-mirror/devices.json → links
         self.cfg = SimpleNamespace(get=lambda k, d=None: {"detector.interval_sec": 60, "detector.fail_threshold": 5,
                                                           "rotation.max_per_day": 6}.get(k, d))
         self.secrets = SimpleNamespace(get=lambda k, d="": {"SUB_BASE_URL": "https://sub.test:8443"}.get(k, d))
@@ -208,6 +209,14 @@ class FakeBot:
         self.commands.append(command)
         if command.startswith("ls /opt/awg31"):
             return remote.Result(0, "".join(f"{n}.conf\n" for n in sorted(self.awg31)), "")
+        if "sub-mirror.py devices" in command:
+            import json
+            return remote.Result(0, json.dumps(self.bindings), "")
+        if "sub-mirror.py drop" in command:
+            _, _, uuid, device = command.split()[-4:]
+            link = self.bindings.get(uuid) or {}
+            link["devices"] = [d for d in link.get("devices", []) if d["id"] != device]
+            return remote.Result(0, "убрано", "")
         if "revoke-client.sh" in command:
             self.awg31.discard(command.rsplit(" ", 1)[1])
             return remote.Result(0, "отозван", "")
@@ -536,6 +545,63 @@ class HttpTest(unittest.TestCase):
         joined = " ".join(self.notes)
         self.assertIn("удалён ключ anna", joined)
         self.assertIn("автоматика на паузе", joined)
+
+    # --- устройства: farah-phone и все, у кого два и больше -------------------
+
+    ANNA = "8c360150-56d5-4f24-bb69-b3660c65fbe9"
+
+    def device(self, ua, kind="soft", ident=None, last_ago=60):
+        now = time.time()
+        return {"kind": kind, "id": ident or ua, "ua": ua, "first": now - 3600, "last": now - last_ago,
+                "hits": 3, "nets": {"a1": now}, "today": 1}
+
+    def test_stuck_browser_binding_is_flagged_and_fixable(self):
+        """Ссылка farah-phone привязалась к «mozilla», и sing-box получал отказ."""
+        self.bot.bindings = {self.ANNA: {"devices": [self.device("mozilla")], "denied": 3,
+                                         "last_denied": time.time() - 300}}
+        csrf = self.login()
+        page = self.req("GET", "/devices")[2]
+        self.assertIn("Требует внимания", page)
+        self.assertIn("не приложение", page)
+        self.assertIn("отказов 3", page)
+        self.assertIn('name="device" value="mozilla"', page)
+        self.assertIn("/devices", self.req("GET", "/")[2], "на обзоре нет тревоги")
+        self.req("POST", "/do", {"action": "key.drop", "name": "anna", "device": "mozilla", "csrf": csrf},
+                 "/devices")
+        self.assertIn(f"sub-mirror.py drop {self.ANNA} mozilla", " ".join(self.bot.commands))
+        self.assertIn("Устройство убрано", self.req("GET", "/devices")[2])
+
+    def test_two_devices_listed_with_actions(self):
+        self.bot.bindings = {self.ANNA: {"limit": 2, "devices": [self.device("sing-box"),
+                                                                 self.device("v2raytun", "hwid", "d67fff172e81")]}}
+        self.login()
+        page = self.req("GET", "/devices")[2]
+        self.assertIn("Два и более устройства", page)
+        self.assertIn("v2RayTun", page)
+        self.assertIn("точно, по отпечатку", page)
+        self.assertIn("Разрешить 3", page)
+        self.assertIn("2 устр.", self.people_names(), "в списке людей нет пометки о двух устройствах")
+        self.assertIn("Устройства", self.req("GET", "/person?k=key&n=anna")[2])
+
+    def test_denied_attempts_section(self):
+        self.bot.bindings = {self.ANNA: {"devices": [self.device("sing-box")], "denied": 2,
+                                         "last_denied": time.time() - 60}}
+        self.login()
+        page = self.req("GET", "/devices")[2]
+        self.assertIn("Пытались поставить на второе устройство", page)
+        self.assertNotIn("Требует внимания: место занял не приложение <span class=\"count\">1", page)
+        self.assertIn("отказов 2", self.people_names())
+
+    def test_limit_three_and_bad_device_id(self):
+        csrf = self.login()
+        self.req("POST", "/do", {"action": "key.limit", "name": "anna", "n": "3", "csrf": csrf})
+        self.assertIn(f"sub-mirror.py limit {self.ANNA} 3", " ".join(self.bot.commands))
+        self.bot.commands.clear()
+        self.req("POST", "/do", {"action": "key.limit", "name": "anna", "n": "9", "csrf": csrf})
+        self.assertIn(f"sub-mirror.py limit {self.ANNA} 1", " ".join(self.bot.commands))
+        self.bot.commands.clear()
+        self.req("POST", "/do", {"action": "key.drop", "name": "anna", "device": "x;reboot", "csrf": csrf})
+        self.assertFalse(any("drop" in c for c in self.bot.commands))
 
     def test_unknown_action(self):
         csrf = self.login()

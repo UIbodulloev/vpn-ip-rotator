@@ -354,6 +354,7 @@ def shell(active: str, title: str, content: str, csrf: str, refresh: int = 0) ->
     meta = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
     brand = f'<div class="brand"><span class="mark">{icon("shield")}</span>mos8 VPN</div>'
     body = (f'{meta}<aside class="side">{brand}<nav class="nav">{links("nav")}'
+            f'<a href="/devices" class="{"on" if active == "/devices" else ""}">{icon("shield")}<span>Устройства</span></a>'
             f'<a href="/jobs" class="{"on" if active == "/jobs" else ""}">{icon("jobs")}<span>Задачи</span></a></nav>'
             f'<div class="foot">{logout}</div></aside>'
             f'<header class="top">{brand}<div class="actions"><a class="btn sm ghost" href="/jobs">{icon("jobs")}</a>'
