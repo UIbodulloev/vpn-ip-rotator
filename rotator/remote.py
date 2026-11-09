@@ -70,7 +70,9 @@ CONTAINERS = "docker ps -a --format '{{.Names}}\\t{{.Status}}\\t{{.Ports}}'"
 CONTAINERS_UP = "docker start $(docker ps -aq) 2>&1 | tail -5; docker ps --format '{{.Names}}\\t{{.Status}}'"
 CONTAINERS_RESTART = "docker restart $(docker ps -aq) 2>&1 | tail -5; docker ps --format '{{.Names}}\\t{{.Status}}'"
 DISK = "df -h / | tail -1; free -m | sed -n '2p;3p'"
-LISTENERS = "ss -lntup 2>/dev/null | grep -E ':(443|35206)' || echo 'порты не слушаются'"
+# 443 — VLESS, 39443 — Hysteria2, 51260 — AmneziaWG 3.1. Порт 35206
+# (AmneziaWG 2.0) выключен 09.11.2026 вместе с контейнером amnezia-awg2.
+LISTENERS = "ss -lntup 2>/dev/null | grep -E ':(443|39443|51260) ' || echo 'порты не слушаются'"
 
 
 def escape(command: str) -> str:

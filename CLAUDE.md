@@ -14,7 +14,8 @@
 | Сторож «1 ключ = 1 устройство» | VPN-сервер, `device-guard.service` | `panel/device-guard.py status / events / unblock <имя>` |
 | Сторож здоровья | VPN-сервер, `vpn-watchdog.timer` раз в минуту | `panel/watchdog.py status / events` |
 | Зеркало подписок :8443 | VPN-сервер, `sub-mirror.service` (sub.mos8.online) | `panel/sub-mirror.py devices / reset / limit` |
-| AmneziaWG | VPN-сервер, контейнеры `amnezia-awg2`, `awg31` | `awg31/*.sh` |
+| AmneziaWG 3.1 | VPN-сервер, контейнер `awg31` (UDP 51260) | `awg31/*.sh` |
+| AmneziaWG 2.0 | контейнер `amnezia-awg2` — **выключен с 09.11.2026** (restart=no), не поднимать | все переведены на VLESS/Hysteria2; конфиги сохранены в `/opt/panel/backup/amnezia-awg2-*` |
 | Генератор подписок | Cloudflare Worker, origin.mos8.online | `subs/worker.js`, выкатка `vpnctl worker` |
 | Telegram-бот | сервер medbot (91.218.115.82), `vpn-rotator.service`, код в `/opt/vpn-rotator` | только через `vpnctl bot-*` |
 | Статистика | medbot, `/var/lib/vpn-rotator/stats.db` (SQLite, почасово: адрес × протокол × клиент) | `rotator/stats.py`; снимок с VPN-сервера — `panel/stats-snapshot.py` раз в 5 мин |

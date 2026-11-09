@@ -40,7 +40,11 @@ GUARD_ENV = Path("/opt/panel/device-guard.env")
 HEALTH_URL = "https://origin.mos8.online/health"
 
 UNITS = ["docker", "hysteria-server", "device-guard", "sub-mirror"]
-CONTAINERS = ["3x-ui", "amnezia-awg2", "awg31", "amnezia-dns"]
+# amnezia-awg2 (AmneziaWG 2.0 из приложения Amnezia) выключен намеренно
+# 09.11.2026: все переведены на VLESS/Hysteria2. Сторож его не поднимает.
+# Вернуть: docker update --restart=always amnezia-awg2 && docker start amnezia-awg2
+# и добавить имя сюда.
+CONTAINERS = ["3x-ui", "awg31", "amnezia-dns"]
 
 MEM_LOW_MB = 80          # MemAvailable ниже — тесно
 MEM_LOW_MINUTES = 3
