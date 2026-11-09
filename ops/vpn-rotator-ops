@@ -1,0 +1,139 @@
+#!/bin/bash
+# Управление ботом на medbot по SSH с VPN-сервера — и только им.
+#
+# Ставится в /usr/local/sbin/vpn-rotator-ops (ops/setup-medbot.sh). Вызывается
+# не руками, а принудительной командой из authorized_keys пользователя vpnops:
+#
+#   ssh medbot-ops status            работает ли бот, какая версия выкачена
+#   ssh medbot-ops logs [N]          последние N строк журнала (до 500)
+#   ssh medbot-ops test [COMMIT]     прогнать тесты на коммите из GitHub
+#   ssh medbot-ops deploy [COMMIT]   выкатить коммит из origin/main с тестами
+#   ssh medbot-ops rollback          вернуть предыдущую выкатку
+#   ssh medbot-ops restart           перезапустить бота
+#
+# Почему так узко. На medbot живёт ещё медицинский проект с базой. VPN-сервер
+# смотрит в интернет и рискует больше, поэтому его ключ не даёт shell: только
+# эти команды, только код из GitHub, только после тестов. Аргументы приходят
+# одной строкой из SSH_ORIGINAL_COMMAND и проверяются по белому списку.
+set -euo pipefail
+
+REPO=/var/www/bot/vpn-ip-rotator
+APP=/opt/vpn-rotator
+VENV=$APP/venv/bin/python
+SERVICE=vpn-rotator
+LOCK=/run/vpn-rotator-ops.lock
+
+say() { printf '==> %s\n' "$*"; }
+die() { printf '!!! %s\n' "$*" >&2; exit 1; }
+
+set -f                                   # никаких подстановок файлов из чужой строки
+# shellcheck disable=SC2206
+ARGS=(${1:-${SSH_ORIGINAL_COMMAND:-status}})
+set +f
+CMD="${ARGS[0]:-status}"
+ARG="${ARGS[1]:-}"
+[ "${#ARGS[@]}" -le 2 ] || die "лишние аргументы"
+[[ "$CMD" =~ ^(status|logs|test|deploy|rollback|restart)$ ]] || die "команды: status logs test deploy rollback restart"
+[[ -z "$ARG" || "$ARG" =~ ^[0-9a-f]{7,40}$ || ( "$CMD" = logs && "$ARG" =~ ^[0-9]{1,3}$ ) ]] \
+    || die "аргумент — хеш коммита (или число строк для logs)"
+
+exec 9>"$LOCK"
+flock -w 120 9 || die "другая операция ещё идёт"
+
+fetch() {
+    cd "$REPO"
+    [ -z "$(git status --porcelain)" ] || die "в $REPO есть незакоммиченные правки — выкатка остановлена"
+    git fetch -q origin main
+}
+
+# Коммит должен быть в origin/main: на medbot попадает только то, что лежит в GitHub.
+resolve() {
+    local want="${1:-origin/main}" sha
+    sha=$(git rev-parse --verify -q "$want^{commit}") || die "коммит $want не найден в GitHub"
+    git merge-base --is-ancestor "$sha" origin/main || die "$sha нет в origin/main — сначала git push"
+    echo "$sha"
+}
+
+run_tests() {
+    local dir="$1" out
+    if out=$(cd "$dir" && PYTHONDONTWRITEBYTECODE=1 "$VENV" -m unittest discover -s tests -t . 2>&1); then
+        printf '%s\n' "$out" | grep -E '^(Ran|OK)' || true
+        return 0
+    fi
+    printf '%s\n' "$out" | tail -30
+    return 1
+}
+
+case "$CMD" in
+status)
+    printf 'бот:        %s\n' "$(systemctl is-active $SERVICE || true)"
+    printf 'с:          %s\n' "$(systemctl show -p ActiveEnterTimestamp --value $SERVICE)"
+    cd "$REPO"
+    printf 'репозиторий: %s (%s)\n' "$(git rev-parse --short HEAD)" "$(git log -1 --format=%s)"
+    [ -f "$APP/.deployed" ] && printf 'выкачено:    %s\n' "$(cat "$APP/.deployed")"
+    journalctl -u $SERVICE -n 5 --no-pager -o cat | cut -c1-200
+    ;;
+logs)
+    n="${ARG:-80}"; [ "$n" -le 500 ] || n=500
+    journalctl -u $SERVICE -n "$n" --no-pager -o short-iso | cut -c1-300
+    ;;
+restart)
+    systemctl restart $SERVICE; sleep 5
+    systemctl is-active $SERVICE
+    ;;
+test)
+    fetch
+    sha=$(resolve "$ARG")
+    tmp=$(mktemp -d)
+    trap 'git -C "$REPO" worktree remove --force "$tmp" >/dev/null 2>&1 || rm -rf "$tmp"' EXIT
+    git worktree add -q --detach "$tmp" "$sha"
+    say "тесты на $(git rev-parse --short "$sha")"
+    run_tests "$tmp" && say "тесты прошли" || die "тесты упали"
+    ;;
+deploy)
+    fetch
+    sha=$(resolve "$ARG")
+    git checkout -q main
+    # Только перемотка вперёд: если в локальной main есть коммиты, которых нет
+    # в GitHub, их нельзя молча затереть — пусть разбирается человек.
+    git merge -q --ff-only "$sha" || die "локальная main разошлась с GitHub — выкатка остановлена"
+    say "репозиторий на $(git rev-parse --short HEAD): $(git log -1 --format=%s)"
+    run_tests "$REPO" || die "тесты упали — бот не тронут"
+    rm -rf "$APP/rotator.prev"
+    cp -a "$APP/rotator" "$APP/rotator.prev"
+    [ -f "$APP/.deployed" ] && cp "$APP/.deployed" "$APP/.deployed.prev"
+    if ! cmp -s "$REPO/requirements.txt" "$APP/requirements.txt"; then
+        say "зависимости изменились — ставлю"
+        "$APP/venv/bin/pip" install -q -r "$REPO/requirements.txt"
+        cp "$REPO/requirements.txt" "$APP/requirements.txt"
+    fi
+    rm -rf "$APP/rotator" "$APP/tests"
+    cp -r "$REPO/rotator" "$APP/rotator"
+    cp -r "$REPO/tests" "$APP/tests"
+    [ -d "$REPO/bin" ] && { rm -rf "$APP/bin"; cp -r "$REPO/bin" "$APP/bin"; }
+    printf '%s %s\n' "$(git rev-parse --short HEAD)" "$(date -u +%FT%TZ)" > "$APP/.deployed"
+    chown -R vpnrotator:vpnrotator "$APP/rotator" "$APP/tests" "$APP/.deployed" "$APP/bin" 2>/dev/null || true
+    if ! cmp -s "$REPO/systemd/vpn-rotator.service" /etc/systemd/system/vpn-rotator.service; then
+        say "внимание: systemd/vpn-rotator.service в репозитории отличается от установленного — не трогаю, это делается install.sh"
+    fi
+    systemctl restart $SERVICE; sleep 8
+    if systemctl is-active --quiet $SERVICE; then
+        say "бот работает на $(git rev-parse --short HEAD)"
+        journalctl -u $SERVICE -n 3 --no-pager -o cat | cut -c1-200
+    else
+        say "бот не поднялся — откатываю"
+        journalctl -u $SERVICE -n 15 --no-pager -o cat | cut -c1-300
+        rm -rf "$APP/rotator"; mv "$APP/rotator.prev" "$APP/rotator"
+        [ -f "$APP/.deployed.prev" ] && mv "$APP/.deployed.prev" "$APP/.deployed"
+        systemctl restart $SERVICE; sleep 5
+        die "выкатка отменена, бот на прежней версии ($(systemctl is-active $SERVICE || true))"
+    fi
+    ;;
+rollback)
+    [ -d "$APP/rotator.prev" ] || die "предыдущей выкатки нет"
+    rm -rf "$APP/rotator"; mv "$APP/rotator.prev" "$APP/rotator"
+    [ -f "$APP/.deployed.prev" ] && mv "$APP/.deployed.prev" "$APP/.deployed"
+    systemctl restart $SERVICE; sleep 5
+    say "откат: $(systemctl is-active $SERVICE || true), $(cat "$APP/.deployed" 2>/dev/null || echo 'версия неизвестна')"
+    ;;
+esac
