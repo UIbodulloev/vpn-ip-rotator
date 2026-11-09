@@ -70,6 +70,7 @@ OPTIONAL_KEYS = [
 # Telegram (setMyCommands), чтобы они не разъезжались.
 COMMANDS = [
     ("menu", "единое меню: всё управление в одном месте"),
+    ("admin", "веб-админка со статистикой: адрес и вход через Google Authenticator"),
     ("server", "управление сервером: питание, хранение, контейнеры"),
     ("settings", "настройки: автоматика, хранение, доступы"),
     ("awg", "AmneziaWG 3.1: конфиги для роутеров"),
@@ -121,7 +122,7 @@ def _help_text() -> str:
 
 HELP_GROUPS = [
     ('Главное', ['menu', 'server', 'settings', 'awg', 'vless']),
-    ('Наблюдение', ['status', 'probe', 'ip', 'log']),
+    ('Наблюдение', ['admin', 'status', 'probe', 'ip', 'log']),
     ('Проверка вхолостую', ['simulate', 'plan', 'costs', 'servers']),
     ('Управление', ['rotate', 'mode', 'pause', 'resume', 'rollback']),
     ('Настройка', ['setup', 'check', 'diag', 'zones', 'plans']),
@@ -512,6 +513,8 @@ class Bot:
             )
         elif command == "/menu":
             self.main_menu()
+        elif command == "/admin":
+            self.cmd_admin()
         elif command == "/server":
             self.server_menu()
         elif command == "/settings":
@@ -1887,6 +1890,40 @@ class Bot:
                     "отрежет лишнее опять. Нужно два — разрешите два.") if done.ok else "",
         ), [[{"text": "📵 К устройствам", "callback_data": "vless:devices"}]])
 
+    # --- Веб-админка -------------------------------------------------------
+
+    ADMIN_URL = "https://admin.mos8.online"
+
+    def cmd_admin(self) -> None:
+        """Адрес админки и, если ещё нет, секрет для Google Authenticator.
+
+        Секрет показывается один раз — при выпуске. Потом бот его не повторяет:
+        переписка в Telegram хранится вечно, и секрет в ней лежал бы рядом
+        с адресом. Потеряли — «Выпустить новый»."""
+        from . import admin
+        secret = self.secrets.get("ADMIN_TOTP_SECRET")
+        if secret:
+            return self.send(ui.joined(
+                ui.title("Админка", "🔐"),
+                ui.esc(f"{self.ADMIN_URL}\nВход — код из Google Authenticator (запись «mos8 VPN»)."),
+                ui.note("Сменили телефон или удалили запись — выпустите новый секрет."),
+            ), [[{"text": "🌐 Открыть", "url": self.ADMIN_URL}],
+                [{"text": "🔄 Выпустить новый секрет", "callback_data": "admin:reset"}]])
+        secret = admin.new_secret()
+        self.secrets.set("ADMIN_TOTP_SECRET", secret)
+        pretty = " ".join(secret[i:i + 4] for i in range(0, len(secret), 4))
+        self.send(ui.joined(
+            ui.title("Админка: подключите Google Authenticator", "🔐"),
+            ui.esc("1. Откройте Google Authenticator → «+» → «Ввести ключ настройки».\n"
+                   "2. Название — любое, например mos8 VPN. Ключ — строка ниже. "
+                   "Тип — «По времени».\n"
+                   f"3. Откройте {self.ADMIN_URL} и введите 6 цифр из приложения."),
+            f"<code>{ui.esc(pretty)}</code>",
+            ui.esc("Или нажмите на ссылку ниже на телефоне — Authenticator добавит запись сам:"),
+            f"<code>{ui.esc(admin.otpauth_uri(secret))}</code>",
+            ui.note("Это сообщение лучше удалить после настройки: ключ показывается один раз."),
+        ), [[{"text": "🌐 Открыть админку", "url": self.ADMIN_URL}]])
+
     def vless_issue_one(self, name: str) -> None:
         """Выпуск по умолчанию: один ключ, одна ссылка, одно сообщение."""
         self.vless_issue(name, mode="")
@@ -3100,6 +3137,18 @@ class Bot:
             return self.vless_devices()
         if data.startswith("guard:unblock:"):
             return self.guard_unblock(data.split(":", 2)[2])
+        if data == "admin:reset":
+            return self.send(ui.joined(
+                ui.title("Выпустить новый секрет?", ui.WARN),
+                ui.esc("Старая запись в Google Authenticator перестанет подходить, "
+                       "все открытые сессии админки продолжат жить до 12 часов."),
+            ), [[{"text": "🔄 Да, выпустить", "callback_data": "admin:reset:go"}],
+                [{"text": "◀️ Отмена", "callback_data": "admin:menu"}]])
+        if data == "admin:reset:go":
+            self.secrets.unset("ADMIN_TOTP_SECRET")
+            return self.cmd_admin()
+        if data == "admin:menu":
+            return self.cmd_admin()
         if data.startswith("vless:unbind:"):
             return self.vless_unbind(data.split(":", 2)[2])
         if data.startswith("vless:two:"):
