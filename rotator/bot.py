@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import threading
 import time
 from pathlib import Path
@@ -1684,7 +1685,24 @@ class Bot:
             rows.append(f"{name:<15} {first['ua']:<9} {exact:<8} "
                         f"сетей {len(first['nets'])}{more}{denied}")
 
+        # Что видит сторож прямо сейчас: кто подключён, откуда, кто отрезан.
+        guard = self.guard_status()
+        live_rows: list[str] = []
+        blocks = []
+        if guard is not None:
+            for who, nets in sorted((guard.get("online") or {}).items()):
+                live_rows.append(f"{who:<15} {', '.join(nets.values())}")
+            blocks = guard.get("blocks") or []
+            now = time.time()
+            for b in blocks:
+                live_rows.append(f"⛔ {b['user']:<12} {b['ip']}  ещё "
+                                 f"{max(0, int((b['until'] - now) // 60))} мин")
+
         keyboard = []
+        if blocks:
+            for who in sorted({b["user"] for b in blocks}):
+                keyboard.append([{"text": f"🔓 Снять блокировку: {who}",
+                                  "callback_data": f"guard:unblock:{who}"}])
         if has:
             keyboard.append([{"text": "📵 Снять привязку", "callback_data": "vless:unbind"}])
             keyboard.append([{"text": "2️⃣ Разрешить два устройства",
@@ -1693,6 +1711,14 @@ class Bot:
                               "callback_data": "vless:one"}])
         keyboard.append([{"text": "◀️ Назад", "callback_data": "vless:menu"}])
         self.send(ui.joined(
+            ui.title("Подключены сейчас", "🛡"),
+            (ui.block(live_rows) if live_rows else ui.note("никого"))
+            if guard is not None else
+            ui.note("сторож устройств не отвечает — ключи работают без "
+                    "ограничения по подключениям (panel/hysteria-official.sh install)"),
+            ui.note(f"Сторож: режим {guard.get('mode')}. Два живых подключения ключа из "
+                    "разных сетей дольше полутора минут — лишнее отрезается на 30 минут. "
+                    "Смена Wi-Fi на LTE не считается.") if guard is not None else "",
             ui.title("Устройства по ссылкам", "📵"),
             ui.esc("Ссылка встаёт на первое устройство, которое её установило. "
                    "Второму приходит отказ."),
@@ -1727,6 +1753,90 @@ class Bot:
         self.send(ui.joined(
             ui.title("Готово" if done.ok else "Не вышло", ui.YES if done.ok else ui.NO),
             ui.block([done.text(300)]),
+        ), [[{"text": "📵 К устройствам", "callback_data": "vless:devices"}]])
+
+    # --- Сторож устройств: один ключ — одно устройство на уровне подключения --
+
+    GUARD_SCRIPT = "/opt/panel/device-guard.py"
+    GUARD_POLL_SEC = 60
+
+    def guard_loop(self, stop_event: threading.Event) -> None:
+        """Раз в минуту забирает события сторожа с VPN-сервера и присылает их.
+
+        Решает и действует сам сторож (panel/device-guard.py): он видит трафик,
+        а бот нет. Бот только сообщает и даёт кнопки. Так токен бота не
+        приходится класть на VPN-сервер."""
+        stop_event.wait(30)
+        while not stop_event.is_set():
+            try:
+                self.guard_report()
+            except remote.RemoteError as exc:
+                logger.debug("сторож устройств недоступен: %s", exc)
+            except Exception as exc:                           # noqa: BLE001
+                logger.warning("события сторожа не забрались: %s", exc)
+            stop_event.wait(self.GUARD_POLL_SEC)
+
+    def guard_report(self) -> None:
+        since = float(self.engine.state["guard_seen_ts"] or 0)
+        if not since:
+            # Первый запуск: историю до него не пересылаем, начинаем с этой минуты.
+            self.engine.state["guard_seen_ts"] = time.time()
+            return
+        answer = self._awg(f"{self.GUARD_SCRIPT} events --json --since {int(since)}", timeout=30)
+        if not answer.ok:
+            return
+        try:
+            events = json.loads(answer.out.strip() or "[]")
+        except ValueError:
+            return
+        for ev in events:
+            if ev.get("kind") in ("blocked", "shared"):
+                self.guard_notify(ev)
+            since = max(since, float(ev.get("t", 0)))
+        self.engine.state["guard_seen_ts"] = since
+
+    def guard_notify(self, ev: dict[str, Any]) -> None:
+        name = str(ev.get("user", ""))
+        owner = ", ".join(ev.get("owner") or []) or "—"
+        others = ", ".join(ev.get("others") or []) or "—"
+        limit = ev.get("limit", 1)
+        blocked = ev.get("kind") == "blocked"
+        lines = [
+            ui.title(f"Ключ {name}: устройств больше, чем можно", "📵"),
+            ui.esc(f"Разрешено: {limit}. Одновременно работали из разных сетей "
+                   "дольше полутора минут — это не смена Wi-Fi на LTE, а второе устройство."),
+            ui.block([f"раньше всех: {owner}", f"лишние:      {others}"]),
+            ui.esc(f"Лишние отрезаны на {ev.get('minutes', 30)} мин — и по VLESS, и по "
+                   "Hysteria2. Хозяин ключа работает как работал.") if blocked else
+            ui.note("Режим «только уведомлять»: никого не отрезали."),
+        ]
+        keyboard = []
+        if blocked:
+            keyboard.append([{"text": "🔓 Снять блокировку", "callback_data": f"guard:unblock:{name}"}])
+        keyboard.append([{"text": "2️⃣ Разрешить этому ключу два устройства",
+                          "callback_data": f"vless:two:{name}"}])
+        keyboard.append([{"text": "🎁 Выдать отдельный ключ", "callback_data": "vless:new"}])
+        self.send(ui.joined(*lines), keyboard)
+
+    def guard_status(self) -> dict[str, Any] | None:
+        try:
+            answer = self._awg(f"{self.GUARD_SCRIPT} status --json", timeout=40)
+        except remote.RemoteError:
+            return None
+        if not answer.ok:
+            return None
+        try:
+            return json.loads(answer.out.strip() or "{}")
+        except ValueError:
+            return None
+
+    def guard_unblock(self, name: str) -> None:
+        done = self._awg(f"{self.GUARD_SCRIPT} unblock {shlex.quote(name)}")
+        self.send(ui.joined(
+            ui.title("Блокировка снята" if done.ok else "Не вышло", ui.YES if done.ok else ui.NO),
+            ui.block([done.text(300)]),
+            ui.note("Если ключ снова окажется на двух устройствах сразу, сторож "
+                    "отрежет лишнее опять. Нужно два — разрешите два.") if done.ok else "",
         ), [[{"text": "📵 К устройствам", "callback_data": "vless:devices"}]])
 
     def vless_issue_one(self, name: str) -> None:
@@ -2940,6 +3050,8 @@ class Bot:
             return self.vless_issue(client, mode)
         if data == "vless:devices":
             return self.vless_devices()
+        if data.startswith("guard:unblock:"):
+            return self.guard_unblock(data.split(":", 2)[2])
         if data.startswith("vless:unbind:"):
             return self.vless_unbind(data.split(":", 2)[2])
         if data.startswith("vless:two:"):

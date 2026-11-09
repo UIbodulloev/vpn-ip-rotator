@@ -59,7 +59,9 @@ def cmd_run(cfg: Config, secrets: Secrets) -> int:
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
 
-    threads = [threading.Thread(target=bot.run, args=(stop,), name="bot", daemon=True)]
+    threads = [threading.Thread(target=bot.run, args=(stop,), name="bot", daemon=True),
+               # События сторожа устройств: кто поделился ключом и кого отрезали.
+               threading.Thread(target=bot.guard_loop, args=(stop,), name="guard", daemon=True)]
     if cfg.get("detector.enabled", True):
         threads.append(threading.Thread(target=engine.detector_loop, args=(stop,), name="detector", daemon=True))
     for thread in threads:

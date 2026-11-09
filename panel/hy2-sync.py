@@ -88,7 +88,20 @@ def build(cfg: dict[str, str], people: list[tuple[str, str]]) -> dict:
     }
 
 
+def official_server_active() -> bool:
+    """Hysteria2 переведён на официальный сервер (hysteria-official.sh)?
+
+    Тогда пользователей в конфиге нет вовсе: каждый вход проверяет
+    device-guard по живому списку ключей панели. Пересобирать и перезапускать
+    нечего — и это главное: перезапуск рвал сессии всем при каждой выдаче."""
+    done = subprocess.run(["systemctl", "is-active", "--quiet", "hysteria-server"])
+    return done.returncode == 0
+
+
 def main() -> None:
+    if official_server_active():
+        print("Hysteria2: ключи проверяет device-guard, перезапуск не нужен")
+        return
     cfg = env()
     people = clients()
     if not people:
