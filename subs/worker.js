@@ -429,7 +429,9 @@ function instructionPage(host) {
   .got{background:var(--card);border:1px solid var(--line);border-radius:14px;
        padding:16px 18px;margin-bottom:10px;display:flex;gap:14px;align-items:flex-start}
   .got .ico{flex:0 0 38px}
-  .got b{display:block;margin-bottom:2px}
+  /* Заголовок карточки — только первый <b>, а не любое выделение в тексте:
+     иначе каждое жирное слово в абзаце уезжало на отдельную строку. */
+  .got div > b:first-child{display:block;margin-bottom:2px}
   .got p{margin:0;color:var(--dim);font-size:15px}
 
   /* Шаги */
@@ -439,7 +441,7 @@ function instructionPage(host) {
   li::before{content:counter(s);position:absolute;left:18px;top:17px;
      width:28px;height:28px;border-radius:50%;background:var(--accent);color:#fff;
      font-weight:600;font-size:15px;display:flex;align-items:center;justify-content:center}
-  li b{display:block;margin-bottom:4px}
+  li > b{display:block;margin-bottom:4px}
   li p{margin:0;color:var(--dim);font-size:15px}
   li p+p{margin-top:8px}
 
@@ -456,7 +458,7 @@ function instructionPage(host) {
      padding:2px 6px;font-size:14px;word-break:break-all}
   .note{background:var(--okbg);color:var(--okink);border-radius:14px;
      padding:16px 18px;margin-top:16px;font-size:15px}
-  .note b{display:block;margin-bottom:4px}
+  .note > b{display:block;margin-bottom:4px}
   .plain{background:transparent;color:var(--dim);border:1px solid var(--line)}
   .warn{background:var(--warn);color:var(--warnink)}
   details{background:var(--card);border:1px solid var(--line);border-radius:14px;
@@ -490,7 +492,7 @@ function instructionPage(host) {
       <circle cx="26" cy="19" r="3.2" fill="var(--accent)"/>
     </svg>
     <div>
-      <b>Ссылка вида https://${host}/sub/…</b>
+      <b>Ссылка вида https://…/sub/…</b>
       <p>Это ваш личный ключ. Приложение скачивает по нему настройки и само
          их обновляет: если сервер переедет или что-то улучшат — у вас всё
          продолжит работать без единого действия.</p>
