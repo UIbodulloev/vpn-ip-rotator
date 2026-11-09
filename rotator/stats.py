@@ -183,7 +183,9 @@ def collect_loop(bot, stats: Stats, stop_event: threading.Event, every: int = 30
             answer = bot._awg("/opt/panel/stats-snapshot.py", timeout=90)
             if answer.ok and answer.out.strip().startswith("{"):
                 added = stats.ingest(json.loads(answer.out), bot.engine.state["ipv4"] or "?")
-                logger.info("снимок статистики: +%.1f МБ", added / 1048576)
+                # Аргументы журнал превращает в строки (маскирует секреты),
+                # поэтому число форматируем сами.
+                logger.info("снимок статистики: +%s МБ", f"{added / 1048576:.1f}")
             elif answer.code != 255:
                 logger.warning("снимок статистики не удался: %s", answer.text(200))
         except Exception as exc:                               # noqa: BLE001
