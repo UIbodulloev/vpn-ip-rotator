@@ -50,6 +50,13 @@ cmd_status() {
     free -m | awk '/^Mem/{printf "  память           свободно %s из %s МБ\n",$7,$2} /^Swap/{printf "  своп             занято %s МБ\n",$3}'
     say "сторож устройств"
     "$PANEL/device-guard.py" status 2>&1 | sed 's/^/  /'
+    say "сторож здоровья (таймер $(systemctl is-active vpn-watchdog.timer 2>/dev/null || true))"
+    "$PANEL/watchdog.py" status 2>&1 | sed 's/^/  /'
+    "$PANEL/watchdog.py" events 2>&1 | tail -3 | sed 's/^/  /'
+    code=$(curl -s -o /tmp/vpnctl-health.json -w '%{http_code}' --max-time 20 "https://$SUB_HOST/health" || echo 000)
+    printf '  списки генератора: HTTP %s, %s\n' "$code" \
+        "$(python3 -c 'import json;h=json.load(open("/tmp/vpnctl-health.json"));print("свежие" if h["ok"] else "ЗАПАСНЫЕ", "· доменов", h["domains"]["count"], "· сетей", h["cidr"]["count"], "· заблокированных .ru", h["blocked_ru"])' 2>/dev/null || echo '?')"
+    rm -f /tmp/vpnctl-health.json
     say "подписка"
     for base in "https://$SUB_HOST" "$MIRROR"; do
         code=$(curl -s -o /tmp/vpnctl-sub.json -w '%{http_code}' --max-time 15 -A SFA/1.14 "$base/sub/$PROBE" || echo 000)

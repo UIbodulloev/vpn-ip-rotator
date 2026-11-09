@@ -135,25 +135,78 @@ function cleanCidr(text) {
 /** Списки с кэшированием на сутки. Недоступен источник — отдаём запасной список,
  *  но подписку не ломаем: неработающий VPN хуже неполного списка. */
 async function ruLists() {
-  const pull = async (query, clean, fallback) => {
+  // Каждый список возвращается вместе с тем, откуда он взялся: «live» —
+  // свежий из источника, «fallback» — запасной. Это видно в /health и в
+  // заголовке x-lists, и сторож на сервере сообщает о деградации в бот:
+  // раньше переход на запасной список случался молча.
+  const pull = async (url, clean, fallback, min) => {
     try {
-      const answer = await fetch(IPLIST + query, {
+      const answer = await fetch(url, {
         cf: { cacheTtl: 86400, cacheEverything: true },
         signal: AbortSignal.timeout(5000),
       });
       if (!answer.ok) throw new Error(`HTTP ${answer.status}`);
       const list = clean(await answer.text());
-      if (list.length < 20) throw new Error("список подозрительно короткий");
-      return list;
-    } catch {
-      return fallback;
+      if (list.length < min) throw new Error("список подозрительно короткий");
+      return { list, source: "live" };
+    } catch (err) {
+      return { list: fallback, source: "fallback", error: String(err && err.message || err) };
     }
   };
-  const [domains, cidr] = await Promise.all([
-    pull("?format=text&data=domains&wildcard=1", cleanDomains, FALLBACK_DOMAINS),
-    pull("?format=text&data=cidr4", cleanCidr, []),
+  const [domains, cidr, ...blocked] = await Promise.all([
+    pull(IPLIST + "?format=text&data=domains&wildcard=1", cleanDomains, FALLBACK_DOMAINS, 20),
+    pull(IPLIST + "?format=text&data=cidr4", cleanCidr, [], 20),
+    ...BLOCKED_SOURCES.map((url) => pull(url, cleanBlocked, [], 5)),
   ]);
-  return { domains, cidr };
+  return {
+    domains: domains.list,
+    cidr: cidr.list,
+    blocked: blockedInRu(blocked.flatMap((b) => b.list), domains.list),
+    status: {
+      domains: { source: domains.source, count: domains.list.length, error: domains.error },
+      cidr: { source: cidr.source, count: cidr.list.length, error: cidr.error },
+      blocked: blocked.map((b, i) => ({ url: BLOCKED_SOURCES[i], source: b.source,
+                                        count: b.list.length, error: b.error })),
+    },
+  };
+}
+
+// Заблокированное в России. Без этого российский сайт, который сам заблокирован
+// РКН (новостные, торренты, аниме — в .ru/.su таких десятки), попадал под
+// правило «российское напрямую» и просто не открывался. Берём два курируемых
+// списка популярных заблокированных доменов (не весь реестр на 1,8 млн строк)
+// и оставляем из них только те, что иначе ушли бы напрямую: остальное и так
+// идёт через VPN по умолчанию.
+// Качает их сам воркер на Cloudflare, а не телефон: в конфиг списки попадают
+// уже готовыми, как и российские (тест test_подписка_ничего_не_качает_на_старте).
+const BLOCKED_SOURCES = [
+  "https://cdn.jsdelivr.net/gh/itdoginfo/allow-domains@main/Russia/inside-raw.lst",
+  "https://community.antifilter.download/list/domains.lst",
+];
+
+function cleanBlocked(text) {
+  const out = new Set();
+  for (let line of text.split("\n")) {
+    line = line.trim().toLowerCase().replace(/^\*\./, "").replace(/^\.+|\.+$/g, "");
+    if (!line || /[^a-z0-9.\-]/.test(line) || !line.includes(".")) continue;
+    out.add(line);
+  }
+  return [...out];
+}
+
+/** Из заблокированных — только то, что попало бы под «российское напрямую». */
+function blockedInRu(blocked, ruDomains) {
+  const ru = new Set(ruDomains);
+  const zones = RU_TLDS.concat([".xn--p1ai"]);
+  const out = new Set();
+  for (const d of blocked) {
+    let direct = zones.some((z) => d.endsWith(z));
+    for (let s = d; !direct && s.includes("."); s = s.slice(s.indexOf(".") + 1)) {
+      if (ru.has(s)) direct = true;
+    }
+    if (direct) out.add(d);
+  }
+  return [...out].sort();
 }
 
 /** Исходящие: Hysteria2 по UDP, VLESS по TCP и автоматический выбор между ними.
@@ -212,13 +265,37 @@ function proxies(uuid, env) {
     hy2.up_mbps = Number(env.VPN_HY2_UP);
     hy2.down_mbps = Number(env.VPN_HY2_DOWN);
   }
-  // Не urltest. Он выбирает по задержке, а задержка у задушенного VLESS как
-  // раз хорошая: оператор режет полосу, а не пинг. Телефон честно измерял
-  // 48 мс у VLESS против 94 мс у Hysteria2 и уверенно выбирал худший канал.
-  // Поэтому выбор жёсткий, с возможностью переключить руками — на случай
-  // сети, где режут наоборот, UDP.
+  // Основной Hysteria2, запасной VLESS — и переключение само, если основной умер.
+  //
+  // Голый urltest не годится: он выбирает по задержке, а задержка у задушенного
+  // VLESS как раз хорошая — оператор режет полосу, а не пинг (телефон мерил 48 мс
+  // у VLESS против 94 мс у Hysteria2 и уверенно выбирал худший канал). Проверка
+  // в sing-box — один крошечный HEAD-запрос, торможение после первых килобайт
+  // она не видит в принципе.
+  //
+  // Но у urltest есть свойство, которое делает из него «основной + запасной»:
+  // кандидаты перебираются по порядку, и следующий отбирает выбор, только если
+  // быстрее предыдущего больше чем на tolerance (protocol/group/urltest.go,
+  // Select). Hysteria2 стоит первым, tolerance — секунда: пока он отвечает,
+  // выбран он, каким бы быстрым ни казался VLESS. Перестал отвечать (оператор
+  // закрыл UDP) — его история стирается, и выбор уходит на VLESS. Вернётся
+  // Hysteria2 — телефон останется на VLESS до перезапуска VPN или до отказа
+  // VLESS: прыгать туда-сюда на живом канале хуже.
+  //
+  // Руками по-прежнему можно выбрать любой канал в «Группах» → proxy.
   return [
-    { type: "selector", tag: "proxy", outbounds: ["hysteria2", "vless"], default: "hysteria2" },
+    { type: "selector", tag: "proxy", outbounds: ["auto", "hysteria2", "vless"], default: "auto" },
+    {
+      type: "urltest",
+      tag: "auto",
+      outbounds: ["hysteria2", "vless"],
+      url: "https://www.gstatic.com/generate_204",
+      interval: "1m",
+      tolerance: 1000,
+      // Сменился канал — рвём старые соединения, чтобы приложения сразу
+      // переподключились по живому, а не висели на умершем.
+      interrupt_exist_connections: true,
+    },
     hy2,
     vless,
     direct,
@@ -232,6 +309,18 @@ function singboxConfig(uuid, env, ru) {
   // правила объединяются по «или», поэтому всё помещается в одно правило.
   const ruDomain = ru.domains;
   const ruSuffix = RU_TLDS.concat(ru.domains.map((d) => "." + d));
+  // Российское, но заблокированное в России: эти правила стоят раньше
+  // «российского напрямую» и отправляют такие сайты через VPN. Пустой список —
+  // пустые правила sing-box считает ошибкой, поэтому тогда их нет вовсе.
+  const blocked = ru.blocked || [];
+  const blockedMatch = { domain: blocked, domain_suffix: blocked.map((d) => "." + d) };
+  const blockedDns = blocked.length ? [
+    // Имя — через fake-IP, как всё заграничное: настоящий адрес найдёт сервер.
+    // Российский DNS для таких сайтов часто отдаёт заглушку провайдера.
+    { ...blockedMatch, query_type: ["A", "AAAA"], action: "route", server: "dns-fake" },
+    { ...blockedMatch, action: "route", server: "dns-proxy" },
+  ] : [];
+  const blockedRoute = blocked.length ? [{ ...blockedMatch, action: "route", outbound: "proxy" }] : [];
 
   return {
     log: { level: "warn" },
@@ -254,6 +343,7 @@ function singboxConfig(uuid, env, ru) {
         { type: "udp", tag: "dns-direct", server: "77.88.8.8" },
       ],
       rules: [
+        ...blockedDns,
         // Российское резолвим по-настоящему: его адреса нужны правилу по IP.
         { domain: ruDomain, domain_suffix: ruSuffix, action: "route", server: "dns-direct" },
         { query_type: ["A", "AAAA"], action: "route", server: "dns-fake" },
@@ -311,6 +401,8 @@ function singboxConfig(uuid, env, ru) {
         { protocol: "quic", action: "reject", no_drop: true },
         // Локальная сеть — мимо туннеля, иначе отвалится доступ к роутеру и принтеру.
         { ip_is_private: true, action: "route", outbound: "direct" },
+        // Заблокированное в России — через VPN, даже если оно в .ru.
+        ...blockedRoute,
         // Банки, Госуслуги и прочее российское — напрямую, без VPN.
         {
           domain: ruDomain,
@@ -362,13 +454,27 @@ export default {
       });
     }
 
+    // Состояние списков: откуда взялись и сколько их. Его раз в несколько
+    // часов проверяет сторож на VPN-сервере (panel/watchdog.py) и сообщает в
+    // бот, если генератор перешёл на запасной список. Ключей здесь нет.
+    if (parts.length === 1 && parts[0] === "health") {
+      const ru = await ruLists();
+      const body = JSON.stringify({ ok: ru.status.domains.source === "live" && ru.status.cidr.source === "live",
+                                    blocked_ru: ru.blocked.length, ...ru.status }, null, 2);
+      return new Response(body, {
+        headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
+      });
+    }
+
     const [kind, uuid] = parts;
     if (!UUID_RE.test(uuid || "")) {
       return new Response("not found\n", { status: 404 });
     }
 
     if (kind === "sub") {
-      const body = JSON.stringify(singboxConfig(uuid.toLowerCase(), env, await ruLists()), null, 2);
+      const ru = await ruLists();
+      const body = JSON.stringify(singboxConfig(uuid.toLowerCase(), env, ru), null, 2);
+      const s = ru.status;
       return new Response(body, {
         headers: {
           "content-type": "application/json; charset=utf-8",
@@ -376,6 +482,7 @@ export default {
           // Имя профиля в приложении и интервал обновления подписки.
           "profile-title": "VPN",
           "profile-update-interval": "24",
+          "x-lists": `domains=${s.domains.source}:${s.domains.count} cidr=${s.cidr.source}:${s.cidr.count} blocked_ru=${ru.blocked.length}`,
         },
       });
     }
@@ -603,9 +710,8 @@ function instructionPage(host) {
     <div>
       <b>Два канала связи</b>
       <p>Основной — <b>Hysteria2</b>: быстрый и устойчивый на мобильном
-         интернете. Запасной — <b>VLESS</b>: выручает в сетях, где режут
-         первый. Переключаться почти никогда не нужно — как это сделать,
-         написано ниже.</p>
+         интернете. Запасной — <b>VLESS</b>. Если оператор перекроет основной,
+         телефон сам перейдёт на запасной за минуту — ничего нажимать не нужно.</p>
     </div>
   </div>
   <div class="got">
@@ -660,10 +766,12 @@ function instructionPage(host) {
 
   <details>
     <summary>VPN включён, но сайты не открываются или всё медленно</summary>
-    <p>Переключите канал связи. На главном экране sing-box нажмите
-       <b>Группы</b> (значок рядом с кнопкой остановки) и в группе
-       <b>proxy</b> выберите <b>vless</b> вместо <b>hysteria2</b>.
-       Это помогает в сетях, где оператор режет один из каналов.</p>
+    <p>Если канал перекрыт полностью, телефон переключится сам. Но бывает,
+       что оператор канал не перекрывает, а душит по скорости — этого
+       автоматика не видит. Тогда переключите вручную: на главном экране
+       sing-box нажмите <b>Группы</b> (значок рядом с кнопкой остановки) и в
+       группе <b>proxy</b> выберите <b>vless</b>. Вернуть автоматику — выбрать
+       там же <b>auto</b>.</p>
     <p>Не помогло — выключите и включите VPN, затем обновите профиль
        стрелочкой. Если и это не помогло, напишите тому, кто дал ссылку.</p>
   </details>

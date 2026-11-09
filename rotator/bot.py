@@ -1767,33 +1767,81 @@ class Bot:
         а бот нет. Бот только сообщает и даёт кнопки. Так токен бота не
         приходится класть на VPN-сервер."""
         stop_event.wait(30)
+        fails, alerted = 0, False
         while not stop_event.is_set():
             try:
                 self.guard_report()
+                if alerted:
+                    self.send(ui.joined(ui.title("VPN-сервер снова на связи", "🟢"),
+                                        ui.note(f"не отвечал около {fails} мин")))
+                fails, alerted = 0, False
             except remote.RemoteError as exc:
-                logger.debug("сторож устройств недоступен: %s", exc)
+                # Сторож здоровья живёт на самом VPN-сервере и о собственной
+                # смерти сказать не может — это делает бот со стороны.
+                fails += 1
+                logger.warning("VPN-сервер не ответил по SSH (%s подряд): %s", fails, exc)
+                if fails == self.SERVER_DOWN_AFTER and not alerted:
+                    alerted = True
+                    self.send(ui.joined(
+                        ui.title("VPN-сервер не отвечает", "🔴"),
+                        ui.esc(f"Уже {fails} мин нет ответа по SSH. Скорее всего, у людей "
+                               "сейчас не работает VPN. Проверьте сервер в панели UpCloud."),
+                        ui.block([str(exc)[:300]]),
+                    ))
             except Exception as exc:                           # noqa: BLE001
-                logger.warning("события сторожа не забрались: %s", exc)
+                logger.warning("события сторожей не забрались: %s", exc)
             stop_event.wait(self.GUARD_POLL_SEC)
 
+    WATCHDOG_SCRIPT = "/opt/panel/watchdog.py"
+    SERVER_DOWN_AFTER = 3          # минут без ответа, после которых будить владельца
+    _EVENTS_SPLIT = "=====watchdog====="
+
     def guard_report(self) -> None:
+        """События обоих сторожей одним заходом по SSH: устройства и здоровье."""
         since = float(self.engine.state["guard_seen_ts"] or 0)
-        if not since:
+        wsince = float(self.engine.state["watch_seen_ts"] or 0)
+        if not since or not wsince:
             # Первый запуск: историю до него не пересылаем, начинаем с этой минуты.
-            self.engine.state["guard_seen_ts"] = time.time()
+            now = time.time()
+            self.engine.state.update(guard_seen_ts=since or now, watch_seen_ts=wsince or now)
             return
-        answer = self._awg(f"{self.GUARD_SCRIPT} events --json --since {int(since)}", timeout=30)
-        if not answer.ok:
-            return
+        answer = self._awg(
+            f"{self.GUARD_SCRIPT} events --json --since {int(since)}; echo; "
+            f"echo {self._EVENTS_SPLIT}; "
+            f"{self.WATCHDOG_SCRIPT} events --json --since {int(wsince)} 2>/dev/null || echo '[]'",
+            timeout=30)
+        if answer.code == 255:
+            # 255 — это сам ssh: сервер не ответил или не пустил.
+            raise remote.RemoteError(answer.err.strip()[:200] or "ssh: нет соединения")
+        guard_part, _, watch_part = answer.out.partition(self._EVENTS_SPLIT)
         try:
-            events = json.loads(answer.out.strip() or "[]")
+            events = json.loads(guard_part.strip() or "[]")
         except ValueError:
-            return
+            events = []
         for ev in events:
             if ev.get("kind") in ("blocked", "shared"):
                 self.guard_notify(ev)
             since = max(since, float(ev.get("t", 0)))
-        self.engine.state["guard_seen_ts"] = since
+        try:
+            health = json.loads(watch_part.strip() or "[]")
+        except ValueError:
+            health = []
+        for ev in health:
+            self.watchdog_notify(ev)
+            wsince = max(wsince, float(ev.get("t", 0)))
+        self.engine.state.update(guard_seen_ts=since, watch_seen_ts=wsince)
+
+    _WATCH_ICONS = {"restarted": "🛠", "recovered": "🟢", "down": "🔴", "tight": "⚠️", "oom": "⚠️"}
+    _WATCH_TITLES = {"restarted": "Починил сам", "recovered": "Снова работает",
+                     "down": "Не могу починить", "tight": "VPN-серверу тесно",
+                     "oom": "Серверу не хватило памяти"}
+
+    def watchdog_notify(self, ev: dict[str, Any]) -> None:
+        kind = str(ev.get("kind", ""))
+        self.send(ui.joined(
+            ui.title(self._WATCH_TITLES.get(kind, "Сторож здоровья"), self._WATCH_ICONS.get(kind, "ℹ️")),
+            ui.esc(str(ev.get("text", ""))),
+        ))
 
     def guard_notify(self, ev: dict[str, Any]) -> None:
         name = str(ev.get("user", ""))

@@ -12,6 +12,7 @@
 | VLESS Reality :443/TCP | VPN-сервер, ядро xray в контейнере `3x-ui` | `panel/client.py`, панель на 127.0.0.1:2053 |
 | Hysteria2 :39443/UDP | VPN-сервер, `hysteria-server.service` (официальный сервер) | `/etc/hysteria/config.yaml`, ставится `panel/hysteria-official.sh` |
 | Сторож «1 ключ = 1 устройство» | VPN-сервер, `device-guard.service` | `panel/device-guard.py status / events / unblock <имя>` |
+| Сторож здоровья | VPN-сервер, `vpn-watchdog.timer` раз в минуту | `panel/watchdog.py status / events` |
 | Зеркало подписок :8443 | VPN-сервер, `sub-mirror.service` (sub.mos8.online) | `panel/sub-mirror.py devices / reset / limit` |
 | AmneziaWG | VPN-сервер, контейнеры `amnezia-awg2`, `awg31` | `awg31/*.sh` |
 | Генератор подписок | Cloudflare Worker, origin.mos8.online | `subs/worker.js`, выкатка `vpnctl worker` |
@@ -48,8 +49,13 @@ vpnctl bot-logs [N]  журнал бота
 
 - Телефон (sing-box) качает `https://sub.mos8.online:8443/sub/<UUID>`. Зеркало
   привязывает ссылку к устройству и отдаёт копию ответа воркера (кэш 1 час).
-- Воркер собирает конфиг sing-box: Hysteria2 (основной) + VLESS (запасной,
-  выбор вручную в «Группах»), российское напрямую, QUIC — отказ с `no_drop`.
+- Воркер собирает конфиг sing-box: группа `auto` (urltest, Hysteria2 первым,
+  tolerance 1000 мс — держится за Hysteria2, пока он отвечает; умер —
+  уходит на VLESS), селектор `proxy` для ручного выбора, российское
+  напрямую, заблокированное в РФ (даже в .ru) — через VPN, QUIC — отказ с `no_drop`.
+- Заблокированное: курируемые списки itdoginfo (Russia/inside) и antifilter
+  community, из них берутся только домены, попадающие под «российское».
+- `https://origin.mos8.online/health` — состояние списков (live или fallback).
 - Списки российского: зоны .ru/.su/.рф и др. зашиты в `RU_TLDS`; домены и
   IP-сети — с russia.iplist.opencck.org (кэш Cloudflare сутки), при сбое —
   `FALLBACK_DOMAINS`. Android-приложения банков и госсервисов — `BYPASS_APPS`
@@ -67,6 +73,20 @@ vpnctl bot-logs [N]  журнал бота
 Hysteria2 проверяет каждый вход через сторож: если служба лежит, новые
 подключения Hysteria2 не пускаются — чинить первым делом.
 Откат Hysteria2 на sing-box: `/opt/panel/hysteria-official.sh rollback`.
+
+## Сторож здоровья
+
+`panel/watchdog.py` раз в минуту: упавшие службы и контейнеры поднимает,
+неотвечающие (ядро VLESS, Hysteria2, сторож, зеркало) перезапускает со
+второго провала, следит за памятью, свопом, диском, нагрузкой и OOM, раз в
+5 минут проверяет бота на medbot (лёг — перезапускает), раз в 6 часов —
+`https://origin.mos8.online/health` (не перешёл ли генератор на запасные
+списки). События — в `/var/lib/vpn-watchdog/events.jsonl`, бот забирает их
+раз в минуту вместе с событиями сторожа устройств и пишет владельцу. Если
+VPN-сервер не отвечает по SSH 3 минуты, бот пишет об этом сам.
+
+Тарифа больше 843 МБ не будет — это решение владельца. Не предлагай его;
+если тесно, ищи, что съело память.
 
 ## Нельзя
 
