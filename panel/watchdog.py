@@ -287,7 +287,9 @@ def check() -> None:
     if now - state.get("health_at", 0) >= HEALTH_EVERY:
         state["health_at"] = now
         try:
-            with urllib.request.urlopen(HEALTH_URL, timeout=20) as answer:
+            # Свой User-Agent: стандартный Python-urllib Cloudflare отбивает 403.
+            req = urllib.request.Request(HEALTH_URL, headers={"User-Agent": "vpn-watchdog/1.0"})
+            with urllib.request.urlopen(req, timeout=20) as answer:
                 health = json.loads(answer.read().decode())
             bad = [name for name in ("domains", "cidr") if health.get(name, {}).get("source") != "live"]
             bad += [b["url"].split("/")[2] for b in health.get("blocked", []) if b.get("source") != "live"]
