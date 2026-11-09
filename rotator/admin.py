@@ -228,7 +228,7 @@ nav a{color:var(--dim);margin-right:14px;text-decoration:none;font-size:14px}nav
 table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
 th,td{padding:8px 12px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
 th{color:var(--dim);font-weight:500;font-size:13px}tr:last-child td{border-bottom:0}
-td.n,th.n{text-align:right}.dim{color:var(--dim);font-size:13px}
+td.n,th.n{text-align:right}.dim{color:var(--dim);font-size:13px}td .dim{white-space:normal;min-width:140px}
 .on{color:var(--ok)}.bad{color:var(--bad)}.pill{display:inline-block;padding:1px 8px;border-radius:99px;
 background:var(--soft);font-size:12px;margin-right:4px}
 .chart{width:100%;height:auto;display:block}.chart text{fill:var(--dim);font-size:10px}

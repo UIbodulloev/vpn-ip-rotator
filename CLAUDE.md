@@ -17,6 +17,8 @@
 | AmneziaWG | VPN-сервер, контейнеры `amnezia-awg2`, `awg31` | `awg31/*.sh` |
 | Генератор подписок | Cloudflare Worker, origin.mos8.online | `subs/worker.js`, выкатка `vpnctl worker` |
 | Telegram-бот | сервер medbot (91.218.115.82), `vpn-rotator.service`, код в `/opt/vpn-rotator` | только через `vpnctl bot-*` |
+| Статистика | medbot, `/var/lib/vpn-rotator/stats.db` (SQLite, почасово: адрес × протокол × клиент) | `rotator/stats.py`; снимок с VPN-сервера — `panel/stats-snapshot.py` раз в 5 мин |
+| Веб-админка | https://admin.mos8.online → nginx на medbot → бот на 127.0.0.1:8787 | `rotator/admin.py`; вход — TOTP, секрет выпускает `/admin` в боте |
 
 Скрипты панели работают из `/opt/panel` — это копии `panel/` из репозитория.
 
