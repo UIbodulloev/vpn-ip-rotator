@@ -167,8 +167,14 @@ def events() -> list[dict]:
 
 
 def main() -> None:
-    print(json.dumps({"ts": int(time.time()), "host": os.uname().nodename, "vless": vless(),
-                      "hy2": hy2(), "awg": awg(), "guard": guard(), "system": system(),
+    keys = vless()
+    h = hy2()
+    # Hysteria2 помнит трафик удалённого ключа до своего перезапуска. Ключи
+    # живут в панели — что в ней нет, того в снимке тоже нет.
+    if "_error" not in keys and "_error" not in h:
+        h = {name: v for name, v in h.items() if name in keys}
+    print(json.dumps({"ts": int(time.time()), "host": os.uname().nodename, "vless": keys,
+                      "hy2": h, "awg": awg(), "guard": guard(), "system": system(),
                       "events": events()},
                      ensure_ascii=False))
 

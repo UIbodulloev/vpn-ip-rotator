@@ -163,6 +163,10 @@ class FakeBot:
         now = int(time.time())
         self.sent: list[str] = []
         self.commands: list[str] = []
+        # Живое состояние сервера: выдача, удаление и отзыв его меняют.
+        self.keys = {"anna": "8c360150-56d5-4f24-bb69-b3660c65fbe9"}
+        self.awg31 = {"keenetic-home"}
+        self.panel_down = False
         self.cfg = SimpleNamespace(get=lambda k, d=None: {"detector.interval_sec": 60, "detector.fail_threshold": 5,
                                                           "rotation.max_per_day": 6}.get(k, d))
         self.secrets = SimpleNamespace(get=lambda k, d="": {"SUB_BASE_URL": "https://sub.test:8443"}.get(k, d))
@@ -184,24 +188,43 @@ class FakeBot:
 
     def _panel(self, args, timeout=60):
         self.commands.append("panel " + args)
+        if self.panel_down:
+            raise remote.RemoteError("ssh: connect to host timed out")
         if args == "list":
-            return remote.Result(0, "anna\t8c360150-56d5-4f24-bb69-b3660c65fbe9\t1.0МБ\tвкл\n", "")
+            return remote.Result(0, "".join(f"{n}\t{u}\t1.0МБ\tвкл\n" for n, u in self.keys.items()), "")
         if args.startswith("add "):
-            return remote.Result(0, "vless://9c44f58c-f56d-47f4-9008-e7528e802af3@vpn:443?x#oleg\n", "")
+            name = args.split(" ", 1)[1]
+            self.keys[name] = "9c44f58c-f56d-47f4-9008-e7528e802af3"
+            return remote.Result(0, f"vless://{self.keys[name]}@vpn:443?x#{name}\n", "")
+        if args.startswith("del "):
+            self.keys.pop(args.split(" ", 1)[1], None)
+            return remote.Result(0, "удалён", "")
         if args.startswith("link "):
-            return remote.Result(0, "vless://8c360150-56d5-4f24-bb69-b3660c65fbe9@vpn:443?x#anna\n", "")
+            name = args.split(" ", 1)[1]
+            return remote.Result(0, f"vless://{self.keys.get(name, '')}@vpn:443?x#{name}\n", "")
         return remote.Result(0, "ok", "")
 
     def _awg(self, command, timeout=90):
         self.commands.append(command)
         if command.startswith("ls /opt/awg31"):
-            return remote.Result(0, "keenetic-home.conf\n", "")
+            return remote.Result(0, "".join(f"{n}.conf\n" for n in sorted(self.awg31)), "")
+        if "revoke-client.sh" in command:
+            self.awg31.discard(command.rsplit(" ", 1)[1])
+            return remote.Result(0, "отозван", "")
+        if "stats-snapshot.py" in command:
+            # Как настоящий: Hysteria2 помнит трафик удалённых ключей.
+            snap = snapshot(int(time.time()), 0, 0, 0)
+            snap["vless"] = {n: {"rx": 0, "tx": 0, "enabled": True, "last_seen": 0} for n in self.keys}
+            snap["awg"] = [p for p in snap["awg"] if p["server"] != "awg31" or p["name"] in self.awg31]
+            import json
+            return remote.Result(0, json.dumps(snap), "")
         return remote.Result(0, "{}", "")
 
     def _awg_conf(self, name):
         return "[Interface]\nPrivateKey = x\n", ""
 
     def _awg_conf_new(self, name, mode):
+        self.awg31.add(name)
         return self._awg_conf(name)
 
     def send_bundle(self, *a):
@@ -247,7 +270,9 @@ class PagesTest(unittest.TestCase):
 
     def test_unknown_person(self):
         _, _, body = pages.person_page(self.ctx(k="key", n="nobody"))
-        self.assertIn("Не найдено", body)
+        self.assertIn("Ключа больше нет", body)
+        _, _, body = pages.person_page(self.ctx(k="awg", n="nobody", s="awg31"))
+        self.assertIn("конфиг отозван", body)
 
 
 class HttpTest(unittest.TestCase):
@@ -352,6 +377,215 @@ class HttpTest(unittest.TestCase):
         csrf = self.login()
         self.req("POST", "/logout", {"csrf": csrf})
         self.assertEqual(self.req("GET", "/")[:2], (303, "/login"))
+
+    # --- то, на чём споткнулись вживую: список обязан совпадать с панелью ---
+
+    def people_names(self) -> str:
+        return self.req("GET", "/people")[2]
+
+    def test_deleted_key_disappears_at_once(self):
+        """Удалили umed-test — он не должен висеть в списке ни секунды, хотя
+        снимок старый, а Hysteria2 всё ещё помнит его трафик."""
+        csrf = self.login()
+        self.assertIn(">anna<", self.people_names())
+        self.req("POST", "/do", {"action": "key.delete", "name": "anna", "csrf": csrf, "confirm": "1"})
+        page = self.people_names()
+        self.assertNotIn(">anna<", page)
+        self.assertIn("Ключи 0", page)
+        self.assertIn("Ключа больше нет", self.req("GET", "/person?k=key&n=anna")[2])
+        # На обзоре нет ни строки в топе, ни ссылки на профиль; в ленте событий
+        # прошлое про anna остаётся — это история, а не список.
+        overview = self.req("GET", "/")[2]
+        self.assertNotIn("<span>anna</span>", overview)
+        self.assertNotIn("n=anna", overview)
+
+    def test_hysteria_ghost_never_shown(self):
+        self.stats.ingest({**snapshot(int(time.time()), 0, 0, 0),
+                           "hy2": {"ghost": {"rx": 1, "tx": 1, "online": 0}}}, "3.3.3.3")
+        self.login()
+        self.assertNotIn(">ghost<", self.people_names())
+        self.assertNotIn("n=ghost", self.people_names())
+
+    def test_issued_key_visible_before_any_traffic(self):
+        csrf = self.login()
+        where = self.req("POST", "/do", {"action": "key.issue", "name": "oleg", "kind": "sub", "csrf": csrf})[1]
+        for _ in range(50):
+            if "готово" in self.req("GET", where)[2]:
+                break
+            time.sleep(0.05)
+        self.assertIn(">oleg<", self.people_names())
+        self.assertIn("sub/9c44f58c", self.req("GET", "/person?k=key&n=oleg")[2])
+
+    def test_duplicate_name_refused(self):
+        csrf = self.login()
+        status, where, _ = self.req("POST", "/do", {"action": "key.issue", "name": "anna", "kind": "sub",
+                                                    "csrf": csrf})
+        self.assertEqual(where, "/people/new")
+        self.assertIn("уже есть", self.req("GET", "/people/new")[2])
+        self.assertFalse(any(c.startswith("panel add") for c in self.bot.commands))
+
+    def test_revoked_awg_disappears_at_once(self):
+        csrf = self.login()
+        self.assertIn("n=keenetic-home", self.people_names())
+        self.req("POST", "/do", {"action": "awg.revoke", "name": "keenetic-home", "csrf": csrf, "confirm": "1"})
+        page = self.people_names()
+        self.assertIn("отозван", page)                                 # плашка об успехе
+        self.assertNotIn("n=keenetic-home", page)                      # а строки в списке нет
+        self.assertIn("Irina (phone)", page)                           # клиенты Amnezia не задеты
+
+    def test_panel_down_falls_back_to_snapshot(self):
+        self.login()
+        self.bot.panel_down = True
+        self.ops.forget("keys", "awg31")
+        page = self.people_names()
+        self.assertIn(">anna<", page)                                  # из снимка
+        self.assertEqual(self.req("GET", "/")[0], 200)
+
+    # --- каждое действие доходит до нужной команды ---------------------------
+
+    def test_every_quick_action(self):
+        csrf = self.login()
+        cases = [
+            ({"action": "key.unbind", "name": "anna"}, "sub-mirror.py reset 8c360150"),
+            ({"action": "key.limit", "name": "anna", "n": "2"}, "sub-mirror.py limit 8c360150-56d5-4f24-bb69-b3660c65fbe9 2"),
+            ({"action": "key.limit", "name": "anna", "n": "1"}, "sub-mirror.py limit 8c360150-56d5-4f24-bb69-b3660c65fbe9 1"),
+            ({"action": "key.unblock", "name": "anna"}, "device-guard.py unblock anna"),
+            ({"action": "key.sync"}, "panel sync"),
+        ]
+        for form, needle in cases:
+            self.bot.commands.clear()
+            status, _, _ = self.req("POST", "/do", {**form, "csrf": csrf}, "/person?k=key&n=anna")
+            self.assertEqual(status, 303, form)
+            self.assertTrue(any(needle in c for c in self.bot.commands), f"{form}: не ушло «{needle}»")
+
+    def test_automation_controls(self):
+        csrf = self.login()
+        self.req("POST", "/do", {"action": "auto.pause", "on": "1", "csrf": csrf})
+        self.assertTrue(self.bot.engine.state["paused"])
+        self.req("POST", "/do", {"action": "auto.pause", "on": "0", "csrf": csrf})
+        self.assertFalse(self.bot.engine.state["paused"])
+        self.req("POST", "/do", {"action": "auto.mode", "mode": "move", "csrf": csrf})
+        self.assertEqual(self.bot.engine.state["mode"], "move")
+        self.req("POST", "/do", {"action": "auto.mode", "mode": "rm -rf", "csrf": csrf})
+        self.assertEqual(self.bot.engine.state["mode"], "move")       # мусор не принят
+
+    def test_dangerous_server_actions_ask_first(self):
+        csrf = self.login()
+        ran = []
+        self.bot._server_action_body = lambda action, arg, say: ran.append((action, arg))
+        for action in ("server.delete", "server.stop", "server.reboot", "server.storage-del", "server.backup-del",
+                       "server.docker-restart"):
+            status, _, page = self.req("POST", "/do", {"action": action, "csrf": csrf})
+            self.assertEqual(status, 200, action)
+            self.assertIn("Подтвердите", page, action)
+        time.sleep(0.1)
+        self.assertEqual(ran, [], "опасное действие выполнено без подтверждения")
+        # Подтвердили — ушло фоновой задачей.
+        status, where, _ = self.req("POST", "/do", {"action": "server.reboot", "csrf": csrf, "confirm": "1"})
+        self.assertTrue(where.startswith("/jobs/"))
+        for _ in range(40):
+            if ran:
+                break
+            time.sleep(0.05)
+        self.assertEqual(ran, [("reboot", "")])
+
+    def test_safe_server_actions_run_without_asking(self):
+        csrf = self.login()
+        ran = []
+        self.bot._server_action_body = lambda action, arg, say: ran.append(action)
+        for action in ("server.containers", "server.protocols", "server.start"):
+            where = self.req("POST", "/do", {"action": action, "csrf": csrf})[1]
+            self.assertTrue(where.startswith("/jobs/"), action)
+        for _ in range(40):
+            if len(ran) == 3:
+                break
+            time.sleep(0.05)
+        self.assertEqual(sorted(ran), ["containers", "protocols", "start"])
+
+    def test_restore_needs_real_backup_id(self):
+        csrf = self.login()
+        ran = []
+        self.bot._server_action_body = lambda action, arg, say: ran.append(action)
+        self.req("POST", "/do", {"action": "server.restore", "arg": "../../etc", "csrf": csrf, "confirm": "1"})
+        time.sleep(0.1)
+        self.assertEqual(ran, [])
+
+    def test_rotation_asks_then_runs(self):
+        csrf = self.login()
+        rotated = []
+        self.bot.engine.rotate = lambda mode, zone, **kw: rotated.append((mode, zone)) or {
+            "old_ip": "3.3.3.3", "new_ip": "4.4.4.4"}
+        page = self.req("POST", "/do", {"action": "rotate", "mode": "move", "zone": "de-fra1", "csrf": csrf})[2]
+        self.assertIn("Подтвердите", page)
+        self.assertEqual(rotated, [])
+        where = self.req("POST", "/do", {"action": "rotate", "mode": "move", "zone": "de-fra1", "csrf": csrf,
+                                         "confirm": "1"})[1]
+        for _ in range(40):
+            page = self.req("GET", where)[2]
+            if "4.4.4.4" in page:
+                break
+            time.sleep(0.05)
+        self.assertEqual(rotated, [("move", "de-fra1")])
+        self.assertIn("3.3.3.3 → 4.4.4.4", page)
+
+    def test_every_action_is_reported(self):
+        csrf = self.login()
+        self.notes.clear()
+        self.req("POST", "/do", {"action": "key.delete", "name": "anna", "csrf": csrf, "confirm": "1"})
+        self.req("POST", "/do", {"action": "auto.pause", "on": "1", "csrf": csrf})
+        joined = " ".join(self.notes)
+        self.assertIn("удалён ключ anna", joined)
+        self.assertIn("автоматика на паузе", joined)
+
+    def test_unknown_action(self):
+        csrf = self.login()
+        self.req("POST", "/do", {"action": "rm", "csrf": csrf}, "/server")
+        self.assertIn("Неизвестное действие", self.req("GET", "/server")[2])
+
+
+class SnapshotTest(unittest.TestCase):
+    """panel/stats-snapshot.py: в снимок не попадают «призраки» Hysteria2."""
+
+    def test_deleted_keys_are_filtered_out(self):
+        import contextlib
+        import importlib.util
+        import io
+        import json
+        spec = importlib.util.spec_from_file_location(
+            "stats_snapshot", Path(__file__).resolve().parents[1] / "panel" / "stats-snapshot.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.vless = lambda: {"anna": {"rx": 1, "tx": 1, "enabled": True, "last_seen": 0}}
+        mod.hy2 = lambda: {"anna": {"rx": 5, "tx": 5, "online": 1}, "umed-test": {"rx": 9, "tx": 9, "online": 0}}
+        for name in ("awg", "events"):
+            setattr(mod, name, lambda: [])
+        mod.guard = lambda: {}
+        mod.system = lambda: {}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mod.main()
+        snap = json.loads(out.getvalue())
+        self.assertEqual(sorted(snap["hy2"]), ["anna"])
+
+    def test_panel_unreadable_keeps_hysteria(self):
+        import contextlib
+        import importlib.util
+        import io
+        import json
+        spec = importlib.util.spec_from_file_location(
+            "stats_snapshot2", Path(__file__).resolve().parents[1] / "panel" / "stats-snapshot.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.vless = lambda: {"_error": "database is locked"}
+        mod.hy2 = lambda: {"anna": {"rx": 5, "tx": 5, "online": 1}}
+        for name in ("awg", "events"):
+            setattr(mod, name, lambda: [])
+        mod.guard = lambda: {}
+        mod.system = lambda: {}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mod.main()
+        self.assertEqual(sorted(json.loads(out.getvalue())["hy2"]), ["anna"])
 
 
 if __name__ == "__main__":

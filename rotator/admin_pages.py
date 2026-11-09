@@ -48,8 +48,16 @@ def people(c: Ctx) -> list[dict]:
     online = (snap.get("guard") or {}).get("online") or {}
     blocks = {b.get("user") for b in (snap.get("guard") or {}).get("blocks") or []}
     vless, hy2 = snap.get("vless") or {}, snap.get("hy2") or {}
+    # Кто есть — решает панель, а не статистика: она отстаёт до 5 минут, а
+    # Hysteria2 помнит трафик удалённого ключа до своего перезапуска.
+    # Только что выданный ключ трафика ещё не имеет, но в списке он нужен.
+    existing = c.ops.key_names()
+    names = (set(vless) | set(hy2)) - {"_error"}
+    if existing is not None:
+        names = existing
+    awg31 = c.ops.awg31_known()
     out = []
-    for name in sorted((set(vless) | set(hy2)) - {"_error"}):
+    for name in sorted(names):
         v, h = vless.get(name) or {}, hy2.get(name) or {}
         tv, th = traffic.get(("vless", name), {}), traffic.get(("hy2", name), {})
         live = bool(online.get(name)) or bool(h.get("online"))
@@ -62,6 +70,8 @@ def people(c: Ctx) -> list[dict]:
                     "all": tv.get("all", 0) + th.get("all", 0),
                     "href": link("/person", k="key", n=name)})
     for p in snap.get("awg") or []:
+        if p.get("server") == "awg31" and awg31 is not None and p.get("name") not in awg31:
+            continue                              # конфиг отозван, снимок ещё не обновился
         t = traffic.get(("awg", p.get("name")), {})
         live = snap.get("ts", now) - p.get("handshake", 0) < 180
         out.append({"kind": "awg", "name": p.get("name"), "server": p.get("server"), "protos": ["awg"],
@@ -252,11 +262,9 @@ def person_page(c: Ctx) -> tuple[str, str, str]:
     kind, name, server = c.q.get("k", "key"), c.q.get("n", ""), c.q.get("s", "")
     p = next((x for x in people(c) if x["kind"] == kind and x["name"] == name
               and (kind != "awg" or x.get("server") == server)), None)
-    if kind == "key" and not p and c.ops.key(name):
-        p = {"kind": "key", "name": name, "protos": ["hy2", "vless"], "live": False, "seen": 0, "nets": 0,
-             "blocked": False, "enabled": True, "day": 0, "month": 0, "all": 0}
     if not p:
-        return "Не найдено", "/people", head("Не найдено", "Такого ключа или клиента нет.", back=("/people", "Люди"))
+        gone = "Ключа больше нет — он удалён." if kind == "key" else "Такого клиента нет — конфиг отозван или удалён."
+        return "Не найдено", "/people", c.note + head(name or "Не найдено", gone, back=("/people", "Люди"))
 
     protos = ["vless", "hy2"] if kind == "key" else ["awg"]
     who = [(pr, name) for pr in protos]

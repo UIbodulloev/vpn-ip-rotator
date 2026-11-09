@@ -3068,6 +3068,15 @@ class Bot:
             target=self.answer_callback, args=(callback["id"],), daemon=True
         ).start()
 
+        # Имя ключа из кнопки уходит в команду на VPN-сервере. Кнопки рисует сам
+        # бот, но callback_data присылает клиент Telegram, и подделать её можно.
+        # Поэтому имя проверяется тем же правилом, что и при вводе.
+        named = re.match(r"^(vless:(?:del|link|sub|file|unbind|two|one|go:[a-z]*)|awg:(?:revoke|send)"
+                         r"|guard:unblock):(.*)$", data)
+        if named and _check_client_name(named.group(2)):
+            logger.warning("кнопка с недопустимым именем отклонена: %r", data[:60])
+            return self.send(f"{ui.NO} Недопустимое имя в кнопке — действие отменено.")
+
         if data == "cancel":
             self.awaiting = ""
             return self.send("Отменено. /setup — вернуться к настройке.")

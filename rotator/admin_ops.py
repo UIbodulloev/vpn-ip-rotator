@@ -92,6 +92,8 @@ class Ops:
             try:
                 job.result = fn(job) or {}
                 job.status = "done" if not job.result.get("failed") else "failed"
+                if job.result.get("name"):
+                    self.refresh_snapshot()             # выданный ключ — сразу в списке
             except Exception as exc:                           # noqa: BLE001
                 logger.exception("задача админки «%s» упала", title)
                 job.say(f"Ошибка: {exc}")
@@ -104,23 +106,59 @@ class Ops:
 
     # --- данные -------------------------------------------------------------
 
+    def _load_keys(self) -> list[dict]:
+        got = self.bot._panel("list")
+        if not got.ok:
+            raise remote.RemoteError(got.text(200))
+        out = []
+        for line in got.out.splitlines():
+            parts = line.split("\t")
+            if len(parts) == 4:
+                out.append({"name": parts[0], "uuid": parts[1], "traffic": parts[2], "state": parts[3]})
+        return out
+
     def keys(self) -> list[dict]:
         """Ключи панели: имя, UUID, трафик за всё время, состояние."""
-        def load():
-            got = self.bot._panel("list")
-            out = []
-            for line in got.out.splitlines():
-                parts = line.split("\t")
-                if len(parts) == 4:
-                    out.append({"name": parts[0], "uuid": parts[1], "traffic": parts[2], "state": parts[3]})
-            return out
         try:
-            return self.cached("keys", 30, load)
+            return self.cached("keys", 30, self._load_keys)
         except remote.RemoteError:
             return []
 
     def key(self, name: str) -> dict | None:
         return next((k for k in self.keys() if k["name"] == name), None)
+
+    def key_names(self) -> set[str] | None:
+        """Какие ключи есть на самом деле — по панели, а не по статистике.
+
+        Статистика отстаёт до 5 минут, а Hysteria2 помнит трафик удалённого
+        ключа до своего перезапуска: по ней удалённый ключ «жил» бы в списке.
+        None — панель не ответила, и тогда судим по статистике."""
+        try:
+            return {k["name"] for k in self.cached("keys", 30, self._load_keys)}
+        except remote.RemoteError:
+            return None
+
+    def awg31_known(self) -> set[str] | None:
+        """Выпущенные ботом конфиги AmneziaWG; None — сервер не ответил."""
+        try:
+            return self.cached("awg31", 30, self._load_awg31)
+        except remote.RemoteError:
+            return None
+
+    def refresh_snapshot(self, wait: bool = False) -> None:
+        """Снять статистику заново сразу после изменения, не дожидаясь 5 минут:
+        удалённый ключ должен исчезнуть, а выданный — появиться в ту же секунду."""
+        def run() -> None:
+            try:
+                got = self.ssh("/opt/panel/stats-snapshot.py", timeout=90)
+                if got.ok and got.out.strip().startswith("{"):
+                    self.stats.ingest(json.loads(got.out), self.bot.engine.state["ipv4"] or "?")
+            except Exception as exc:                           # noqa: BLE001
+                logger.warning("внеочередной снимок не удался: %s", exc)
+        if wait:
+            run()
+        else:
+            threading.Thread(target=run, name="snapshot-now", daemon=True).start()
 
     def bindings(self) -> dict:
         def load():
@@ -131,12 +169,15 @@ class Ops:
         except (remote.RemoteError, ValueError):
             return {}
 
+    def _load_awg31(self) -> set[str]:
+        got = self.ssh("ls /opt/awg31/clients 2>/dev/null", timeout=20)
+        if got.code == 255:                       # сам ssh: сервер не ответил
+            raise remote.RemoteError(got.text(200))
+        return {f[:-5] for f in got.out.split() if f.endswith(".conf")}
+
     def awg31_names(self) -> set[str]:
-        def load():
-            got = self.ssh("ls /opt/awg31/clients 2>/dev/null", timeout=20)
-            return {f[:-5] for f in got.out.split() if f.endswith(".conf")}
         try:
-            return self.cached("awg31", 30, load)
+            return self.cached("awg31", 30, self._load_awg31)
         except remote.RemoteError:
             return set()
 
@@ -225,6 +266,7 @@ class Ops:
         self.forget("keys", "bindings")
         if done.ok:
             self.audit(f"удалён ключ {name}")
+            self.refresh_snapshot()
         return done.ok, (f"Ключ «{name}» удалён — он перестал работать сразу." if done.ok else done.text(300))
 
     def key_resend(self, name: str) -> tuple[bool, str]:
@@ -255,6 +297,7 @@ class Ops:
         done = self.ssh(f"/opt/panel/device-guard.py unblock {shlex.quote(name)}")
         if done.ok:
             self.audit(f"сняты блокировки ключа {name}")
+            self.refresh_snapshot()
         return done.ok, (done.text(200) if done.ok else done.text(300))
 
     def key_sync(self) -> tuple[bool, str]:
@@ -269,6 +312,7 @@ class Ops:
         self.forget("awg31")
         if done.ok:
             self.audit(f"отозван конфиг AmneziaWG {name}")
+            self.refresh_snapshot()
         return done.ok, (f"Конфиг «{name}» отозван." if done.ok else done.text(300))
 
     def awg_send(self, name: str) -> tuple[bool, str]:
