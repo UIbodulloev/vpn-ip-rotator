@@ -76,8 +76,10 @@ def hy2() -> dict:
     out = {}
     for name in set(traffic) | set(online):
         t = traffic.get(name) or {}
-        # tx/rx в API — со стороны сервера: tx ушло клиенту, rx пришло от него.
-        out[name] = {"rx": int(t.get("tx", 0)), "tx": int(t.get("rx", 0)),
+        # tx/rx в API Hysteria — со стороны клиента (как и в /dump/streams):
+        # rx — скачано клиентом, tx — отдано им. Сверено по живому ключу:
+        # видео в браузере даёт rx на порядки больше tx.
+        out[name] = {"rx": int(t.get("rx", 0)), "tx": int(t.get("tx", 0)),
                      "online": int(online.get(name, 0))}
     return out
 

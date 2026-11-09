@@ -59,7 +59,16 @@ class Stats:
             pass
         with self.db() as db:
             db.executescript(SCHEMA)
+            fresh = db.execute("select count(*) from counters").fetchone()[0] == 0
             db.execute("insert or ignore into meta values ('started', ?)", (str(int(time.time())),))
+            # Первые снимки читали rx/tx Hysteria2 со стороны сервера, а API
+            # отдаёт их со стороны клиента. Разворачиваем накопленное один раз,
+            # иначе следующая разница сравнила бы «скачано» с «отдано».
+            if not db.execute("select 1 from meta where k='hy2_client_side'").fetchone():
+                if not fresh:
+                    for table in ("counters", "hourly"):
+                        db.execute(f"update {table} set rx = tx, tx = rx where proto = 'hy2'")
+                db.execute("insert into meta values ('hy2_client_side', '1')")
 
     def db(self) -> sqlite3.Connection:
         return sqlite3.connect(self.path, timeout=10)
@@ -119,23 +128,58 @@ class Stats:
             row = db.execute("select v from meta where k='started'").fetchone()
         return int(row[0]) if row else int(time.time())
 
-    def by_proto(self, since: int) -> dict[str, int]:
+    def by_proto(self, since: int, until: int | None = None) -> dict[str, int]:
         with self.db() as db:
-            rows = db.execute("select proto, sum(rx + tx) from hourly where hour >= ? group by proto",
-                              (since,)).fetchall()
+            rows = db.execute("select proto, sum(rx + tx) from hourly where hour >= ? and hour < ? "
+                              "group by proto", (since, until or 2 ** 40)).fetchall()
         return {p: int(v or 0) for p, v in rows}
 
-    def daily(self, days: int) -> list[tuple[int, dict[str, int]]]:
-        """[(начало суток UTC, {протокол: байт})] за последние days суток."""
-        today = int(time.time()) // 86400 * 86400
+    @staticmethod
+    def _who(clients: list[tuple[str, str]] | None) -> tuple[str, list]:
+        """Условие «только эти клиенты» для запросов по hourly."""
+        if not clients:
+            return "", []
+        return (" and (" + " or ".join("(proto = ? and client = ?)" for _ in clients) + ")",
+                [x for pair in clients for x in pair])
+
+    def daily(self, days: int, clients: list[tuple[str, str]] | None = None,
+              shift: int = 0) -> list[tuple[int, dict[str, int]]]:
+        """[(начало суток, {протокол: байт})] за последние days суток.
+
+        shift — сдвиг границы суток в секундах (MSK = +3 ч), чтобы «сегодня»
+        на графике совпадало с сегодняшним днём владельца, а не с UTC."""
+        today = (int(time.time()) + shift) // 86400 * 86400 - shift
         start = today - (days - 1) * 86400
+        cond, args = self._who(clients)
         with self.db() as db:
-            rows = db.execute("select hour / 86400 * 86400 as d, proto, sum(rx + tx) from hourly "
-                              "where hour >= ? group by d, proto", (start,)).fetchall()
+            rows = db.execute(f"select (hour + ?) / 86400 * 86400 - ? as d, proto, sum(rx + tx) "
+                              f"from hourly where hour >= ?{cond} group by d, proto",
+                              [shift, shift, start, *args]).fetchall()
         out = {start + i * 86400: {} for i in range(days)}
         for d, proto, v in rows:
             out.setdefault(d, {})[proto] = int(v or 0)
         return sorted(out.items())
+
+    def hourly_series(self, hours: int = 24) -> list[tuple[int, int]]:
+        """[(час, байт)] за последние hours часов — для графика «сейчас»."""
+        now_h = int(time.time()) // 3600 * 3600
+        start = now_h - (hours - 1) * 3600
+        with self.db() as db:
+            rows = dict(db.execute("select hour, sum(rx + tx) from hourly where hour >= ? group by hour",
+                                   (start,)).fetchall())
+        return [(start + i * 3600, int(rows.get(start + i * 3600) or 0)) for i in range(hours)]
+
+    def client_total(self, clients: list[tuple[str, str]], since: int = 0) -> dict[str, int]:
+        cond, args = self._who(clients)
+        with self.db() as db:
+            rows = db.execute(f"select proto, sum(rx), sum(tx) from hourly where hour >= ?{cond} group by proto",
+                              [since, *args]).fetchall()
+        out = {"rx": 0, "tx": 0}
+        for proto, rx, tx in rows:
+            out[proto] = int((rx or 0) + (tx or 0))
+            out["rx"] += int(rx or 0)
+            out["tx"] += int(tx or 0)
+        return out
 
     def clients(self) -> list[dict[str, Any]]:
         """Каждый клиент: трафик за сутки, 7 и 30 дней и за всё время, по протоколам."""

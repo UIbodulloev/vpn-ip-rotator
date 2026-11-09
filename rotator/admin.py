@@ -1,17 +1,23 @@
-"""Веб-админка: вся статистика на одной странице, вход по Google Authenticator.
+"""Веб-админка: статистика и управление, вход по Google Authenticator.
 
 Слушает только 127.0.0.1:8787 — наружу её выставляет nginx на medbot
 (admin.mos8.online, HTTPS). Секрет для Authenticator выпускает бот командой
 /admin и хранит в secrets.env как ADMIN_TOTP_SECRET.
 
-Защита входа:
-  * код TOTP (RFC 6238: SHA-1, 6 цифр, шаг 30 с, допуск ±1 шаг);
-  * один и тот же код дважды не принимается;
+Устройство:
+  admin_ui.py     дизайн-система: стили, иконки, графики, каркас страницы
+  admin_pages.py  страницы: обзор, люди, профиль, адреса, сервер, здоровье, задачи
+  admin_ops.py    действия: те же операции, что у бота, с результатом на странице
+  admin.py        вход, сессии, маршруты, подтверждения (этот файл)
+
+Защита:
+  * код TOTP (RFC 6238: SHA-1, 6 цифр, шаг 30 с, допуск ±1 шаг), один код — один вход;
   * 5 неверных кодов с адреса за 15 минут — адрес заблокирован на 15 минут;
     20 неверных за час со всех адресов — вход закрыт для всех на час;
-  * о каждом входе и каждой блокировке бот пишет владельцу в Telegram;
-  * сессия — случайный токен в cookie (Secure, HttpOnly, SameSite=Strict), 12 часов.
-Страницы без внешних скриптов и шрифтов: графики — встроенный SVG.
+  * о каждом входе, блокировке и действии бот пишет владельцу в Telegram;
+  * сессия — случайный токен в cookie (Secure, HttpOnly, SameSite=Strict), 12 часов;
+  * каждое действие — POST с токеном CSRF сессии; опасные переспрашивают;
+  * страницы без скриптов вовсе: CSP запрещает их целиком.
 """
 from __future__ import annotations
 
@@ -19,8 +25,8 @@ import base64
 import collections
 import hashlib
 import hmac
-import html
 import http.server
+import re
 import secrets as pysecrets
 import struct
 import threading
@@ -28,8 +34,11 @@ import time
 import urllib.parse
 from typing import Any
 
-from . import log
-from .stats import PROTO_TITLES, PROTOS, Stats
+from . import admin_pages as pages
+from . import log, modes
+from .admin_ops import ISSUE_KINDS, NAME_RE, Ops
+from .admin_ui import clock, document, esc, flash, icon, shell
+from .stats import Stats
 
 logger = log.get("admin")
 
@@ -37,7 +46,9 @@ LISTEN = ("127.0.0.1", 8787)
 SESSION_TTL = 12 * 3600
 IP_FAILS, IP_WINDOW, IP_LOCK = 5, 15 * 60, 15 * 60
 ALL_FAILS, ALL_WINDOW, ALL_LOCK = 20, 3600, 3600
-MSK = 3 * 3600                     # время на страницах — московское
+
+# Совместимость: старые вызовы и тесты берут это отсюда.
+rotation_periods = pages.rotation_periods
 
 
 # --- TOTP ---------------------------------------------------------------------
@@ -64,7 +75,7 @@ class Auth:
         self.get_secret = get_secret
         self.notify = notify
         self.lock = threading.Lock()
-        self.sessions: dict[str, float] = {}
+        self.sessions: dict[str, dict] = {}
         self.fails: dict[str, collections.deque] = {}
         self.all_fails: collections.deque = collections.deque()
         self.locked_ip: dict[str, float] = {}
@@ -112,313 +123,71 @@ class Auth:
         token = pysecrets.token_urlsafe(32)
         with self.lock:
             now = time.time()
-            self.sessions = {t: e for t, e in self.sessions.items() if e > now}
-            self.sessions[token] = now + SESSION_TTL
+            self.sessions = {t: s for t, s in self.sessions.items() if s["exp"] > now}
+            self.sessions[token] = {"exp": now + SESSION_TTL, "csrf": pysecrets.token_urlsafe(24), "flash": ""}
         return token
 
-    def valid(self, token: str) -> bool:
+    def session(self, token: str) -> dict | None:
         with self.lock:
-            return bool(token) and self.sessions.get(token, 0) > time.time()
+            s = self.sessions.get(token or "")
+            return s if s and s["exp"] > time.time() else None
+
+    def valid(self, token: str) -> bool:
+        return self.session(token) is not None
 
     def close(self, token: str) -> None:
         with self.lock:
             self.sessions.pop(token, None)
 
 
-# --- Форматирование -----------------------------------------------------------
-
-def esc(v: Any) -> str:
-    return html.escape(str(v), quote=True)
-
-
-def size(n: float) -> str:
-    n = float(n or 0)
-    for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
-        if n < 1024 or unit == "ТБ":
-            return f"{n:.0f} {unit}" if unit in ("Б", "КБ") else f"{n:.1f} {unit}"
-        n /= 1024
-    return f"{n:.1f} ТБ"
-
-
-def clock(ts: float) -> str:
-    return time.strftime("%H:%M", time.gmtime(ts + MSK))
-
-
-def when(ts: float) -> str:
-    return time.strftime("%d.%m.%Y %H:%M", time.gmtime(ts + MSK)) if ts else "—"
-
-
-def span(seconds: float) -> str:
-    seconds = int(max(seconds, 0))
-    d, h, m = seconds // 86400, seconds % 86400 // 3600, seconds % 3600 // 60
-    if d:
-        return f"{d} д {h} ч"
-    if h:
-        return f"{h} ч {m} мин"
-    return f"{m} мин"
-
-
-def ago(ts: float, now: float) -> str:
-    if not ts:
-        return "никогда"
-    return "только что" if now - ts < 90 else span(now - ts) + " назад"
-
-
-COLORS = {"vless": "var(--c1)", "hy2": "var(--c2)", "awg": "var(--c3)"}
-
-
-def bars(series: list[tuple[int, dict[str, int]]]) -> str:
-    """Столбики по дням, сложенные по протоколам. Чистый SVG."""
-    if not series:
-        return ""
-    top = max(sum(v.values()) for _, v in series) or 1
-    w, h, gap = 24, 160, 6
-    width = len(series) * (w + gap)
-    parts = [f'<svg viewBox="0 0 {width} {h + 22}" class="chart" role="img" '
-             f'aria-label="Трафик по дням">']
-    for i, (day, values) in enumerate(series):
-        x, y = i * (w + gap), h
-        tip = time.strftime("%d.%m", time.gmtime(day)) + ": " + ", ".join(
-            f"{PROTO_TITLES[p]} {size(values.get(p, 0))}" for p in PROTOS if values.get(p))
-        parts.append(f"<g><title>{esc(tip or time.strftime('%d.%m', time.gmtime(day)) + ': 0')}</title>")
-        for p in PROTOS:
-            v = values.get(p, 0)
-            if not v:
-                continue
-            bh = max(v / top * h, 1.5)
-            y -= bh
-            parts.append(f'<rect x="{x}" y="{y:.1f}" width="{w}" height="{bh:.1f}" rx="3" fill="{COLORS[p]}"/>')
-        parts.append(f'<rect x="{x}" y="0" width="{w}" height="{h}" fill="transparent"/></g>')
-        if i % 5 == 0 or i == len(series) - 1:
-            parts.append(f'<text x="{x + w / 2}" y="{h + 16}" text-anchor="middle">'
-                         f'{time.strftime("%d.%m", time.gmtime(day))}</text>')
-    parts.append("</svg>")
-    return "".join(parts)
-
-
-def spark(points: list[tuple[int, int]], label: str) -> str:
-    if len(points) < 2:
-        return '<p class="dim">данных пока мало — график появится через пару часов</p>'
-    t0, t1 = points[0][0], points[-1][0]
-    top = max(v for _, v in points) or 1
-    w, h = 600, 70
-    path = " ".join(f"{'M' if i == 0 else 'L'}{(t - t0) / max(t1 - t0, 1) * w:.1f},"
-                    f"{h - v / top * (h - 6):.1f}" for i, (t, v) in enumerate(points))
-    return (f'<svg viewBox="0 0 {w} {h}" class="spark" role="img" aria-label="{esc(label)}">'
-            f'<path d="{path}" fill="none" stroke="var(--c2)" stroke-width="2"/></svg>'
-            f'<p class="dim">{esc(label)}: максимум {top}, сейчас {points[-1][1]}</p>')
-
-
-CSS = """
-:root{--bg:#f5f6f8;--card:#fff;--ink:#16181d;--dim:#626a76;--line:#e2e5ea;--accent:#1d6fe0;
---c1:#2f7de1;--c2:#18a37a;--c3:#c9822b;--bad:#c63b3b;--ok:#1d7a43;--soft:#eef1f5}
-@media (prefers-color-scheme:dark){:root{--bg:#121418;--card:#1b1e24;--ink:#e6e8eb;--dim:#9aa1ad;
---line:#2a2f37;--accent:#6aa9f5;--c1:#5b9cf0;--c2:#35c194;--c3:#e0a052;--bad:#ef6b6b;--ok:#5fcf8b;--soft:#23272e}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);
-font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
-main{max-width:1100px;margin:0 auto;padding:20px 16px 60px}
-header{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
-h1{font-size:22px;margin:0}h2{font-size:18px;margin:32px 0 10px}
-nav a{color:var(--dim);margin-right:14px;text-decoration:none;font-size:14px}nav a:hover{color:var(--accent)}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
-.card b{display:block;font-size:24px;font-variant-numeric:tabular-nums}
-.card span{color:var(--dim);font-size:13px}
-.wrap{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow-x:auto}
-table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
-th,td{padding:8px 12px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
-th{color:var(--dim);font-weight:500;font-size:13px}tr:last-child td{border-bottom:0}
-td.n,th.n{text-align:right}.dim{color:var(--dim);font-size:13px}td .dim{white-space:normal;min-width:140px}
-.on{color:var(--ok)}.bad{color:var(--bad)}.pill{display:inline-block;padding:1px 8px;border-radius:99px;
-background:var(--soft);font-size:12px;margin-right:4px}
-.chart{width:100%;height:auto;display:block}.chart text{fill:var(--dim);font-size:10px}
-.spark{width:100%;height:70px;display:block}
-.legend span{display:inline-flex;align-items:center;gap:6px;margin-right:16px;font-size:13px;color:var(--dim)}
-.legend i{width:10px;height:10px;border-radius:3px;display:inline-block}
-button{font:inherit;cursor:pointer;border-radius:8px;border:1px solid var(--line);background:var(--card);
-color:var(--ink);padding:6px 12px}
-.login{max-width:340px;margin:12vh auto;text-align:center}
-.login input{font:600 28px/1 ui-monospace,monospace;letter-spacing:.3em;text-align:center;width:100%;
-padding:12px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--ink)}
-.login button{width:100%;margin-top:12px;padding:12px;background:var(--accent);color:#fff;border:0;font-weight:600}
-.err{color:var(--bad);min-height:1.5em}
-"""
-
-
-def page(title: str, body: str) -> bytes:
-    return (f'<!doctype html><html lang="ru"><head><meta charset="utf-8">'
-            f'<meta name="viewport" content="width=device-width,initial-scale=1">'
-            f'<meta name="robots" content="noindex,nofollow"><title>{esc(title)}</title>'
-            f"<style>{CSS}</style></head><body>{body}</body></html>").encode()
-
+# --- Вход ---------------------------------------------------------------------
 
 def login_page(error: str = "") -> bytes:
-    return page("Вход", f"""<main class="login"><h1>VPN · админка</h1>
-<p class="dim">Код из Google Authenticator</p>
+    return document("Вход", f"""<div class="login"><div class="card">
+<span class="mark">{icon("shield")}</span><h1>mos8 VPN</h1>
+<p class="muted small" style="margin:0">Введите код из Google Authenticator</p>
 <form method="post" action="/login" autocomplete="off">
-<input name="code" inputmode="numeric" pattern="[0-9 ]*" maxlength="7" autofocus required>
-<p class="err">{esc(error)}</p><button>Войти</button></form></main>""")
+<input name="code" inputmode="numeric" pattern="[0-9 ]*" maxlength="7" autofocus required aria-label="Код">
+<div class="err">{esc(error)}</div><button class="btn primary">Войти</button></form></div></div>""")
 
 
-# --- Сборка страницы ----------------------------------------------------------
+# --- Подтверждения ------------------------------------------------------------
+# action → (заголовок, текст, опасно ли). Нет в словаре — выполняется сразу.
 
-def rotation_periods(history: list[dict], current_ip: str, now: float) -> list[dict]:
-    """Каждый адрес: когда появился, когда ушёл, сколько прожил и почему сменён.
-
-    history — от новых к старым: {"ts", "from", "to", "zone", "mode", "reason"}."""
-    periods = []
-    if history:
-        periods.append({"ip": current_ip or history[0].get("to"), "start": history[0]["ts"], "end": None,
-                        "zone": history[0].get("zone"), "why": "сейчас"})
-    for i, r in enumerate(history):
-        older = history[i + 1] if i + 1 < len(history) else None
-        start = older["ts"] if older and older.get("to") == r.get("from") else None
-        periods.append({"ip": r.get("from"), "start": start, "end": r["ts"],
-                        "zone": (older or {}).get("zone"), "mode": r.get("mode"),
-                        "why": "сам: адрес заблокирован" if str(r.get("reason", "")).startswith("auto")
-                        else "вручную"})
-    for p in periods:
-        p["lived"] = ((p["end"] or now) - p["start"]) if p["start"] else None
-    return periods
-
-
-def dashboard(bot, stats: Stats) -> bytes:
-    now = time.time()
-    st = bot.engine.state
-    snap = stats.latest or {}
-    history = list(st["history"] or [])
-    current_ip = st["ipv4"] or snap.get("server_ip", "?")
-    today = int(now) // 86400 * 86400
-    proto_day, proto_week, proto_month = (stats.by_proto(today), stats.by_proto(int(now) - 7 * 86400),
-                                          stats.by_proto(int(now) - 30 * 86400))
-    clients = stats.clients()
-    traffic = {(c["proto"], c["client"]): c for c in clients}
-    started = stats.started()
-
-    guard = snap.get("guard") or {}
-    online = guard.get("online") or {}
-    blocks = guard.get("blocks") or []
-    awg = snap.get("awg") or []
-    awg_online = [p for p in awg if snap.get("ts", now) - p.get("handshake", 0) < 180]
-    keys = sorted(set(snap.get("vless") or {}) - {"_error"} | set(snap.get("hy2") or {}) - {"_error"})
-    system = snap.get("system") or {}
-    periods = rotation_periods(history, current_ip, now)
-    servers = stats.by_server()
-    rot30 = [r for r in history if now - r["ts"] < 30 * 86400]
-    lived = [p["lived"] for p in periods[1:] if p["lived"] and p["end"] and now - p["end"] < 30 * 86400]
-
-    def total(d):
-        return sum(d.values())
-
-    # Сводка
-    out = [f"""<main><header><h1>VPN · админка</h1>
-<nav><a href="#traffic">Трафик</a><a href="#keys">Ключи</a><a href="#awg">AmneziaWG</a>
-<a href="#servers">Адреса</a><a href="#health">Сервер</a><a href="#events">События</a></nav>
-<form method="post" action="/logout"><button>Выйти</button></form></header>
-<p class="dim">Обновлено {when(snap.get('collected', 0))} (снимок раз в 5 минут) · учёт трафика ведётся с {when(started)}</p>
-<div class="grid">
-<div class="card"><span>Ключи VLESS / Hysteria2</span><b>{len(keys)}</b><span>онлайн сейчас: {len(online)}</span></div>
-<div class="card"><span>Клиенты AmneziaWG</span><b>{len(awg)}</b><span>онлайн сейчас: {len(awg_online)}</span></div>
-<div class="card"><span>Трафик сегодня</span><b>{size(total(proto_day))}</b><span>за 7 дней: {size(total(proto_week))}</span></div>
-<div class="card"><span>Трафик за 30 дней</span><b>{size(total(proto_month))}</b><span>
-{' · '.join(f"{PROTO_TITLES[p]} {size(proto_month.get(p, 0))}" for p in PROTOS)}</span></div>
-<div class="card"><span>Текущий адрес</span><b style="font-size:18px">{esc(current_ip)}</b>
-<span>{esc(st['zone'] or '')} · живёт {span(now - history[0]['ts']) if history else '—'}</span></div>
-<div class="card"><span>Смен адреса за 30 дней</span><b>{len(rot30)}</b><span>в среднем адрес живёт
-{span(sum(lived) / len(lived)) if lived else '—'}</span></div>
-</div>"""]
-
-    # Трафик по дням
-    out.append(f"""<h2 id="traffic">Трафик по дням, 30 дней</h2><div class="card">
-<div class="legend">{''.join(f'<span><i style="background:{COLORS[p]}"></i>{PROTO_TITLES[p]}</span>' for p in PROTOS)}</div>
-{bars(stats.daily(30))}<p class="dim">Наведите на столбик — увидите разбивку. Дни — по UTC.</p></div>""")
-
-    # Ключи VLESS / Hysteria2
-    rows = []
-    vless_snap, hy2_snap = snap.get("vless") or {}, snap.get("hy2") or {}
-    for name in keys:
-        v, h = vless_snap.get(name) or {}, hy2_snap.get(name) or {}
-        tv, th = traffic.get(("vless", name), {}), traffic.get(("hy2", name), {})
-        nets = online.get(name) or {}
-        seen = max(v.get("last_seen", 0), tv.get("last_hour", 0), th.get("last_hour", 0))
-        state = ('<span class="on">● онлайн</span>' + (f' <span class="pill">{len(nets)} сети</span>' if len(nets) > 1 else "")
-                 if nets or h.get("online") else f'<span class="dim">{ago(seen, now)}</span>')
-        if any(b.get("user") == name for b in blocks):
-            state += ' <span class="pill bad">отрезано лишнее</span>'
-        if v and not v.get("enabled", True):
-            state += ' <span class="pill">выключен</span>'
-        rows.append(f"<tr><td>{esc(name)}</td><td>{state}</td>"
-                    f"<td class='n'>{size(tv.get('day', 0) + th.get('day', 0))}</td>"
-                    f"<td class='n'>{size(tv.get('month', 0) + th.get('month', 0))}</td>"
-                    f"<td class='n'>{size(th.get('month', 0))}</td><td class='n'>{size(tv.get('month', 0))}</td>"
-                    f"<td class='n'>{size(tv.get('all', 0) + th.get('all', 0))}</td></tr>")
-    out.append(f"""<h2 id="keys">Ключи VLESS / Hysteria2 · {len(keys)}</h2><div class="wrap"><table>
-<tr><th>Ключ</th><th>Сейчас</th><th class="n">Сутки</th><th class="n">30 дней</th><th class="n">из них Hysteria2</th>
-<th class="n">из них VLESS</th><th class="n">Всего</th></tr>{''.join(rows) or '<tr><td colspan=7 class=dim>нет ключей</td></tr>'}
-</table></div>""")
-
-    # AmneziaWG
-    rows = []
-    for p in sorted(awg, key=lambda p: (-(p.get("handshake") or 0))):
-        t = traffic.get(("awg", p.get("name")), {})
-        live = snap.get("ts", now) - p.get("handshake", 0) < 180
-        rows.append(f"<tr><td>{esc(p.get('name'))}</td><td><span class='pill'>{esc(p.get('server'))}</span></td>"
-                    f"<td>{'<span class=on>● онлайн</span>' if live else '<span class=dim>' + ago(p.get('handshake', 0), now) + '</span>'}</td>"
-                    f"<td class='n'>{size(t.get('day', 0))}</td><td class='n'>{size(t.get('month', 0))}</td>"
-                    f"<td class='n'>{size(t.get('all', 0))}</td></tr>")
-    out.append(f"""<h2 id="awg">AmneziaWG · {len(awg)} клиентов, онлайн {len(awg_online)}</h2><div class="wrap"><table>
-<tr><th>Клиент</th><th>Где</th><th>Последний раз</th><th class="n">Сутки</th><th class="n">30 дней</th><th class="n">Всего</th></tr>
-{''.join(rows) or '<tr><td colspan=6 class=dim>нет клиентов</td></tr>'}</table></div>""")
-
-    # Адреса
-    rows = []
-    for p in periods:
-        t = servers.get(p["ip"] or "", {})
-        counted = size(t["total"]) if t else ('<span class="dim">учёта ещё не было</span>'
-                                              if (p["end"] or now) < started else size(0))
-        split = " · ".join(f"{PROTO_TITLES[x]} {size(t[x])}" for x in PROTOS if t.get(x)) if t else ""
-        rows.append(f"<tr><td>{esc(p['ip'])}{' <span class=pill>сейчас</span>' if p['end'] is None else ''}</td>"
-                    f"<td>{esc(p.get('zone') or '—')}</td><td>{when(p['start']) if p['start'] else '—'}</td>"
-                    f"<td>{when(p['end']) if p['end'] else '—'}</td><td>{span(p['lived']) if p['lived'] else '—'}</td>"
-                    f"<td>{esc(p['why'])}</td><td class='n'>{counted}<div class=dim>{split}</div></td></tr>")
-    out.append(f"""<h2 id="servers">Адреса сервера · {len(history)} смен</h2>
-<p class="dim">Трафик по адресу считается с начала учёта ({when(started)}); раньше счётчики по адресам
-не велись, и восстановить их нельзя.</p><div class="wrap"><table>
-<tr><th>Адрес</th><th>Локация</th><th>Появился</th><th>Сменён</th><th>Прожил</th><th>Причина смены</th><th class="n">Трафик</th></tr>
-{''.join(rows) or '<tr><td colspan=7 class=dim>смен адреса ещё не было</td></tr>'}</table></div>""")
-
-    # Сервер
-    report = system.get("watchdog") or {}
-    load = stats.load_series(24)
-    out.append(f"""<h2 id="health">VPN-сервер</h2><div class="grid">
-<div class="card"><span>Свободная память</span><b>{system.get('mem_avail', '?')} МБ</b><span>из {system.get('mem_total', '?')} · своп {system.get('swap_used', '?')} МБ</span></div>
-<div class="card"><span>Диск</span><b>{system.get('disk_pct', '?')}%</b><span>занято</span></div>
-<div class="card"><span>Нагрузка</span><b>{(system.get('load') or ['?'])[0]}</b><span>за 1 / 5 / 15 мин: {' / '.join(str(x) for x in system.get('load') or [])}</span></div>
-<div class="card"><span>Работает без перезагрузки</span><b style="font-size:18px">{span(system.get('uptime', 0))}</b><span>{esc(snap.get('host', ''))}</span></div>
-</div><div class="card" style="margin-top:12px">{spark([(t, (k or 0) + (a or 0)) for t, k, a, _m in load], 'Подключено людей за сутки (ключи + AmneziaWG)')}</div>
-<div class="wrap" style="margin-top:12px"><table><tr><th>Проверка сторожа здоровья</th><th>Состояние</th></tr>
-{''.join(f"<tr><td>{esc(k)}</td><td class='{'on' if v in ('ok', 'отвечает', 'работает', 'свежие') else ''}'>{esc(v)}</td></tr>" for k, v in report.items())}
-</table></div>""")
-
-    # События
-    events = list(reversed(snap.get("events") or []))[:30]
-    rows = []
-    for e in events:
-        text = e.get("text") or (f"ключ {e.get('user')}: " + {
-            "blocked": f"второе устройство отрезано ({', '.join(e.get('others') or [])})",
-            "shared": "работает на нескольких устройствах",
-            "unblocked": "блокировка снята"}.get(e.get("kind"), e.get("kind", "")))
-        rows.append(f"<tr><td>{when(e.get('t', 0))}</td><td><span class='pill'>{esc(e.get('source'))}</span></td>"
-                    f"<td>{esc(text)}</td></tr>")
-    out.append(f"""<h2 id="events">События</h2><div class="wrap"><table>
-<tr><th>Когда</th><th>Сторож</th><th>Что</th></tr>{''.join(rows) or '<tr><td colspan=3 class=dim>событий нет</td></tr>'}
-</table></div></main>""")
-    return page("VPN · админка", "".join(out))
+def confirmation(action: str, form: dict[str, str], bot) -> tuple[str, str, bool] | None:
+    name = esc(form.get("name", ""))
+    if action == "key.delete":
+        return "Удалить ключ", f"Ключ «{name}» перестанет работать сразу на всех устройствах. Вернуть его нельзя — " \
+                               "только выдать новый.", True
+    if action == "awg.revoke":
+        return "Отозвать конфиг", f"Файл «{name}.conf» перестанет подключаться сразу.", True
+    if action == "rotate":
+        mode = form.get("mode", "")
+        where = f" в {esc(form.get('zone'))}" if mode == modes.MOVE else ""
+        return "Сменить адрес", f"{esc(modes.MODE_TITLES.get(mode, mode)).capitalize()}{where}. VPN будет недоступен " \
+                                "несколько минут, DNS обновится сам. Клиенты переподключатся без вашего участия.", False
+    if action == "unstick":
+        return "Снять отметку", "Делайте это, только если смена адреса точно не идёт: иначе бот потеряет, " \
+                                "на каком она шаге.", True
+    if action.startswith("server."):
+        what = action.split(".", 1)[1]
+        if what in bot.SERVER_ACTIONS:
+            heading, text, _button = bot.SERVER_ACTIONS[what]
+            return heading, esc(text), what in ("delete", "storage-del", "backup-del")
+        extra = {"restore": ("Восстановить диск", "Данные Backup будут записаны поверх текущего диска. Всё, что "
+                             "появилось после его снятия, пропадёт. Сервер остановится и запустится снова.", True),
+                 "create": ("Поднять сервер из шаблона", "Будет создан новый сервер — он тарифицируется отдельно. "
+                            "DNS не меняется: это не смена адреса.", False),
+                 "docker-restart": ("Перезапустить контейнеры", "Все подключения VPN оборвутся на несколько секунд.", False),
+                 "backup-now": ("Сделать Backup", "Backup тарифицируется как дополнительное хранилище.", False)}
+        if what in extra:
+            return extra[what]
+    return None
 
 
 # --- HTTP ---------------------------------------------------------------------
 
-def make_handler(bot, stats: Stats, auth: Auth):
+def make_handler(bot, stats: Stats, auth: Auth, ops: Ops):
     class Handler(http.server.BaseHTTPRequestHandler):
         server_version = "admin"
         sys_version = ""
@@ -426,6 +195,7 @@ def make_handler(bot, stats: Stats, auth: Auth):
         def log_message(self, fmt: str, *args) -> None:
             pass
 
+        # --- помощники ---
         def client_ip(self) -> str:
             # Слушаем только 127.0.0.1, так что заголовок ставит наш nginx.
             return (self.headers.get("X-Real-IP") or self.client_address[0]).strip()
@@ -437,18 +207,21 @@ def make_handler(bot, stats: Stats, auth: Auth):
                     return v
             return ""
 
-        def reply(self, body: bytes, status: int = 200, extra: dict | None = None) -> None:
+        def reply(self, body: bytes, status: int = 200, extra: dict | None = None,
+                  ctype: str = "text/html; charset=utf-8") -> None:
             self.send_response(status)
-            headers = {"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store",
-                       "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer",
+            headers = {"Content-Type": ctype, "Cache-Control": "no-store",
+                       "X-Frame-Options": "DENY", "Referrer-Policy": "same-origin",
                        "X-Content-Type-Options": "nosniff",
                        "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; "
-                                                  "img-src 'self' data:; form-action 'self'; frame-ancestors 'none'",
+                                                  "img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; "
+                                                  "base-uri 'none'",
                        "Content-Length": str(len(body)), **(extra or {})}
             for k, v in headers.items():
                 self.send_header(k, v)
             self.end_headers()
-            self.wfile.write(body)
+            if self.command != "HEAD":
+                self.wfile.write(body)
 
         def redirect(self, where: str, cookie: str | None = None) -> None:
             extra = {"Location": where}
@@ -456,35 +229,179 @@ def make_handler(bot, stats: Stats, auth: Auth):
                 extra["Set-Cookie"] = cookie
             self.reply(b"", 303, extra)
 
-        def do_GET(self) -> None:                                  # noqa: N802
-            path = self.path.split("?", 1)[0]
+        def back(self, fallback: str = "/") -> str:
+            """Куда вернуться после действия: та же страница, с которой пришли."""
+            ref = urllib.parse.urlsplit(self.headers.get("Referer") or "")
+            path = ref.path + (f"?{ref.query}" if ref.query else "")
+            return path if path.startswith("/") and not path.startswith("//") and path != "/do" else fallback
+
+        def ctx(self, session: dict, query: dict) -> pages.Ctx:
+            note, session["flash"] = session.get("flash", ""), ""
+            return pages.Ctx(bot=bot, stats=stats, ops=ops, csrf=session["csrf"], q=query, note=note)
+
+        def render(self, session: dict, result: tuple[str, str, str], refresh: int = 0, status: int = 200) -> None:
+            title, active, content = result
+            self.reply(shell(active, title, content, session["csrf"], refresh), status)
+
+        # --- GET ---
+        def do_HEAD(self) -> None:                                  # noqa: N802
+            self.do_GET()
+
+        def do_GET(self) -> None:                                   # noqa: N802
+            url = urllib.parse.urlsplit(self.path)
+            path = url.path
+            query = {k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}
             if path == "/login":
                 return self.reply(login_page())
-            if path != "/":
-                return self.reply(page("Нет такой страницы", "<main><p>404</p></main>"), 404)
-            if not auth.valid(self.token()):
+            session = auth.session(self.token())
+            if not session:
                 return self.redirect("/login")
             try:
-                self.reply(dashboard(bot, stats))
+                c = self.ctx(session, query)
+                if path == "/":
+                    return self.render(session, pages.overview(c))
+                if path == "/people":
+                    return self.render(session, pages.people_page(c))
+                if path == "/people/new":
+                    return self.render(session, pages.new_person(c))
+                if path == "/person":
+                    return self.render(session, pages.person_page(c))
+                if path == "/addresses":
+                    return self.render(session, pages.addresses(c))
+                if path == "/server":
+                    return self.render(session, pages.server_page(c))
+                if path == "/health":
+                    return self.render(session, pages.health(c))
+                if path == "/jobs":
+                    return self.render(session, pages.jobs_page(c))
+                if path.startswith("/jobs/"):
+                    job = ops.jobs.get(path.rsplit("/", 1)[1])
+                    if not job:
+                        return self.redirect("/jobs")
+                    return self.render(session, pages.job_page(c, job), refresh=3 if job.status == "running" else 0)
+                if path == "/download/awg":
+                    name = query.get("n", "")
+                    conf = ops.awg_conf(name) if NAME_RE.match(name) else ""
+                    if not conf:
+                        session["flash"] = flash("bad", "Конфига с таким именем нет.")
+                        return self.redirect("/people")
+                    ops.audit(f"скачан конфиг AmneziaWG {name}")
+                    return self.reply(conf.encode(), extra={
+                        "Content-Disposition": f'attachment; filename="{name}.conf"'},
+                        ctype="text/plain; charset=utf-8")
+                self.render(session, ("Нет такой страницы", "", '<div class="empty">Такой страницы нет. '
+                                      '<a href="/"><u>На обзор</u></a></div>'), status=404)
             except Exception as exc:                               # noqa: BLE001
-                logger.exception("админка не собралась")
-                self.reply(page("Ошибка", f"<main><p>Страница не собралась: {esc(exc)}</p></main>"), 500)
+                logger.exception("страница админки %s не собралась", path)
+                self.render(session, ("Ошибка", "", flash("bad", f"Страница не собралась: {esc(exc)}")), status=500)
 
-        def do_POST(self) -> None:                                 # noqa: N802
-            size_ = min(int(self.headers.get("Content-Length") or 0), 1024)
-            form = urllib.parse.parse_qs(self.rfile.read(size_).decode(errors="replace"))
+        # --- POST ---
+        def form(self) -> dict[str, str]:
+            size = min(int(self.headers.get("Content-Length") or 0), 8192)
+            return {k: v[0] for k, v in urllib.parse.parse_qs(self.rfile.read(size).decode(errors="replace")).items()}
+
+        def do_POST(self) -> None:                                  # noqa: N802
+            form = self.form()
+            if self.path == "/login":
+                ip = self.client_ip()
+                ok, why = auth.check_code(form.get("code", ""), ip)
+                if not ok:
+                    return self.reply(login_page(why), 401)
+                token = auth.open_session()
+                auth.notify(f"🔐 Вход в админку с {ip}")
+                return self.redirect("/", f"adm={token}; Max-Age={SESSION_TTL}; Path=/; Secure; HttpOnly; SameSite=Strict")
+            session = auth.session(self.token())
+            if not session:
+                return self.redirect("/login")
+            if not hmac.compare_digest(form.get("csrf", ""), session["csrf"]):
+                session["flash"] = flash("bad", "Форма устарела — повторите действие.")
+                return self.redirect(self.back())
             if self.path == "/logout":
                 auth.close(self.token())
                 return self.redirect("/login", "adm=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Strict")
-            if self.path != "/login":
+            if self.path != "/do":
                 return self.reply(b"", 404)
-            ip = self.client_ip()
-            ok, why = auth.check_code((form.get("code") or [""])[0], ip)
-            if not ok:
-                return self.reply(login_page(why), 401)
-            token = auth.open_session()
-            auth.notify(f"🔐 Вход в админку с {ip}")
-            self.redirect("/", f"adm={token}; Max-Age={SESSION_TTL}; Path=/; Secure; HttpOnly; SameSite=Strict")
+            try:
+                self.act(session, form)
+            except Exception as exc:                               # noqa: BLE001
+                logger.exception("действие админки %s упало", form.get("action"))
+                session["flash"] = flash("bad", f"Не вышло: {esc(exc)}")
+                self.redirect(self.back())
+
+        def act(self, session: dict, form: dict[str, str]) -> None:
+            action = form.get("action", "")
+            name = form.get("name", "")
+            if name and not NAME_RE.match(name):
+                session["flash"] = flash("bad", "Имя — латиница, цифры, «-» и «_», до 32 символов.")
+                return self.redirect(self.back())
+
+            ask = confirmation(action, form, bot)
+            if ask and form.get("confirm") != "1":
+                title, text, danger = ask
+                keep = {k: v for k, v in form.items() if k != "confirm"}
+                c = self.ctx(session, {})
+                return self.render(session, pages.confirm_page(c, title, text, keep, danger, self.back()))
+
+            def done(result: tuple[bool, str], where: str | None = None) -> None:
+                ok, text = result
+                session["flash"] = flash("ok" if ok else "bad", esc(text))
+                self.redirect(where or self.back())
+
+            def job(j) -> None:
+                self.redirect(f"/jobs/{j.id}")
+
+            if action == "key.issue":
+                kind = form.get("kind", "sub")
+                if not name or kind not in ISSUE_KINDS:
+                    session["flash"] = flash("bad", "Укажите имя и что выдать.")
+                    return self.redirect("/people/new")
+                if any(k["name"] == name for k in ops.keys()) and not kind.startswith("awg-"):
+                    session["flash"] = flash("bad", f"Ключ «{esc(name)}» уже есть — выберите другое имя.")
+                    return self.redirect("/people/new")
+                return job(ops.key_issue(name, kind, form.get("tg") == "1"))
+            if action == "key.delete":
+                return done(ops.key_delete(name), "/people")
+            if action == "key.resend":
+                return done(ops.key_resend(name))
+            if action == "key.unbind":
+                return done(ops.key_unbind(name))
+            if action == "key.limit":
+                return done(ops.key_limit(name, 2 if form.get("n") == "2" else 1))
+            if action == "key.unblock":
+                return done(ops.key_unblock(name))
+            if action == "key.sync":
+                return done(ops.key_sync())
+            if action == "awg.revoke":
+                return done(ops.awg_revoke(name), "/people?f=awg")
+            if action == "awg.send":
+                return done(ops.awg_send(name))
+            if action.startswith("server."):
+                what = action.split(".", 1)[1]
+                arg = form.get("arg", "")
+                if what == "restore" and re.fullmatch(r"[0-9a-f-]{36}", arg):
+                    return job(ops.server_job(f"restore:{arg}"))
+                if what == "create" and re.fullmatch(r"[0-9a-f-]{36}", arg):
+                    return job(ops.server_job("create", arg))
+                if what in ("start", "stop", "reboot", "template", "backup-now", "backup-del", "storage-del",
+                            "containers", "protocols", "docker-up", "docker-restart", "delete"):
+                    return job(ops.server_job(what))
+            if action == "rotate":
+                mode = form.get("mode", "")
+                if mode in modes.ALL_MODES:
+                    return job(ops.rotate_job(mode, form.get("zone", "") if mode == modes.MOVE else ""))
+            if action == "probe":
+                return job(ops.probe_job())
+            if action == "auto.pause":
+                return done(ops.auto_pause(form.get("on") == "1"))
+            if action == "auto.mode":
+                return done(ops.auto_mode(form.get("mode", "")))
+            if action == "unstick":
+                return done(ops.unstick())
+            if action.startswith("tg.") and action[3:] in ("costs", "servers", "status"):
+                return done(ops.to_telegram(action[3:]))
+            session["flash"] = flash("bad", "Неизвестное действие.")
+            self.redirect(self.back())
+
     return Handler
 
 
@@ -493,7 +410,8 @@ def serve(bot, stats: Stats, stop_event: threading.Event) -> None:
         threading.Thread(target=bot.send, args=(esc(text),), daemon=True).start()
 
     auth = Auth(lambda: bot.secrets.get("ADMIN_TOTP_SECRET"), notify)
-    server = http.server.ThreadingHTTPServer(LISTEN, make_handler(bot, stats, auth))
+    ops = Ops(bot, stats)
+    server = http.server.ThreadingHTTPServer(LISTEN, make_handler(bot, stats, auth, ops))
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, name="admin-http", daemon=True).start()
     logger.info("админка слушает %s:%s", *LISTEN)
