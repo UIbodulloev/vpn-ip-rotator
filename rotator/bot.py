@@ -239,6 +239,40 @@ def _check_keypath(v: str) -> str:
     return ""
 
 
+# --- Страницы в списках ------------------------------------------------------
+# Людей десятки, а в одном сообщении Telegram — 4096 символов и разумная
+# клавиатура в пару экранов. Поэтому любой список людей идёт страницами по
+# PAGE_SIZE, кнопки — в два столбца, а листание правит то же сообщение, а не
+# шлёт новое.
+
+PAGE_SIZE = 10
+
+
+def _page(items: list, page: int, per: int = PAGE_SIZE) -> tuple[list, int, int]:
+    """(кусок списка, номер страницы, всего страниц). Номер вне диапазона
+    прижимается к краю: список мог стать короче, пока человек листал."""
+    pages = max(1, -(-len(items) // per))
+    page = min(max(int(page), 0), pages - 1)
+    return items[page * per:(page + 1) * per], page, pages
+
+
+def _nav(kind: str, page: int, pages: int) -> list[list[dict]]:
+    """Ряд «◀️ 2 / 5 ▶️». На единственной странице — ничего."""
+    if pages <= 1:
+        return []
+    return [[
+        {"text": "◀️", "callback_data": f"pg:{kind}:{page - 1}"} if page > 0
+        else {"text": "·", "callback_data": "noop"},
+        {"text": f"{page + 1} / {pages}", "callback_data": "noop"},
+        {"text": "▶️", "callback_data": f"pg:{kind}:{page + 1}"} if page < pages - 1
+        else {"text": "·", "callback_data": "noop"},
+    ]]
+
+
+def _two_columns(buttons: list[dict]) -> list[list[dict]]:
+    return [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+
+
 def _check_client_name(v: str) -> str:
     if re.fullmatch(r"[A-Za-z0-9_-]{1,32}", v):
         return ""
@@ -314,6 +348,9 @@ class Bot:
         self.offset = 0
         self._picks: dict[str, list] = {}
         self._lock = threading.Lock()
+        # Сообщение, которое сейчас листают: show() правит его, а не шлёт новое.
+        # Апдейты обрабатываются по одному (self._lock), поэтому поле не гоняется.
+        self._turn_msg = 0
 
     # Ожидаемое поле живёт в state, а не в памяти: перезапуск сервиса посреди
     # мастера не должен молча съедать следующее сообщение пользователя.
@@ -385,6 +422,13 @@ class Bot:
             payload["text"] = ui.strip_tags(text)[:4000]
             payload.pop("parse_mode", None)
             self.api("editMessageText", payload)
+
+    def show(self, text: str, keyboard: list[list[dict]] | None = None) -> int:
+        """Показать экран: при листании — в том же сообщении, иначе новым."""
+        if self._turn_msg:
+            self.edit(self._turn_msg, text, keyboard)
+            return self._turn_msg
+        return self.send(text, keyboard)
 
     def send_document(self, filename: str, content: str, caption: str = "") -> bool:
         """Отправить файл в чат. Нужно для конфигов: приложения импортируют их файлом."""
@@ -1510,7 +1554,7 @@ class Bot:
         VPN-сервере, поэтому ходим туда по SSH, а не открываем порт наружу."""
         return self._awg(f"{self.PANEL_SCRIPT} {args}", timeout=timeout)
 
-    def vless_menu(self) -> None:
+    def vless_menu(self, page: int = 0) -> None:
         try:
             listing = self._panel("list")
         except remote.RemoteError as exc:
@@ -1554,9 +1598,12 @@ class Bot:
             keyboard.append([{"text": "📄 Профиль файлом", "callback_data": "vless:file"}])
             keyboard.append([{"text": "📵 Устройства", "callback_data": "vless:devices"}])
             keyboard.append([{"text": "🗑 Удалить", "callback_data": "vless:del"}])
+        shown, page, pages = _page(rows, page)
+        keyboard += _nav("vm", page, pages)
         keyboard.append([{"text": "◀️ Сервер", "callback_data": "srv:menu"}])
+        rows = shown
 
-        self.send(ui.joined(
+        self.show(ui.joined(
             ui.title("VLESS Reality · мобильные", "📱"),
             ui.esc(f"Порт 443 на {domain_of(self.cfg, self.secrets) or 'вашем домене'}, "
                    "маскировка под обычный HTTPS."),
@@ -1565,7 +1612,7 @@ class Bot:
                    "устройству, на котором её установят."),
             ui.esc("Вторая кнопка добавляет к ней файл AmneziaWG — запасной канал "
                    "для роутера и для операторов, где подписка не качается."),
-            ui.title("Клиенты"),
+            ui.title(f"Клиенты · {len(names)}" + (f" · стр. {page + 1}/{pages}" if pages > 1 else "")),
             ui.block(rows) if rows else ui.note("пока ни одного"),
             ui.note("Трафик — вверх и вниз вместе, за всё время: его считает панель, "
                     "и перезапуск ядра счётчик не сбрасывает.") if rows else "",
@@ -1594,7 +1641,7 @@ class Bot:
 
         threading.Thread(target=worker, name="vless-sync", daemon=True).start()
 
-    def vless_pick(self, action: str) -> None:
+    def vless_pick(self, action: str, page: int = 0) -> None:
         try:
             listing = self._panel("list")
         except remote.RemoteError as exc:
@@ -1602,7 +1649,9 @@ class Bot:
         names = [l.split("\t")[0] for l in listing.out.strip().splitlines() if "\t" in l]
         if not names:
             return self.vless_menu()
-        rows = [[{"text": n, "callback_data": f"vless:{action}:{n}"}] for n in names[:20]]
+        shown, page, pages = _page(names, page)
+        rows = _two_columns([{"text": n, "callback_data": f"vless:{action}:{n}"} for n in shown])
+        rows += _nav(f"vp.{action}", page, pages)
         rows.append([{"text": "◀️ Назад", "callback_data": "vless:menu"}])
         titles = {
             "del": ("Удалить клиента", "🗑", "Удаление необратимо: ключ перестанет работать сразу."),
@@ -1619,7 +1668,9 @@ class Bot:
                     "Лишние привязки при этом не снимаются — снимите их отдельно."),
         }
         heading, emoji, note = titles[action]
-        self.send(ui.joined(ui.title(heading, emoji), ui.esc(note)), rows)
+        self.show(ui.joined(ui.title(heading, emoji), ui.esc(note),
+                            ui.note(f"ключей {len(names)}" + (f" · страница {page + 1} из {pages}"
+                                                              if pages > 1 else ""))), rows)
 
     # --- Выдача человеку: два ключа и одно сообщение --------------------------
 
@@ -1643,7 +1694,7 @@ class Bot:
         return next((l.split("\t")[1] for l in listing.out.splitlines()
                      if l.split("\t")[0] == name and "\t" in l), "")
 
-    def vless_devices(self) -> None:
+    def vless_devices(self, page: int = 0) -> None:
         """Кто к каким ссылкам привязан.
 
         Счёт ведёт зеркало подписок: ссылка привязывается к первому
@@ -1712,8 +1763,11 @@ class Bot:
                               "callback_data": "vless:two"}])
             keyboard.append([{"text": "1️⃣ Вернуть одно устройство",
                               "callback_data": "vless:one"}])
+        total = len(rows)
+        rows, page, pages = _page(rows, page)
+        keyboard += _nav("vd", page, pages)
         keyboard.append([{"text": "◀️ Назад", "callback_data": "vless:menu"}])
-        self.send(ui.joined(
+        self.show(ui.joined(
             ui.title("Подключены сейчас", "🛡"),
             (ui.block(live_rows) if live_rows else ui.note("никого"))
             if guard is not None else
@@ -1722,7 +1776,7 @@ class Bot:
             ui.note(f"Сторож: режим {guard.get('mode')}. Два живых подключения ключа из "
                     "разных сетей дольше полутора минут — лишнее отрезается на 30 минут. "
                     "Смена Wi-Fi на LTE не считается.") if guard is not None else "",
-            ui.title("Устройства по ссылкам", "📵"),
+            ui.title(f"Устройства по ссылкам · {total}" + (f" · стр. {page + 1}/{pages}" if pages > 1 else ""), "📵"),
             ui.esc("Ссылка встаёт на первое устройство, которое её установило. "
                    "Второму приходит отказ."),
             ui.block(rows) if rows else ui.note("клиентов нет"),
@@ -2261,7 +2315,7 @@ class Bot:
         port = int(self.cfg.get("vpn.control_port", 22)) or 22
         return remote.run(host, command, key_path=key, port=port, timeout=timeout)
 
-    def awg_menu(self) -> None:
+    def awg_menu(self, page: int = 0) -> None:
         try:
             listing = self._awg(f"{self.AWG_DIR}/list-clients.sh")
         except remote.RemoteError as exc:
@@ -2288,13 +2342,16 @@ class Bot:
         if names:
             keyboard.append([{"text": "📤 Прислать существующий", "callback_data": "awg:send"}])
             keyboard.append([{"text": "🗑 Отозвать", "callback_data": "awg:revoke"}])
+        total = len(rows)
+        rows, page, pages = _page(rows, page)
+        keyboard += _nav("am", page, pages)
         keyboard.append([{"text": "◀️ Сервер", "callback_data": "srv:menu"}])
 
-        self.send(ui.joined(
+        self.show(ui.joined(
             ui.title("AmneziaWG 3.1", "🔐"),
-            ui.esc("Отдельный интерфейс рядом с 2.0: свой порт, своя подсеть, свои ключи. "
-                   "Существующие клиенты 2.0 он не затрагивает."),
-            ui.title("Выпущенные конфиги"),
+            ui.esc("Отдельный интерфейс: свой порт, своя подсеть, свои ключи — для роутеров "
+                   "и как запасной канал. AmneziaWG 2.0 выключен с 09.11.2026."),
+            ui.title(f"Выпущенные конфиги · {total}" + (f" · стр. {page + 1}/{pages}" if pages > 1 else "")),
             ui.block(rows) if rows else ui.note("пока ни одного"),
             ui.note("Трафик — вверх и вниз вместе, с последнего перезапуска интерфейса: "
                     "счётчики живут в ядре и обнуляются вместе с контейнером."),
@@ -2303,7 +2360,7 @@ class Bot:
                     "контейнер 2.0 и отключит текущих пользователей."),
         ), keyboard)
 
-    def awg_pick(self, action: str) -> None:
+    def awg_pick(self, action: str, page: int = 0) -> None:
         """Список имён кнопками: для отправки или отзыва."""
         try:
             listing = self._awg(f"{self.AWG_DIR}/list-clients.sh")
@@ -2313,12 +2370,15 @@ class Bot:
         if not names:
             return self.awg_menu()
         verb = "Отозвать" if action == "revoke" else "Прислать"
-        rows = [[{"text": n, "callback_data": f"awg:{action}:{n}"}] for n in names[:20]]
+        shown, page, pages = _page(names, page)
+        rows = _two_columns([{"text": n, "callback_data": f"awg:{action}:{n}"} for n in shown])
+        rows += _nav(f"ap.{action}", page, pages)
         rows.append([{"text": "◀️ Назад", "callback_data": "awg:menu"}])
-        self.send(ui.joined(
+        self.show(ui.joined(
             ui.title(f"{verb} конфиг", "🗑" if action == "revoke" else "📤"),
             ui.esc("Отзыв необратим: ключ перестанет работать сразу."
                    if action == "revoke" else "Файл придёт в этот чат."),
+            ui.note(f"конфигов {len(names)}" + (f" · страница {page + 1} из {pages}" if pages > 1 else "")),
         ), rows)
 
     def awg_issue(self, name: str) -> None:
@@ -3077,6 +3137,11 @@ class Bot:
             logger.warning("кнопка с недопустимым именем отклонена: %r", data[:60])
             return self.send(f"{ui.NO} Недопустимое имя в кнопке — действие отменено.")
 
+        if data == "noop":
+            return                                      # «2 / 5» и пустые места в ряду листания
+        if data.startswith("pg:"):
+            return self.turn_page(data, (callback.get("message") or {}).get("message_id", 0))
+
         if data == "cancel":
             self.awaiting = ""
             return self.send("Отменено. /setup — вернуться к настройке.")
@@ -3230,6 +3295,31 @@ class Bot:
         if data.startswith("go:"):
             _, mode, zone = (data.split(":") + [""])[:3]
             return self.start_rotation(mode, zone)
+
+    # Что листается: вид списка → как его показать на странице n.
+    VLESS_PICKS = ("del", "link", "sub", "file", "unbind", "two", "one")
+    AWG_PICKS = ("revoke", "send")
+
+    def turn_page(self, data: str, message_id: int) -> None:
+        """pg:<вид>:<страница> — та же клавиатура, другая страница, в том же сообщении."""
+        m = re.fullmatch(r"pg:([a-z]+)(?:\.([a-z]+))?:(-?\d{1,4})", data)
+        if not m:
+            return
+        kind, action, page = m.group(1), m.group(2) or "", int(m.group(3))
+        self._turn_msg = message_id
+        try:
+            if kind == "vm":
+                return self.vless_menu(page)
+            if kind == "vd":
+                return self.vless_devices(page)
+            if kind == "am":
+                return self.awg_menu(page)
+            if kind == "vp" and action in self.VLESS_PICKS:
+                return self.vless_pick(action, page)
+            if kind == "ap" and action in self.AWG_PICKS:
+                return self.awg_pick(action, page)
+        finally:
+            self._turn_msg = 0
 
     def on_pick(self, data: str) -> None:
         _, kind, index = data.split(":", 2)

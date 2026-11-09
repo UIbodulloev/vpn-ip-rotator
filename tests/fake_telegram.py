@@ -20,6 +20,8 @@ class FakeTelegram:
         self.calls: list[str] = []
         self.timeline: list[str] = []      # всё, что увидел пользователь, по порядку
         self.documents: list[dict] = []    # отправленные файлы
+        self.markups: dict[int, dict] = {} # клавиатура каждого сообщения — с учётом правок
+        self.last_touched = 0              # последнее отправленное или исправленное сообщение
         self._update_id = 100
         self._message_id = 1000
 
@@ -77,6 +79,11 @@ class FakeTelegram:
         """Все кнопки последней клавиатуры как (текст, callback_data)."""
         return [(b["text"], b.get("callback_data", "")) for row in self.last_keyboard() for b in row]
 
+    def current_keyboard(self) -> list:
+        """Клавиатура сообщения, которое пользователь видел последним — даже если
+        его не прислали заново, а исправили (листание страниц)."""
+        return (self.markups.get(self.last_touched) or {}).get("inline_keyboard", [])
+
     # --- маршрутизация ------------------------------------------------------
 
     def send_document(self, filename: str, content: str, caption: str) -> FakeResponse:
@@ -107,11 +114,15 @@ class FakeTelegram:
                 "message_id": self._message_id,
             })
             self.timeline.append(payload.get("text", ""))
+            self.markups[self._message_id] = payload.get("reply_markup") or {}
+            self.last_touched = self._message_id
             return FakeResponse(200, {"ok": True, "result": {"message_id": self._message_id}})
 
         if api_method == "editMessageText":
             self.edited.append({"message_id": payload.get("message_id"), "text": payload.get("text", "")})
             self.timeline.append(payload.get("text", ""))
+            self.markups[payload.get("message_id")] = payload.get("reply_markup") or {}
+            self.last_touched = payload.get("message_id")
             return FakeResponse(200, {"ok": True, "result": {"message_id": payload.get("message_id")}})
 
         if api_method == "deleteMessage":
