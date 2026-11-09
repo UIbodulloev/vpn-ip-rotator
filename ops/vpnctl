@@ -121,8 +121,10 @@ cmd_ship() {
     git push -q origin HEAD:main
     pushed
     cmd_panel
-    if ! git diff --quiet "$before" HEAD -- subs/; then cmd_worker; else say "subs/ не менялся — воркер не трогаю"; fi
-    if ! git diff --quiet "$before" HEAD -- rotator/ tests/ requirements.txt; then
+    # Пути — от корня репозитория (:/): cmd_worker уходит в subs/, и
+    # относительный путь после него смотрел бы не туда.
+    if ! git -C "$REPO" diff --quiet "$before" HEAD -- :/subs; then cmd_worker; else say "subs/ не менялся — воркер не трогаю"; fi
+    if ! git -C "$REPO" diff --quiet "$before" HEAD -- :/rotator :/tests :/requirements.txt; then
         medbot deploy "$(git rev-parse HEAD)"
     else
         say "бот не менялся — medbot не трогаю"

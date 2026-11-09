@@ -237,7 +237,9 @@ CODE=$(curl -sS -o "$TMP/page.html" -w '%{http_code}' --max-time 10 "https://$HO
 if [[ "$CODE" == "200" ]]; then
     PROBLEMS=""
     grep -q '\${' "$TMP/page.html" && PROBLEMS="осталась неподставленная вставка \${…}"
-    for NEEDLE in "sing-box" "AmneziaWG" "$HOSTNAME_ARG" "</html>"; do
+    # Имени хоста на странице нет намеренно: её отдают и origin, и зеркало, и
+    # конкретный адрес в карточке только путал людей.
+    for NEEDLE in "sing-box" "AmneziaWG" "/sub/" "</html>"; do
         grep -qF -- "$NEEDLE" "$TMP/page.html" || PROBLEMS="$PROBLEMS; нет «$NEEDLE»"
     done
     if [[ -n "$PROBLEMS" ]]; then
