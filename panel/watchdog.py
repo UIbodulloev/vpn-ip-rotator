@@ -54,7 +54,10 @@ HEALTH_EVERY = 6 * 3600
 
 def sh(cmd: list[str], timeout: float = 20, data: str | None = None) -> tuple[int, str]:
     try:
-        done = subprocess.run(cmd, input=data, capture_output=True, text=True, timeout=timeout)
+        # errors="replace": чужой вывод режут по байтам (cut -c), и половинка
+        # русской буквы не должна ронять весь проход сторожа.
+        done = subprocess.run(cmd, input=data, capture_output=True, text=True,
+                              errors="replace", timeout=timeout)
         return done.returncode, (done.stdout + done.stderr).strip()
     except subprocess.TimeoutExpired:
         return 124, "таймаут"
