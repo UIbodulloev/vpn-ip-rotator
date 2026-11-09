@@ -18,7 +18,7 @@
 | Генератор подписок | Cloudflare Worker, origin.mos8.online | `subs/worker.js`, выкатка `vpnctl worker` |
 | Telegram-бот | сервер medbot (91.218.115.82), `vpn-rotator.service`, код в `/opt/vpn-rotator` | только через `vpnctl bot-*` |
 | Статистика | medbot, `/var/lib/vpn-rotator/stats.db` (SQLite, почасово: адрес × протокол × клиент) | `rotator/stats.py`; снимок с VPN-сервера — `panel/stats-snapshot.py` раз в 5 мин |
-| Веб-админка | https://admin.mos8.online → nginx на medbot → бот на 127.0.0.1:8787 | `rotator/admin.py`; вход — TOTP, секрет выпускает `/admin` в боте |
+| Веб-админка | https://admin.mos8.online → nginx на medbot → бот на 127.0.0.1:8787 | вход — TOTP, секрет выпускает `/admin` в боте; `rotator/admin.py` (вход, маршруты, подтверждения), `admin_pages.py` (страницы), `admin_ops.py` (действия — те же, что у бота), `admin_ui.py` (дизайн-система, графики SVG) |
 
 Скрипты панели работают из `/opt/panel` — это копии `panel/` из репозитория.
 
